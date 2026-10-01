@@ -1,0 +1,35 @@
+{
+  "name": "firstmate",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "sh scripts/build",
+    "test": "bun test tests/"
+  },
+  "devDependencies": {
+    "@openchamber/sdk": "2.1.0"
+  },
+  "openchamber": {
+    "apiVersion": 1,
+    "engines": {
+      "openchamber": ">=1.22.0"
+    },
+    "contributes": {
+      "capabilities": ["sessions"],
+      "panel": {
+        "id": "firstmate",
+        "name": "FirstMate",
+        "icon": "icon.svg",
+        "entry": "panel/index.html"
+      },
+      "service": {
+        "entry": "service/main.js",
+        "runtime": "host",
+        "permissions": {
+          "exec": ["openchamber", "git", "gh", "sh"]
+        }
+      }
+    }
+  }
+}

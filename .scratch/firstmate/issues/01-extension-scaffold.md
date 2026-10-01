@@ -4,7 +4,7 @@
 
 **Blocked by:** None (can start immediately)
 
-**Status:** ready-for-agent
+**Status:** resolved
 
 - [ ] `firstmate/package.json` carries the `openchamber` manifest: panel (id `firstmate`, icon, `panel/index.html`), service (`service/main.js`, `runtime: "host"`, exec permissions limited to `openchamber`, `git`, `gh`, `sh`), panel capabilities `["sessions"]`
 - [ ] Build produces IIFE `panel/main.js` and Node `service/main.js`; install checks pass (no `invalid-manifest` / `missing-build`)

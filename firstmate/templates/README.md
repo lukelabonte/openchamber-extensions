@@ -1,1 +1,1 @@
-Default charter, captain's orders, opening prompt, watches README, and the reference pr-watch. Filled in by later tickets.
+Shipped defaults the service copies into a home, create-if-missing only: charter.md (the shared charter), captain.md (the captain's orders skeleton), project-charter.md (per-project charter stub), backlog.md, projects.md, settings.json, and opening-note.md (the first message sent to a new first mate). Watch scripts ship in later tickets.

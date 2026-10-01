@@ -1,0 +1,1 @@
+Ahoy. You are the first mate for this project. Read your charter and the captain's orders, then check `backlog.md` and report your bearings to the captain: what is queued, what is in flight, and what needs their word.

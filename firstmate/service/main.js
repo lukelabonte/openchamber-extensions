@@ -1,6 +1,7 @@
 // service/main.ts
 import { createServer } from "node:http";
-import { mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
+import { spawn } from "node:child_process";
+import { mkdir, readFile, readdir, rename, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import path2 from "node:path";
 
@@ -37,6 +38,51 @@ ${body}
 `;
   await filesystem.writeFile(`${homeRoot}/projects/${slug}/AGENTS.md`, composed);
   return composed;
+}
+
+// service/control-client.ts
+class MissingCliError extends Error {
+  constructor() {
+    super("the openchamber CLI is required. Install it with: npm i -g @openchamber/web");
+    this.name = "MissingCliError";
+  }
+}
+async function createSession(exec, input) {
+  let output;
+  try {
+    output = await exec("openchamber", ["session", "create", "--dir", input.directory, "--title", input.title, "--json"]);
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      throw new MissingCliError;
+    }
+    throw error;
+  }
+  const parsed = parseJsonOutput(output);
+  const sessionId = extractSessionId(parsed);
+  if (sessionId === undefined) {
+    throw new Error("openchamber session create output did not include a session id");
+  }
+  return sessionId;
+}
+function parseJsonOutput(output) {
+  try {
+    return JSON.parse(output);
+  } catch {
+    throw new Error("openchamber command did not return valid JSON");
+  }
+}
+function extractSessionId(parsed) {
+  if (!isRecord(parsed))
+    return;
+  for (const key of ["sessionID", "sessionId", "id"]) {
+    const value = parsed[key];
+    if (typeof value === "string" && value !== "")
+      return value;
+  }
+  return;
+}
+function isRecord(value) {
+  return typeof value === "object" && value !== null;
 }
 
 // service/slug.ts
@@ -127,7 +173,7 @@ async function findProjectHomeSlug(input) {
     } catch {
       continue;
     }
-    if (isRecord(settings) && settings.projectDirectory === projectDirectory) {
+    if (isRecord2(settings) && settings.projectDirectory === projectDirectory) {
       return homeName;
     }
   }
@@ -139,7 +185,7 @@ async function writeSettingsAssociation(input) {
   await input.filesystem.writeFile(input.settingsPath, `${JSON.stringify(settings, null, 2)}
 `);
 }
-function isRecord(value) {
+function isRecord2(value) {
   return typeof value === "object" && value !== null;
 }
 async function createFiles(input) {
@@ -153,6 +199,149 @@ async function createFiles(input) {
       continue;
     await filesystem.writeFile(filePath, await templateReader(file.templateName));
   }
+}
+
+// service/registry.ts
+class RegistryCorruptError extends Error {
+  constructor(filePath, cause) {
+    super(`FirstMate registry file ${filePath} is unreadable (${cause}). Fix or delete it, then relaunch.`);
+    this.name = "RegistryCorruptError";
+  }
+}
+function registryPath(homeRoot) {
+  return `${homeRoot}/registry.json`;
+}
+async function loadRegistry(filesystem, homeRoot) {
+  const filePath = registryPath(homeRoot);
+  if (!await filesystem.exists(filePath)) {
+    return {};
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(await filesystem.readFile(filePath));
+  } catch (error) {
+    throw new RegistryCorruptError(filePath, error instanceof Error ? error.message : "not valid JSON");
+  }
+  if (!isPlainObject(parsed)) {
+    throw new RegistryCorruptError(filePath, "not a JSON object");
+  }
+  for (const [slug, registration] of Object.entries(parsed)) {
+    if (!isRegistration(registration)) {
+      throw new RegistryCorruptError(filePath, `the entry for slug ${slug} is not a registration`);
+    }
+  }
+  return parsed;
+}
+async function saveRegistry(filesystem, homeRoot, registrations) {
+  const filePath = registryPath(homeRoot);
+  const tempPath = `${filePath}.${Date.now()}-${Math.random().toString(16).slice(2)}.tmp`;
+  await filesystem.writeFile(tempPath, `${JSON.stringify(registrations, null, 2)}
+`);
+  await filesystem.rename(tempPath, filePath);
+}
+function findRegistration(registrations, projectDirectory) {
+  const normalizedDirectory = normalizeProjectDirectory(projectDirectory);
+  return Object.values(registrations).find((registration) => registration.projectDirectory === normalizedDirectory);
+}
+function isRegistration(value) {
+  if (!isPlainObject(value))
+    return false;
+  return typeof value.slug === "string" && typeof value.projectDirectory === "string" && typeof value.homeDirectory === "string" && typeof value.coordinatorSessionId === "string" && typeof value.createdAt === "string";
+}
+function isPlainObject(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+// service/launch.ts
+var launchesInFlight = new Map;
+async function launchFirstMate(input) {
+  const key = normalizeProjectDirectory(input.projectDirectory);
+  const previous = launchesInFlight.get(key) ?? Promise.resolve();
+  const launch = previous.catch(() => {
+    return;
+  }).then(() => launchOnce(input));
+  launchesInFlight.set(key, launch);
+  try {
+    return await launch;
+  } finally {
+    if (launchesInFlight.get(key) === launch) {
+      launchesInFlight.delete(key);
+    }
+  }
+}
+async function launchOnce(input) {
+  const { filesystem, exec, templateReader, homeRoot } = input;
+  const normalizedDirectory = normalizeProjectDirectory(input.projectDirectory);
+  const registrations = await loadRegistry(filesystem, homeRoot);
+  const existing = findRegistration(registrations, normalizedDirectory);
+  if (existing !== undefined) {
+    return { registration: existing, adopted: true };
+  }
+  const { slug, projectHomeDirectory } = await provisionProject({
+    filesystem,
+    templateReader,
+    homeRoot,
+    projectDirectory: normalizedDirectory
+  });
+  await composeInstructions({ filesystem, homeRoot, slug });
+  const settingsPath = `${projectHomeDirectory}/settings.json`;
+  const priorSessionId = await readCoordinatorSessionId(filesystem, settingsPath);
+  if (priorSessionId !== undefined) {
+    const registration = {
+      slug,
+      projectDirectory: normalizedDirectory,
+      homeDirectory: projectHomeDirectory,
+      coordinatorSessionId: priorSessionId,
+      createdAt: new Date().toISOString()
+    };
+    await saveRegistry(filesystem, homeRoot, { ...registrations, [slug]: registration });
+    return { registration, adopted: true };
+  }
+  let coordinatorSessionId;
+  try {
+    coordinatorSessionId = await createSession(exec, {
+      directory: projectHomeDirectory,
+      title: `FirstMate — ${slug}`
+    });
+  } catch (error) {
+    if (error instanceof MissingCliError)
+      throw error;
+    throw new Error(`could not create the coordinator session: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  await recordCoordinatorSessionId(filesystem, settingsPath, coordinatorSessionId);
+  const registration = {
+    slug,
+    projectDirectory: normalizedDirectory,
+    homeDirectory: projectHomeDirectory,
+    coordinatorSessionId,
+    createdAt: new Date().toISOString()
+  };
+  await saveRegistry(filesystem, homeRoot, { ...registrations, [slug]: registration });
+  return { registration, adopted: false };
+}
+async function readCoordinatorSessionId(filesystem, settingsPath) {
+  let parsed;
+  try {
+    parsed = JSON.parse(await filesystem.readFile(settingsPath));
+  } catch {
+    return;
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed))
+    return;
+  const value = parsed.coordinatorSessionId;
+  return typeof value === "string" && value !== "" ? value : undefined;
+}
+async function recordCoordinatorSessionId(filesystem, settingsPath, coordinatorSessionId) {
+  let settings = {};
+  try {
+    const parsed = JSON.parse(await filesystem.readFile(settingsPath));
+    if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
+      settings = parsed;
+    }
+  } catch {}
+  settings.coordinatorSessionId = coordinatorSessionId;
+  await filesystem.writeFile(settingsPath, `${JSON.stringify(settings, null, 2)}
+`);
 }
 
 // service/main.ts
@@ -179,6 +368,7 @@ var nodeFileSystem = {
   readFile: (filePath) => readFile(filePath, "utf8"),
   writeFile: (filePath, contents) => writeFile(filePath, contents, "utf8"),
   createDirectory: (directoryPath) => mkdir(directoryPath, { recursive: true }),
+  rename: (fromPath, toPath) => rename(fromPath, toPath),
   listDirectories: async (directoryPath) => {
     try {
       const entries = await readdir(directoryPath, { withFileTypes: true });
@@ -188,11 +378,27 @@ var nodeFileSystem = {
     }
   }
 };
+var nodeExec = (command, args) => new Promise((resolve, reject) => {
+  const child = spawn(command, args, { stdio: ["ignore", "pipe", "pipe"] });
+  const stdoutChunks = [];
+  const stderrChunks = [];
+  child.stdout.on("data", (chunk) => stdoutChunks.push(chunk));
+  child.stderr.on("data", (chunk) => stderrChunks.push(chunk));
+  child.on("error", reject);
+  child.on("close", (code) => {
+    if (code === 0) {
+      resolve(Buffer.concat(stdoutChunks).toString("utf8"));
+      return;
+    }
+    const stderr = Buffer.concat(stderrChunks).toString("utf8").trim();
+    reject(new Error(`${command} exited with code ${code}${stderr === "" ? "" : `: ${stderr}`}`));
+  });
+});
 var templateReader = (templateName) => readFile(path2.join(templatesDirectory, templateName), "utf8");
 function isAuthorized(request) {
   return request.headers.authorization === `Bearer ${serviceToken}`;
 }
-function isRecord2(value) {
+function isRecord3(value) {
   return typeof value === "object" && value !== null;
 }
 function respondJson(response, statusCode, body) {
@@ -214,16 +420,22 @@ function readJsonBody(request) {
     request.on("error", reject);
   });
 }
-async function handleProvision(request, response) {
+async function readProjectDirectory(request) {
   let payload;
   try {
     payload = await readJsonBody(request);
   } catch {
-    respondJson(response, 400, { error: "request body must be JSON" });
     return;
   }
-  const projectDirectory = isRecord2(payload) ? payload.projectDirectory : undefined;
+  const projectDirectory = isRecord3(payload) ? payload.projectDirectory : undefined;
   if (typeof projectDirectory !== "string" || projectDirectory.trim() === "") {
+    return;
+  }
+  return projectDirectory;
+}
+async function handleProvision(request, response) {
+  const projectDirectory = await readProjectDirectory(request);
+  if (projectDirectory === undefined) {
     respondJson(response, 400, { error: "projectDirectory must be a non-empty string" });
     return;
   }
@@ -240,18 +452,88 @@ async function handleProvision(request, response) {
     respondJson(response, 500, { error: error instanceof Error ? error.message : "provisioning failed" });
   }
 }
+async function handleLaunch(request, response) {
+  const projectDirectory = await readProjectDirectory(request);
+  if (projectDirectory === undefined) {
+    respondJson(response, 400, { error: "projectDirectory must be a non-empty string" });
+    return;
+  }
+  try {
+    const { registration } = await launchFirstMate({
+      filesystem: nodeFileSystem,
+      exec: nodeExec,
+      templateReader,
+      homeRoot,
+      projectDirectory
+    });
+    respondJson(response, 200, registration);
+  } catch (error) {
+    if (error instanceof MissingCliError) {
+      respondJson(response, 503, { error: error.message, code: "cli-missing" });
+      return;
+    }
+    respondJson(response, 500, { error: error instanceof Error ? error.message : "launch failed" });
+  }
+}
+async function handleRegistryList(response) {
+  const registrations = await loadRegistry(nodeFileSystem, homeRoot);
+  respondJson(response, 200, { registrations: Object.values(registrations) });
+}
+async function handleRegistryItem(slug, response) {
+  const registrations = await loadRegistry(nodeFileSystem, homeRoot);
+  const registration = registrations[slug];
+  if (registration === undefined) {
+    respondJson(response, 404, { error: `no first mate registered for slug ${slug}` });
+    return;
+  }
+  respondJson(response, 200, registration);
+}
+async function handleLookup(url, response) {
+  const directory = url.searchParams.get("directory");
+  if (directory === null || directory.trim() === "") {
+    respondJson(response, 400, { error: "directory must be a non-empty string" });
+    return;
+  }
+  try {
+    const registrations = await loadRegistry(nodeFileSystem, homeRoot);
+    const registration = findRegistration(registrations, directory);
+    respondJson(response, 200, { registration: registration ?? null });
+  } catch (error) {
+    respondJson(response, 500, { error: error instanceof Error ? error.message : "lookup failed" });
+  }
+}
 async function handleRequest(request, response) {
   if (!isAuthorized(request)) {
     respondJson(response, 401, { error: "unauthorized" });
     return;
   }
-  const pathname = new URL(request.url ?? "/", "http://127.0.0.1").pathname;
+  const url = new URL(request.url ?? "/", "http://127.0.0.1");
+  const pathname = url.pathname;
   if (request.method === "GET" && pathname === "/health") {
     respondJson(response, 200, { status: "ok" });
     return;
   }
   if (request.method === "POST" && pathname === "/provision") {
     await handleProvision(request, response);
+    return;
+  }
+  if (request.method === "POST" && pathname === "/launch") {
+    await handleLaunch(request, response);
+    return;
+  }
+  if (request.method === "GET" && pathname === "/registry") {
+    await handleRegistryList(response);
+    return;
+  }
+  if (request.method === "GET" && pathname.startsWith("/registry/")) {
+    const slug = decodeURIComponent(pathname.slice("/registry/".length));
+    if (slug !== "") {
+      await handleRegistryItem(slug, response);
+      return;
+    }
+  }
+  if (request.method === "GET" && pathname === "/lookup") {
+    await handleLookup(url, response);
     return;
   }
   response.statusCode = 404;

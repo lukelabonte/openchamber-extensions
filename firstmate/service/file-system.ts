@@ -4,4 +4,5 @@ export interface FileSystemPort {
   writeFile(filePath: string, contents: string): Promise<void>
   createDirectory(directoryPath: string): Promise<void>
   listDirectories(directoryPath: string): Promise<string[]>
+  rename(fromPath: string, toPath: string): Promise<void>
 }

@@ -4,7 +4,7 @@
 
 **Blocked by:** 01 (Extension scaffold and install loop)
 
-**Status:** ready-for-agent
+**Status:** resolved
 
 - [ ] Service creates `~/.config/firstmate/shared/` (charter.md, captain.md, watches/) and `projects/<slug>/` (charter.md, captain.md, backlog.md, projects.md, settings.json, briefs/, reports/, watches/) from templates, without overwriting user-edited files
 - [ ] Charter composition writes the home's AGENTS.md in the specified precedence order; composition is unit-tested at the service-core seam (injected filesystem)

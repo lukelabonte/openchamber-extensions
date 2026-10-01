@@ -1,10 +1,14 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http"
-import { mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises"
+import { spawn } from "node:child_process"
+import { mkdir, readFile, readdir, rename, stat, writeFile } from "node:fs/promises"
 import { homedir } from "node:os"
 import path from "node:path"
 import { composeInstructions } from "./compose"
+import { MissingCliError, type ExecRunner } from "./control-client"
 import type { FileSystemPort } from "./file-system"
+import { launchFirstMate } from "./launch"
 import { provisionProject } from "./provision"
+import { findRegistration, loadRegistry } from "./registry"
 
 const rawServicePort = process.env.OPENCHAMBER_SERVICE_PORT
 const serviceToken = process.env.OPENCHAMBER_SERVICE_TOKEN
@@ -32,6 +36,7 @@ const nodeFileSystem: FileSystemPort = {
   readFile: (filePath) => readFile(filePath, "utf8"),
   writeFile: (filePath, contents) => writeFile(filePath, contents, "utf8"),
   createDirectory: (directoryPath) => mkdir(directoryPath, { recursive: true }),
+  rename: (fromPath, toPath) => rename(fromPath, toPath),
   listDirectories: async (directoryPath) => {
     try {
       const entries = await readdir(directoryPath, { withFileTypes: true })
@@ -41,6 +46,24 @@ const nodeFileSystem: FileSystemPort = {
     }
   },
 }
+
+const nodeExec: ExecRunner = (command, args) =>
+  new Promise((resolve, reject) => {
+    const child = spawn(command, args, { stdio: ["ignore", "pipe", "pipe"] })
+    const stdoutChunks: Buffer[] = []
+    const stderrChunks: Buffer[] = []
+    child.stdout.on("data", (chunk: Buffer) => stdoutChunks.push(chunk))
+    child.stderr.on("data", (chunk: Buffer) => stderrChunks.push(chunk))
+    child.on("error", reject)
+    child.on("close", (code) => {
+      if (code === 0) {
+        resolve(Buffer.concat(stdoutChunks).toString("utf8"))
+        return
+      }
+      const stderr = Buffer.concat(stderrChunks).toString("utf8").trim()
+      reject(new Error(`${command} exited with code ${code}${stderr === "" ? "" : `: ${stderr}`}`))
+    })
+  })
 
 const templateReader = (templateName: string): Promise<string> =>
   readFile(path.join(templatesDirectory, templateName), "utf8")
@@ -74,16 +97,23 @@ function readJsonBody(request: IncomingMessage): Promise<unknown> {
   })
 }
 
-async function handleProvision(request: IncomingMessage, response: ServerResponse): Promise<void> {
+async function readProjectDirectory(request: IncomingMessage): Promise<string | undefined> {
   let payload: unknown
   try {
     payload = await readJsonBody(request)
   } catch {
-    respondJson(response, 400, { error: "request body must be JSON" })
-    return
+    return undefined
   }
   const projectDirectory = isRecord(payload) ? payload.projectDirectory : undefined
   if (typeof projectDirectory !== "string" || projectDirectory.trim() === "") {
+    return undefined
+  }
+  return projectDirectory
+}
+
+async function handleProvision(request: IncomingMessage, response: ServerResponse): Promise<void> {
+  const projectDirectory = await readProjectDirectory(request)
+  if (projectDirectory === undefined) {
     respondJson(response, 400, { error: "projectDirectory must be a non-empty string" })
     return
   }
@@ -101,18 +131,92 @@ async function handleProvision(request: IncomingMessage, response: ServerRespons
   }
 }
 
+async function handleLaunch(request: IncomingMessage, response: ServerResponse): Promise<void> {
+  const projectDirectory = await readProjectDirectory(request)
+  if (projectDirectory === undefined) {
+    respondJson(response, 400, { error: "projectDirectory must be a non-empty string" })
+    return
+  }
+  try {
+    const { registration } = await launchFirstMate({
+      filesystem: nodeFileSystem,
+      exec: nodeExec,
+      templateReader,
+      homeRoot,
+      projectDirectory,
+    })
+    respondJson(response, 200, registration)
+  } catch (error) {
+    if (error instanceof MissingCliError) {
+      respondJson(response, 503, { error: error.message, code: "cli-missing" })
+      return
+    }
+    respondJson(response, 500, { error: error instanceof Error ? error.message : "launch failed" })
+  }
+}
+
+async function handleRegistryList(response: ServerResponse): Promise<void> {
+  const registrations = await loadRegistry(nodeFileSystem, homeRoot)
+  respondJson(response, 200, { registrations: Object.values(registrations) })
+}
+
+async function handleRegistryItem(slug: string, response: ServerResponse): Promise<void> {
+  const registrations = await loadRegistry(nodeFileSystem, homeRoot)
+  const registration = registrations[slug]
+  if (registration === undefined) {
+    respondJson(response, 404, { error: `no first mate registered for slug ${slug}` })
+    return
+  }
+  respondJson(response, 200, registration)
+}
+
+async function handleLookup(url: URL, response: ServerResponse): Promise<void> {
+  const directory = url.searchParams.get("directory")
+  if (directory === null || directory.trim() === "") {
+    respondJson(response, 400, { error: "directory must be a non-empty string" })
+    return
+  }
+  try {
+    const registrations = await loadRegistry(nodeFileSystem, homeRoot)
+    const registration = findRegistration(registrations, directory)
+    respondJson(response, 200, { registration: registration ?? null })
+  } catch (error) {
+    respondJson(response, 500, { error: error instanceof Error ? error.message : "lookup failed" })
+  }
+}
+
 async function handleRequest(request: IncomingMessage, response: ServerResponse): Promise<void> {
   if (!isAuthorized(request)) {
     respondJson(response, 401, { error: "unauthorized" })
     return
   }
-  const pathname = new URL(request.url ?? "/", "http://127.0.0.1").pathname
+  const url = new URL(request.url ?? "/", "http://127.0.0.1")
+  const pathname = url.pathname
   if (request.method === "GET" && pathname === "/health") {
     respondJson(response, 200, { status: "ok" })
     return
   }
   if (request.method === "POST" && pathname === "/provision") {
     await handleProvision(request, response)
+    return
+  }
+  if (request.method === "POST" && pathname === "/launch") {
+    await handleLaunch(request, response)
+    return
+  }
+  if (request.method === "GET" && pathname === "/registry") {
+    await handleRegistryList(response)
+    return
+  }
+  if (request.method === "GET" && pathname.startsWith("/registry/")) {
+    const slug = decodeURIComponent(pathname.slice("/registry/".length))
+    if (slug !== "") {
+      await handleRegistryItem(slug, response)
+      return
+    }
+  }
+  if (request.method === "GET" && pathname === "/lookup") {
+    await handleLookup(url, response)
     return
   }
   response.statusCode = 404

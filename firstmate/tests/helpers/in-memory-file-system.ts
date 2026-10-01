@@ -20,6 +20,14 @@ export class InMemoryFileSystem {
     createDirectory: async (directoryPath) => {
       this.entries.set(directoryPath, { kind: "directory" })
     },
+    rename: async (fromPath, toPath) => {
+      const node = this.entries.get(fromPath)
+      if (node === undefined) {
+        throw new Error(`file not found: ${fromPath}`)
+      }
+      this.entries.delete(fromPath)
+      this.entries.set(toPath, node)
+    },
     listDirectories: async (directoryPath) => {
       const prefix = `${directoryPath}/`
       const names: string[] = []

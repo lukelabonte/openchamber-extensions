@@ -1,6 +1,6 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http"
 import { spawn } from "node:child_process"
-import { mkdir, readFile, readdir, rename, stat, writeFile, appendFile } from "node:fs/promises"
+import { access, chmod, mkdir, readFile, readdir, rename, stat, writeFile, appendFile, constants as fsConstants } from "node:fs/promises"
 import { homedir } from "node:os"
 import path from "node:path"
 import { requestRelaunch, steerWorker } from "./actions"
@@ -16,6 +16,7 @@ import { launchFirstMate } from "./launch"
 import { createSupervisionPoller } from "./poller"
 import { provisionProject } from "./provision"
 import { findRegistration, loadRegistry, type Registration } from "./registry"
+import { createWatchRunner, type WatchExecPort } from "./watches"
 
 const rawServicePort = process.env.OPENCHAMBER_SERVICE_PORT
 const serviceToken = process.env.OPENCHAMBER_SERVICE_TOKEN
@@ -58,6 +59,26 @@ const nodeFileSystem: FileSystemPort = {
       return []
     }
   },
+  listExecutableFiles: async (directoryPath) => {
+    const names: string[] = []
+    let entries
+    try {
+      entries = await readdir(directoryPath, { withFileTypes: true })
+    } catch {
+      return []
+    }
+    for (const entry of entries) {
+      if (!entry.isFile()) continue
+      try {
+        await access(path.join(directoryPath, entry.name), fsConstants.X_OK)
+        names.push(entry.name)
+      } catch {
+        // Not executable → not a watch.
+      }
+    }
+    return names
+  },
+  setExecutable: (filePath) => chmod(filePath, 0o755),
 }
 
 const nodeExec: ExecRunner = (command, args) =>
@@ -80,24 +101,88 @@ const nodeExec: ExecRunner = (command, args) =>
 
 const nodeFetcher: HttpFetcher = (url, init) => fetch(url, init)
 
+// Watch scripts run as the executables they are (shebangs, user-owned), with
+// the project home as their working directory, the env contract from the
+// spec, a hard timeout, and a stdout cap. The runner owns the timeout value;
+// this port honors whatever it is passed. The byte cap keeps the TAIL of the
+// output — the newest lines — and says how much head was dropped, so the
+// truncation marker the coordinator sees is honest about the full output.
+const watchOutputCapBytes = 256 * 1024
+
+const nodeWatchExec: WatchExecPort = ({ scriptPath, cwd, env, timeoutMs }) =>
+  new Promise((resolve, reject) => {
+    const child = spawn(scriptPath, [], { cwd, env: { ...process.env, ...env }, stdio: ["ignore", "pipe", "pipe"] })
+    const stdoutChunks: Buffer[] = []
+    let totalBytes = 0
+    let tailBytes = 0
+    let timedOut = false
+    const timer = setTimeout(() => {
+      timedOut = true
+      child.kill()
+    }, timeoutMs)
+    child.stdout.on("data", (chunk: Buffer) => {
+      totalBytes += chunk.length
+      stdoutChunks.push(chunk)
+      tailBytes += chunk.length
+      while (tailBytes > watchOutputCapBytes) {
+        const overflow = tailBytes - watchOutputCapBytes
+        const first = stdoutChunks[0]
+        if (first.length <= overflow) {
+          stdoutChunks.shift()
+          tailBytes -= first.length
+        } else {
+          stdoutChunks[0] = first.subarray(overflow)
+          tailBytes -= overflow
+        }
+      }
+    })
+    child.on("error", (error) => {
+      clearTimeout(timer)
+      reject(error)
+    })
+    child.on("close", (code) => {
+      clearTimeout(timer)
+      const droppedHeadBytes = totalBytes - tailBytes
+      const kept = Buffer.concat(stdoutChunks).toString("utf8")
+      resolve({
+        stdout: droppedHeadBytes > 0 ? `…[truncated ${droppedHeadBytes} bytes]\n${kept}` : kept,
+        exitCode: code,
+        timedOut,
+      })
+    })
+  })
+
 const templateReader = (templateName: string): Promise<string> =>
   readFile(path.join(templatesDirectory, templateName), "utf8")
 
 const defaultPollIntervalMs = 15_000
+const defaultWatchIntervalMs = 60_000
 
-function readPollIntervalMs(): number {
-  const raw = process.env.FIRSTMATE_POLL_MS
-  if (raw === undefined || raw.trim() === "") return defaultPollIntervalMs
+function readIntervalMs(env: string | undefined, fallback: number, name: string): number {
+  const raw = process.env[env]
+  if (raw === undefined || raw.trim() === "") return fallback
   const value = Number(raw)
   if (!Number.isInteger(value) || value <= 0) {
-    throw new Error("FIRSTMATE_POLL_MS must be a positive integer")
+    throw new Error(`${name} must be a positive integer`)
   }
   return value
 }
 
+function readPollIntervalMs(): number {
+  return readIntervalMs("FIRSTMATE_POLL_MS", defaultPollIntervalMs, "FIRSTMATE_POLL_MS")
+}
+
+// Watch ticks are cheap discovery+due checks; the schedule granularity itself
+// is minutes. The override exists so tests can tick faster.
+function readWatchIntervalMs(): number {
+  return readIntervalMs("FIRSTMATE_WATCH_MS", defaultWatchIntervalMs, "FIRSTMATE_WATCH_MS")
+}
+
 const pollIntervalMs = readPollIntervalMs()
+const watchIntervalMs = readWatchIntervalMs()
 const clock = createNodeClock()
 const supervisionPoller = createSupervisionPoller({ filesystem: nodeFileSystem, exec: nodeExec, homeRoot })
+const watchRunner = createWatchRunner({ filesystem: nodeFileSystem, exec: nodeWatchExec, clock, homeRoot })
 
 // One supervision round: poll every registered project's workers, then
 // deliver each project's notification to its coordinator. A failed delivery is
@@ -123,6 +208,32 @@ async function runSupervisionRound(): Promise<void> {
     }
   } finally {
     roundInFlight = false
+  }
+}
+
+// One watch round: run every due watch, then deliver its notifications to the
+// project's coordinator. Like the supervision round, rounds never overlap and
+// a failed delivery is absorbed — the coordinator's answer (or the board's
+// delivery error slot) is where a lost watch message would surface from.
+let watchRoundInFlight = false
+
+async function runWatchRound(): Promise<void> {
+  if (watchRoundInFlight) return
+  watchRoundInFlight = true
+  try {
+    const round = await watchRunner.tick()
+    for (const notification of round.notifications) {
+      try {
+        await deliverNotification({ exec: nodeExec, clock, notification })
+      } catch {
+        // Never thrown into the interval; the next due run re-reports.
+      }
+    }
+  } catch {
+    // A tick must never reject into the interval — an unhandled rejection
+    // would kill the service. The round is skipped; the next one re-reads.
+  } finally {
+    watchRoundInFlight = false
   }
 }
 
@@ -459,6 +570,65 @@ async function handleInterrupt(request: IncomingMessage, response: ServerRespons
   }
 }
 
+// Watches: the card lists every watch of a registered project (shared ones
+// included, keyed per project for their enabled switch); toggling persists to
+// the project's settings.json.
+async function handleWatchesList(url: URL, response: ServerResponse): Promise<void> {
+  const slug = url.searchParams.get("slug")
+  if (slug === null || slug.trim() === "") {
+    respondJson(response, 400, { error: "slug must be a non-empty string" })
+    return
+  }
+  try {
+    const registrations = await loadRegistry(nodeFileSystem, homeRoot)
+    if (!Object.hasOwn(registrations, slug)) {
+      respondJson(response, 404, { error: `no first mate registered for slug ${slug}` })
+      return
+    }
+    const watches = await watchRunner.listWatches(slug)
+    respondJson(response, 200, { watches })
+  } catch (error) {
+    respondJson(response, 500, { error: error instanceof Error ? error.message : "watches read failed" })
+  }
+}
+
+async function handleWatchesToggle(request: IncomingMessage, response: ServerResponse): Promise<void> {
+  const payload = await readJsonRecord(request)
+  const slug = recordString(payload, "slug")
+  const name = recordString(payload, "name")
+  const enabled = payload?.enabled
+  const source = payload?.source
+  if (slug === undefined || name === undefined || typeof enabled !== "boolean") {
+    respondJson(response, 400, { error: "slug and name must be non-empty strings and enabled a boolean" })
+    return
+  }
+  if (source !== undefined && source !== "shared" && source !== "project") {
+    respondJson(response, 400, { error: `source must be "shared" or "project" when given` })
+    return
+  }
+  try {
+    const registrations = await loadRegistry(nodeFileSystem, homeRoot)
+    if (!Object.hasOwn(registrations, slug)) {
+      respondJson(response, 404, { error: `no first mate registered for slug ${slug}` })
+      return
+    }
+    const result = await watchRunner.setEnabled(slug, source, name, enabled)
+    if (result === "unknown-watch") {
+      respondJson(response, 404, { error: `no watch named ${name} for slug ${slug}` })
+      return
+    }
+    if (result === "ambiguous-watch") {
+      respondJson(response, 409, {
+        error: `the watch name ${name} matches both a shared and a project watch for ${slug}; pass source "shared" or "project"`,
+      })
+      return
+    }
+    respondJson(response, 200, { toggled: true, name, enabled })
+  } catch (error) {
+    respondJson(response, 500, { error: error instanceof Error ? error.message : "watch toggle failed" })
+  }
+}
+
 async function handleEnd(request: IncomingMessage, response: ServerResponse): Promise<void> {
   const payload = await readJsonRecord(request)
   const slug = recordString(payload, "slug")
@@ -532,6 +702,14 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse)
     await handleBoard(url, response)
     return
   }
+  if (request.method === "GET" && pathname === "/watches") {
+    await handleWatchesList(url, response)
+    return
+  }
+  if (request.method === "POST" && pathname === "/watches/toggle") {
+    await handleWatchesToggle(request, response)
+    return
+  }
   if (request.method === "POST" && pathname === "/steer") {
     await handleSteer(request, response)
     return
@@ -565,8 +743,13 @@ const pollTimer = clock.startInterval(() => {
   void runSupervisionRound()
 }, pollIntervalMs)
 
+const watchTimer = clock.startInterval(() => {
+  void runWatchRound()
+}, watchIntervalMs)
+
 function stopService(): void {
   pollTimer.cancel()
+  watchTimer.cancel()
   server.close(() => process.exit(0))
   // A lingering keep-alive connection must not keep the host's child alive.
   setTimeout(() => process.exit(0), 500).unref()

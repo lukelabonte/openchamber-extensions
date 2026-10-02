@@ -4,7 +4,7 @@
 
 **Blocked by:** 06 (Live board panel)
 
-**Status:** ready-for-agent
+**Status:** resolved
 
 - [ ] Service discovers the per-directory opencode endpoint and issues session.abort for the worker session
 - [ ] Observed: a running worker's turn stops on Interrupt

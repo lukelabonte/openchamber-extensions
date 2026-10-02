@@ -2,6 +2,7 @@ import { connectHost } from "@openchamber/sdk"
 import { applyHostReady, mountBadge, type Tone } from "@openchamber/sdk/ui"
 import { parseBoardWorkers, type BoardCard, type BoardColumn } from "./board"
 import { initialPanelState, reducePanelState, type Board, type PanelEvent, type PanelState, type RegistrationInfo } from "./state"
+import { formatLastRun, parseWatches, watchOutcomeLabel, type WatchRow } from "./watches"
 
 const host = connectHost()
 
@@ -107,9 +108,11 @@ function startBoardFlow(registration: RegistrationInfo): void {
   stopBoardFlow()
   activeRegistration = registration
   void fetchBoard()
+  void fetchWatches()
   void ensureSessionsSubscription(registration)
   boardRefreshTimer = window.setInterval(() => {
     void fetchBoard()
+    void fetchWatches()
     // While the live subscription is unattached (transient host failures),
     // every refresh tick is also a re-attach attempt.
     void ensureSessionsSubscription(registration)
@@ -198,6 +201,33 @@ async function fetchBoard(): Promise<void> {
   }
 }
 
+// Watches ride the same cadence as the board: one fetch on mount and one per
+// refresh interval. The service is the authority; a toggle is only sent to
+// it, and the refetch carries the authoritative switch state back.
+async function fetchWatches(): Promise<void> {
+  const registration = activeRegistration
+  if (registration === null) return
+  try {
+    const result = await host.serviceRequest({ method: "GET", path: "/watches", query: { slug: registration.slug } })
+    if (activeRegistration !== registration) return
+    if (result.status !== 200) {
+      dispatch({ type: "watches-failed", message: `Reading the watches failed (status ${result.status}).` })
+      return
+    }
+    let body: { watches?: unknown }
+    try {
+      body = JSON.parse(result.body) as { watches?: unknown }
+    } catch {
+      dispatch({ type: "watches-failed", message: "Reading the watches failed: the service sent a malformed answer." })
+      return
+    }
+    dispatch({ type: "watches-loaded", watches: parseWatches(body.watches) })
+  } catch {
+    if (activeRegistration !== registration) return
+    dispatch({ type: "watches-failed", message: "Reading the watches failed: the service is unreachable." })
+  }
+}
+
 function dispatch(event: PanelEvent): void {
   state = reducePanelState(state, event)
   render(state)
@@ -225,6 +255,7 @@ function render(state: PanelState): void {
     case "registered":
       root.append(coordinatorRow(state.registration, state.coordinatorTitle))
       root.append(boardView(state.board))
+      root.append(watchesCard(state))
       break
     case "cli-missing":
       root.append(text("The openchamber CLI is required. Install it with: npm i -g @openchamber/web"))
@@ -529,4 +560,99 @@ function endButton(card: BoardCard, say: ActionFeedback): HTMLElement {
     })
   })
   return button
+}
+
+// The Watches card sits below the board columns: one row per watch with its
+// schedule, last run, last outcome, an on/off switch, and the expandable last
+// output. The service runs watches only while the extension runs — the copy
+// says so plainly rather than implying coverage that does not exist.
+function watchesCard(state: PanelState & { kind: "registered" }): HTMLElement {
+  const section = document.createElement("section")
+  const heading = document.createElement("h2")
+  heading.textContent = "Watches"
+  section.append(heading)
+  section.append(
+    text(
+      "Watches run only while OpenChamber is running. A run whose time passed while the machine was asleep fires once, late; runs missed while OpenChamber was closed are never made up.",
+    ),
+  )
+  if (state.watchesError !== undefined) {
+    if (state.watches !== undefined) {
+      section.append(text(`${state.watchesError} — showing the last read watches.`))
+    } else {
+      section.append(text(state.watchesError))
+      return section
+    }
+  }
+  if (state.watches === undefined) {
+    section.append(text("Reading the watches…"))
+    return section
+  }
+  if (state.watches.length === 0) {
+    section.append(text("No watches. Add an executable script with a `# schedule:` comment to the home's watches/ directory."))
+    return section
+  }
+  for (const watch of state.watches) section.append(watchRow(watch))
+  return section
+}
+
+function watchRow(watch: WatchRow): HTMLElement {
+  const article = document.createElement("article")
+  const title = document.createElement("strong")
+  title.textContent = `${watch.name} (${watch.source})`
+  article.append(title, enabledSwitch(watch))
+  const summary = text(
+    `${watch.schedule} — last run ${formatLastRun(watch.lastRunAt)} — ${watchOutcomeLabel(watch)}`,
+  )
+  if (watch.error !== undefined) summary.append(warningBadge(watch.error))
+  article.append(summary)
+  if (watch.lastOutput !== undefined) article.append(lastOutput(watch.lastOutput))
+  return article
+}
+
+function enabledSwitch(watch: WatchRow): HTMLElement {
+  const checkbox = document.createElement("input")
+  checkbox.type = "checkbox"
+  checkbox.checked = watch.enabled
+  checkbox.setAttribute("aria-label", `Enable watch ${watch.name}`)
+  checkbox.addEventListener("change", () => {
+    const registration = activeRegistration
+    if (registration === null) return
+    void toggleWatch(registration, watch, checkbox.checked)
+  })
+  return checkbox
+}
+
+async function toggleWatch(registration: RegistrationInfo, watch: WatchRow, enabled: boolean): Promise<void> {
+  try {
+    const result = await host.serviceRequest({
+      method: "POST",
+      path: "/watches/toggle",
+      body: JSON.stringify({ slug: registration.slug, name: watch.name, source: watch.source, enabled }),
+    })
+    if (result.status !== 200) {
+      let message = `Toggling the watch failed (status ${result.status}).`
+      try {
+        const parsed = JSON.parse(result.body) as { error?: string }
+        if (parsed.error !== undefined) message = parsed.error
+      } catch {
+        // A non-JSON body only matters through the generic message above.
+      }
+      dispatch({ type: "watches-failed", message })
+    }
+  } catch {
+    dispatch({ type: "watches-failed", message: "Toggling the watch failed: the service is unreachable." })
+  } finally {
+    void fetchWatches()
+  }
+}
+
+function lastOutput(output: string): HTMLElement {
+  const details = document.createElement("details")
+  const summary = document.createElement("summary")
+  summary.textContent = "Last output"
+  const pre = document.createElement("pre")
+  pre.textContent = output
+  details.append(summary, pre)
+  return details
 }

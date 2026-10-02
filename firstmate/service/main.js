@@ -1,7 +1,7 @@
 // service/main.ts
 import { createServer } from "node:http";
 import { spawn } from "node:child_process";
-import { mkdir, readFile, readdir, rename, stat, writeFile, appendFile } from "node:fs/promises";
+import { access, chmod, mkdir, readFile, readdir, rename, stat, writeFile, appendFile, constants as fsConstants } from "node:fs/promises";
 import { homedir } from "node:os";
 import path2 from "node:path";
 
@@ -448,7 +448,9 @@ function pathHash(directoryPath) {
 var sharedDirectories = ["watches"];
 var sharedFiles = [
   { templateName: "charter.md", fileName: "charter.md" },
-  { templateName: "captain.md", fileName: "captain.md" }
+  { templateName: "captain.md", fileName: "captain.md" },
+  { templateName: "watches-README.md", fileName: "watches/README.md" },
+  { templateName: "pr-watch", fileName: "watches/pr-watch", executable: true }
 ];
 var projectDirectories = ["briefs", "reports", "watches"];
 var projectFiles = [
@@ -529,6 +531,8 @@ async function createFiles(input) {
     if (await filesystem.exists(filePath))
       continue;
     await filesystem.writeFile(filePath, await templateReader(file.templateName));
+    if (file.executable === true)
+      await filesystem.setExecutable(filePath);
   }
 }
 
@@ -851,6 +855,366 @@ function describeEvent(event) {
   }
 }
 
+// service/watch-schedule.ts
+class ScheduleParseError extends Error {
+  constructor(expression, reason) {
+    super(`invalid watch schedule "${expression}": ${reason}`);
+    this.name = "ScheduleParseError";
+  }
+}
+function parseCronExpression(expression) {
+  const fields = expression.trim().split(/\s+/);
+  if (fields.length !== 5) {
+    throw new ScheduleParseError(expression, "expected 5 fields (minute hour day-of-month month day-of-week)");
+  }
+  const minutes = parseField(fields[0], 0, 59, expression);
+  const hours = parseField(fields[1], 0, 23, expression);
+  const daysOfMonth = parseField(fields[2], 1, 31, expression);
+  const months = parseField(fields[3], 1, 12, expression);
+  const daysOfWeek = parseField(fields[4], 0, 7, expression);
+  if (daysOfWeek.has(7)) {
+    daysOfWeek.delete(7);
+    daysOfWeek.add(0);
+  }
+  if (fields[2] !== "*") {
+    const shortestDayOfMonth = Math.min(...daysOfMonth);
+    const longestRestrictedMonth = Math.max(...[...months].map((month) => daysInMonth[month - 1]));
+    if (shortestDayOfMonth > longestRestrictedMonth) {
+      throw new ScheduleParseError(expression, `no restricted month has a day ${shortestDayOfMonth}`);
+    }
+  }
+  return {
+    minutes,
+    hours,
+    daysOfMonth,
+    months,
+    daysOfWeek,
+    anyDayOfMonth: fields[2] === "*",
+    anyDayOfWeek: fields[4] === "*"
+  };
+}
+var daysInMonth = [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+function parseField(field, min, max, expression) {
+  const values = new Set;
+  for (const part of field.split(",")) {
+    const pieces = part.split("/");
+    if (pieces.length > 2)
+      throw new ScheduleParseError(expression, `"${part}" has too many steps`);
+    const [base, stepPart] = pieces;
+    const step = stepPart === undefined ? 1 : Number(stepPart);
+    if (!Number.isInteger(step) || step < 1) {
+      throw new ScheduleParseError(expression, `"${part}" has an invalid step`);
+    }
+    let low;
+    let high;
+    if (base === "*") {
+      low = min;
+      high = max;
+    } else if (base.includes("-")) {
+      const [from, to] = base.split("-");
+      if (from === "" || to === "") {
+        throw new ScheduleParseError(expression, `"${part}" has an empty range end`);
+      }
+      low = Number(from);
+      high = Number(to);
+    } else {
+      low = Number(base);
+      high = stepPart === undefined ? low : max;
+    }
+    if (!Number.isInteger(low) || !Number.isInteger(high)) {
+      throw new ScheduleParseError(expression, `"${part}" is not a number, a range, or *`);
+    }
+    if (low < min || high > max || low > high) {
+      throw new ScheduleParseError(expression, `"${part}" is out of range ${min}-${max}`);
+    }
+    for (let value = low;value <= high; value += step)
+      values.add(value);
+  }
+  return values;
+}
+var searchBoundMs = 4 * 366 * 24 * 60 * 60000;
+function computeNextRun(schedule, from) {
+  const candidate = new Date(from.getTime());
+  candidate.setSeconds(0, 0);
+  candidate.setMinutes(candidate.getMinutes() + 1);
+  const deadlineMs = from.getTime() + searchBoundMs;
+  while (candidate.getTime() <= deadlineMs) {
+    if (!schedule.months.has(candidate.getMonth() + 1)) {
+      candidate.setMonth(candidate.getMonth() + 1, 1);
+      candidate.setHours(0, 0, 0, 0);
+      continue;
+    }
+    if (!dayMatches(schedule, candidate)) {
+      candidate.setDate(candidate.getDate() + 1);
+      candidate.setHours(0, 0, 0, 0);
+      continue;
+    }
+    if (!schedule.hours.has(candidate.getHours())) {
+      candidate.setHours(candidate.getHours() + 1, 0, 0, 0);
+      continue;
+    }
+    if (!schedule.minutes.has(candidate.getMinutes())) {
+      candidate.setMinutes(candidate.getMinutes() + 1);
+      continue;
+    }
+    return candidate;
+  }
+  return null;
+}
+function dayMatches(schedule, date) {
+  if (schedule.anyDayOfMonth && schedule.anyDayOfWeek)
+    return true;
+  const domMatch = schedule.daysOfMonth.has(date.getDate());
+  const dowMatch = schedule.daysOfWeek.has(date.getDay());
+  if (schedule.anyDayOfMonth)
+    return dowMatch;
+  if (schedule.anyDayOfWeek)
+    return domMatch;
+  return domMatch || dowMatch;
+}
+function extractScheduleComment(scriptText) {
+  for (const line of scriptText.split(`
+`, 20)) {
+    const match = /^#\s*schedule:\s*(.+?)\s*$/.exec(line);
+    if (match !== null)
+      return match[1];
+  }
+  return;
+}
+
+// service/watches.ts
+class WatchSettingsError extends Error {
+  constructor(settingsPath, cause) {
+    super(`FirstMate settings file ${settingsPath} is unreadable (${cause}). Fix or delete it, then toggle the watch again.`);
+    this.name = "WatchSettingsError";
+  }
+}
+var lastOutputMaxLength = 2000;
+var watchTimeoutMs = 60000;
+function createWatchRunner(input) {
+  const { filesystem, exec, clock, homeRoot } = input;
+  const timeoutMs = input.timeoutMs ?? watchTimeoutMs;
+  const runStates = new Map;
+  const stateKey = (slug, source, name) => `${slug}
+${source}
+${name}`;
+  async function discoverWatches(slug) {
+    const directories = [
+      { source: "shared", directory: `${homeRoot}/shared/watches` },
+      { source: "project", directory: `${homeRoot}/projects/${slug}/watches` }
+    ];
+    const discovered = [];
+    for (const { source, directory } of directories) {
+      for (const name of await filesystem.listExecutableFiles(directory)) {
+        const scriptPath = `${directory}/${name}`;
+        let scriptText;
+        try {
+          scriptText = await filesystem.readFile(scriptPath);
+        } catch {
+          continue;
+        }
+        const expression = extractScheduleComment(scriptText);
+        if (expression === undefined)
+          continue;
+        let error;
+        try {
+          parseCronExpression(expression);
+        } catch (parseError) {
+          error = parseError instanceof Error ? parseError.message : String(parseError);
+        }
+        discovered.push({
+          name,
+          source,
+          schedule: expression,
+          ...error !== undefined ? { error } : {},
+          scriptPath
+        });
+      }
+    }
+    return discovered;
+  }
+  async function loadEnabledOverrides(slug) {
+    const settingsPath = `${homeRoot}/projects/${slug}/settings.json`;
+    if (!await filesystem.exists(settingsPath))
+      return {};
+    let settings;
+    try {
+      settings = JSON.parse(await filesystem.readFile(settingsPath));
+    } catch {
+      return {};
+    }
+    if (!isPlainObject2(settings))
+      return {};
+    const watches = settings.watches;
+    if (!isPlainObject2(watches))
+      return {};
+    const overrides = {};
+    for (const source of ["shared", "project"]) {
+      if (isPlainObject2(watches[source]))
+        overrides[source] = watches[source];
+    }
+    return overrides;
+  }
+  async function tick() {
+    const notifications = [];
+    let registrations;
+    try {
+      registrations = await loadRegistry(filesystem, homeRoot);
+    } catch {
+      return { notifications };
+    }
+    const nowMs = clock.nowMs();
+    const now = new Date(nowMs);
+    for (const registration of Object.values(registrations)) {
+      const { slug, homeDirectory, coordinatorSessionId } = registration;
+      const watches = await discoverWatches(slug);
+      if (watches.length === 0)
+        continue;
+      const enabledOverrides = await loadEnabledOverrides(slug);
+      for (const watch of watches) {
+        if (watch.error !== undefined)
+          continue;
+        if (!isEnabled(enabledOverrides, watch.source, watch.name))
+          continue;
+        const key = stateKey(slug, watch.source, watch.name);
+        let runState = runStates.get(key);
+        if (runState === undefined) {
+          const next = computeNextRun(parseCronExpression(watch.schedule), now);
+          runState = { nextRunAtMs: next === null ? Number.POSITIVE_INFINITY : next.getTime() };
+          runStates.set(key, runState);
+        }
+        if (nowMs < runState.nextRunAtMs)
+          continue;
+        await runWatch(registration, watch, runState, notifications);
+        const following = computeNextRun(parseCronExpression(watch.schedule), new Date(clock.nowMs()));
+        runState.nextRunAtMs = following === null ? Number.POSITIVE_INFINITY : following.getTime();
+      }
+    }
+    return { notifications };
+  }
+  async function runWatch(registration, watch, runState, notifications) {
+    const { slug, homeDirectory, coordinatorSessionId } = registration;
+    const stateDirectory = `${homeDirectory}/watch-state/${watch.name}`;
+    runState.lastRunAt = new Date(clock.nowMs()).toISOString();
+    let execution;
+    let execError;
+    try {
+      await filesystem.createDirectory(stateDirectory);
+      execution = await exec({
+        scriptPath: watch.scriptPath,
+        cwd: homeDirectory,
+        env: {
+          FIRSTMATE_HOME: homeDirectory,
+          FIRSTMATE_BACKLOG: `${homeDirectory}/backlog.md`,
+          FIRSTMATE_WATCH_STATE: stateDirectory
+        },
+        timeoutMs
+      });
+    } catch (error) {
+      execError = error instanceof Error ? error.message : String(error);
+    }
+    const failed = execError !== undefined || execution === undefined || execution.timedOut || execution.exitCode !== 0;
+    if (failed) {
+      const reason = execError ?? (execution?.timedOut === true ? `timed out after ${timeoutMs} ms` : execution?.exitCode === null ? "was killed without an exit code" : `exited with code ${execution?.exitCode}`);
+      runState.lastOutcome = "failed";
+      runState.lastOutput = execution === undefined ? "" : presentOutput(execution.stdout.trim());
+      if (runState.reportedFailure !== true) {
+        runState.reportedFailure = true;
+        notifications.push({
+          slug,
+          coordinatorSessionId,
+          homeDirectory,
+          message: `FirstMate (${slug}) watch ${watch.name} failed: ${reason}`
+        });
+      }
+      return;
+    }
+    runState.reportedFailure = false;
+    const output = presentOutput(execution.stdout.trim());
+    if (output === "") {
+      runState.lastOutcome = "empty";
+      runState.lastOutput = "";
+      return;
+    }
+    runState.lastOutcome = "ok";
+    runState.lastOutput = output;
+    notifications.push({
+      slug,
+      coordinatorSessionId,
+      homeDirectory,
+      message: `FirstMate (${slug}) watch ${watch.name}:
+${output}`
+    });
+  }
+  async function listWatches(slug) {
+    const watches = await discoverWatches(slug);
+    const enabledOverrides = await loadEnabledOverrides(slug);
+    return watches.map((watch) => {
+      const runState = runStates.get(stateKey(slug, watch.source, watch.name));
+      return {
+        name: watch.name,
+        source: watch.source,
+        schedule: watch.schedule,
+        enabled: isEnabled(enabledOverrides, watch.source, watch.name),
+        ...watch.error !== undefined ? { error: watch.error } : {},
+        ...runState?.lastRunAt !== undefined ? { lastRunAt: runState.lastRunAt } : {},
+        ...runState?.lastOutcome !== undefined ? { lastOutcome: runState.lastOutcome } : {},
+        ...runState?.lastOutput !== undefined && runState.lastOutput !== "" ? { lastOutput: runState.lastOutput } : {}
+      };
+    });
+  }
+  async function setEnabled(slug, source, name, enabled) {
+    const candidates = (await discoverWatches(slug)).filter((watch) => watch.name === name);
+    const targets = source === undefined ? candidates : candidates.filter((watch) => watch.source === source);
+    if (targets.length === 0)
+      return "unknown-watch";
+    if (targets.length > 1)
+      return "ambiguous-watch";
+    const target = targets[0];
+    const settingsPath = `${homeRoot}/projects/${slug}/settings.json`;
+    let settings = {};
+    if (await filesystem.exists(settingsPath)) {
+      let parsed;
+      try {
+        parsed = JSON.parse(await filesystem.readFile(settingsPath));
+      } catch (error) {
+        throw new WatchSettingsError(settingsPath, error instanceof Error ? error.message : "not valid JSON");
+      }
+      if (!isPlainObject2(parsed)) {
+        throw new WatchSettingsError(settingsPath, "not a JSON object");
+      }
+      settings = parsed;
+    }
+    const stored = isPlainObject2(settings.watches) ? { ...settings.watches } : {};
+    const forSource = isPlainObject2(stored[target.source]) ? { ...stored[target.source] } : {};
+    const entry = isPlainObject2(forSource[name]) ? { ...forSource[name] } : {};
+    entry.enabled = enabled;
+    forSource[name] = entry;
+    stored[target.source] = forSource;
+    settings.watches = stored;
+    const tempPath = `${settingsPath}.${Date.now()}-${Math.random().toString(16).slice(2)}.tmp`;
+    await filesystem.writeFile(tempPath, `${JSON.stringify(settings, null, 2)}
+`);
+    await filesystem.rename(tempPath, settingsPath);
+    return "ok";
+  }
+  return { tick, listWatches, setEnabled };
+}
+function isEnabled(overrides, source, name) {
+  const entry = overrides[source]?.[name];
+  return !(isPlainObject2(entry) && entry.enabled === false);
+}
+function isPlainObject2(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+function presentOutput(text) {
+  if (text.length <= lastOutputMaxLength)
+    return text;
+  const dropped = text.length - lastOutputMaxLength;
+  return `…[truncated ${dropped} chars]
+${text.slice(-lastOutputMaxLength)}`;
+}
+
 // service/main.ts
 var rawServicePort = process.env.OPENCHAMBER_SERVICE_PORT;
 var serviceToken = process.env.OPENCHAMBER_SERVICE_TOKEN;
@@ -885,7 +1249,26 @@ var nodeFileSystem = {
     } catch {
       return [];
     }
-  }
+  },
+  listExecutableFiles: async (directoryPath) => {
+    const names = [];
+    let entries;
+    try {
+      entries = await readdir(directoryPath, { withFileTypes: true });
+    } catch {
+      return [];
+    }
+    for (const entry of entries) {
+      if (!entry.isFile())
+        continue;
+      try {
+        await access(path2.join(directoryPath, entry.name), fsConstants.X_OK);
+        names.push(entry.name);
+      } catch {}
+    }
+    return names;
+  },
+  setExecutable: (filePath) => chmod(filePath, 493)
 };
 var nodeExec = (command, args) => new Promise((resolve, reject) => {
   const child = spawn(command, args, { stdio: ["ignore", "pipe", "pipe"] });
@@ -904,21 +1287,73 @@ var nodeExec = (command, args) => new Promise((resolve, reject) => {
   });
 });
 var nodeFetcher = (url, init) => fetch(url, init);
+var watchOutputCapBytes = 256 * 1024;
+var nodeWatchExec = ({ scriptPath, cwd, env, timeoutMs }) => new Promise((resolve, reject) => {
+  const child = spawn(scriptPath, [], { cwd, env: { ...process.env, ...env }, stdio: ["ignore", "pipe", "pipe"] });
+  const stdoutChunks = [];
+  let totalBytes = 0;
+  let tailBytes = 0;
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    child.kill();
+  }, timeoutMs);
+  child.stdout.on("data", (chunk) => {
+    totalBytes += chunk.length;
+    stdoutChunks.push(chunk);
+    tailBytes += chunk.length;
+    while (tailBytes > watchOutputCapBytes) {
+      const overflow = tailBytes - watchOutputCapBytes;
+      const first = stdoutChunks[0];
+      if (first.length <= overflow) {
+        stdoutChunks.shift();
+        tailBytes -= first.length;
+      } else {
+        stdoutChunks[0] = first.subarray(overflow);
+        tailBytes -= overflow;
+      }
+    }
+  });
+  child.on("error", (error) => {
+    clearTimeout(timer);
+    reject(error);
+  });
+  child.on("close", (code) => {
+    clearTimeout(timer);
+    const droppedHeadBytes = totalBytes - tailBytes;
+    const kept = Buffer.concat(stdoutChunks).toString("utf8");
+    resolve({
+      stdout: droppedHeadBytes > 0 ? `…[truncated ${droppedHeadBytes} bytes]
+${kept}` : kept,
+      exitCode: code,
+      timedOut
+    });
+  });
+});
 var templateReader = (templateName) => readFile(path2.join(templatesDirectory, templateName), "utf8");
 var defaultPollIntervalMs = 15000;
-function readPollIntervalMs() {
-  const raw = process.env.FIRSTMATE_POLL_MS;
+var defaultWatchIntervalMs = 60000;
+function readIntervalMs(env, fallback, name) {
+  const raw = process.env[env];
   if (raw === undefined || raw.trim() === "")
-    return defaultPollIntervalMs;
+    return fallback;
   const value = Number(raw);
   if (!Number.isInteger(value) || value <= 0) {
-    throw new Error("FIRSTMATE_POLL_MS must be a positive integer");
+    throw new Error(`${name} must be a positive integer`);
   }
   return value;
 }
+function readPollIntervalMs() {
+  return readIntervalMs("FIRSTMATE_POLL_MS", defaultPollIntervalMs, "FIRSTMATE_POLL_MS");
+}
+function readWatchIntervalMs() {
+  return readIntervalMs("FIRSTMATE_WATCH_MS", defaultWatchIntervalMs, "FIRSTMATE_WATCH_MS");
+}
 var pollIntervalMs = readPollIntervalMs();
+var watchIntervalMs = readWatchIntervalMs();
 var clock = createNodeClock();
 var supervisionPoller = createSupervisionPoller({ filesystem: nodeFileSystem, exec: nodeExec, homeRoot });
+var watchRunner = createWatchRunner({ filesystem: nodeFileSystem, exec: nodeWatchExec, clock, homeRoot });
 var roundInFlight = false;
 async function runSupervisionRound() {
   if (roundInFlight)
@@ -936,6 +1371,22 @@ async function runSupervisionRound() {
     }
   } finally {
     roundInFlight = false;
+  }
+}
+var watchRoundInFlight = false;
+async function runWatchRound() {
+  if (watchRoundInFlight)
+    return;
+  watchRoundInFlight = true;
+  try {
+    const round = await watchRunner.tick();
+    for (const notification of round.notifications) {
+      try {
+        await deliverNotification({ exec: nodeExec, clock, notification });
+      } catch {}
+    }
+  } catch {} finally {
+    watchRoundInFlight = false;
   }
 }
 function isAuthorized(request) {
@@ -1234,6 +1685,60 @@ async function handleInterrupt(request, response) {
     respondJson(response, 500, { error: error instanceof Error ? error.message : "interrupt failed" });
   }
 }
+async function handleWatchesList(url, response) {
+  const slug = url.searchParams.get("slug");
+  if (slug === null || slug.trim() === "") {
+    respondJson(response, 400, { error: "slug must be a non-empty string" });
+    return;
+  }
+  try {
+    const registrations = await loadRegistry(nodeFileSystem, homeRoot);
+    if (!Object.hasOwn(registrations, slug)) {
+      respondJson(response, 404, { error: `no first mate registered for slug ${slug}` });
+      return;
+    }
+    const watches = await watchRunner.listWatches(slug);
+    respondJson(response, 200, { watches });
+  } catch (error) {
+    respondJson(response, 500, { error: error instanceof Error ? error.message : "watches read failed" });
+  }
+}
+async function handleWatchesToggle(request, response) {
+  const payload = await readJsonRecord(request);
+  const slug = recordString(payload, "slug");
+  const name = recordString(payload, "name");
+  const enabled = payload?.enabled;
+  const source = payload?.source;
+  if (slug === undefined || name === undefined || typeof enabled !== "boolean") {
+    respondJson(response, 400, { error: "slug and name must be non-empty strings and enabled a boolean" });
+    return;
+  }
+  if (source !== undefined && source !== "shared" && source !== "project") {
+    respondJson(response, 400, { error: `source must be "shared" or "project" when given` });
+    return;
+  }
+  try {
+    const registrations = await loadRegistry(nodeFileSystem, homeRoot);
+    if (!Object.hasOwn(registrations, slug)) {
+      respondJson(response, 404, { error: `no first mate registered for slug ${slug}` });
+      return;
+    }
+    const result = await watchRunner.setEnabled(slug, source, name, enabled);
+    if (result === "unknown-watch") {
+      respondJson(response, 404, { error: `no watch named ${name} for slug ${slug}` });
+      return;
+    }
+    if (result === "ambiguous-watch") {
+      respondJson(response, 409, {
+        error: `the watch name ${name} matches both a shared and a project watch for ${slug}; pass source "shared" or "project"`
+      });
+      return;
+    }
+    respondJson(response, 200, { toggled: true, name, enabled });
+  } catch (error) {
+    respondJson(response, 500, { error: error instanceof Error ? error.message : "watch toggle failed" });
+  }
+}
 async function handleEnd(request, response) {
   const payload = await readJsonRecord(request);
   const slug = recordString(payload, "slug");
@@ -1303,6 +1808,14 @@ async function handleRequest(request, response) {
     await handleBoard(url, response);
     return;
   }
+  if (request.method === "GET" && pathname === "/watches") {
+    await handleWatchesList(url, response);
+    return;
+  }
+  if (request.method === "POST" && pathname === "/watches/toggle") {
+    await handleWatchesToggle(request, response);
+    return;
+  }
   if (request.method === "POST" && pathname === "/steer") {
     await handleSteer(request, response);
     return;
@@ -1333,8 +1846,12 @@ server.listen(servicePort, "127.0.0.1");
 var pollTimer = clock.startInterval(() => {
   runSupervisionRound();
 }, pollIntervalMs);
+var watchTimer = clock.startInterval(() => {
+  runWatchRound();
+}, watchIntervalMs);
 function stopService() {
   pollTimer.cancel();
+  watchTimer.cancel();
   server.close(() => process.exit(0));
   setTimeout(() => process.exit(0), 500).unref();
 }

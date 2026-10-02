@@ -16,6 +16,8 @@ interface ProvisionedProject {
 interface HomeFile {
   templateName: string
   fileName: string
+  /** Executable watch scripts are installed with the exec bit set. */
+  executable?: boolean
 }
 
 const sharedDirectories = ["watches"]
@@ -23,6 +25,8 @@ const sharedDirectories = ["watches"]
 const sharedFiles: HomeFile[] = [
   { templateName: "charter.md", fileName: "charter.md" },
   { templateName: "captain.md", fileName: "captain.md" },
+  { templateName: "watches-README.md", fileName: "watches/README.md" },
+  { templateName: "pr-watch", fileName: "watches/pr-watch", executable: true },
 ]
 
 const projectDirectories = ["briefs", "reports", "watches"]
@@ -125,5 +129,6 @@ async function createFiles(input: {
     const filePath = `${parentDirectory}/${file.fileName}`
     if (await filesystem.exists(filePath)) continue
     await filesystem.writeFile(filePath, await templateReader(file.templateName))
+    if (file.executable === true) await filesystem.setExecutable(filePath)
   }
 }

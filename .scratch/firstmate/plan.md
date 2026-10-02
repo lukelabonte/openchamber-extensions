@@ -88,3 +88,5 @@ Runtime home (created by the service, never by hand):
 ## Acceptance target
 
 Managed project: `openchamber-extensions` (`/Users/lukelabonte/Developer/open-source/openchamber-extensions`, GitHub remote present). Acceptance will push real branches/PRs to it, add a trivial CI workflow for green/red control, and perform one real `+yolo` merge into its default branch, then the refusal cases. Two independent tasks for the two-worker proof will be small, real changes to this repo (proposed in the spec).
+
+Runtime-verify at acceptance (watches): the service lists watch files by exec permission and runs them directly (no `sh` wrapper) — confirm on the real host that a non-executable file in `watches/` is never listed or run, and that an installed `pr-watch` carries the exec bit end to end.

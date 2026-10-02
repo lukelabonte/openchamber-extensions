@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test"
 import { spawn, type ChildProcess } from "node:child_process"
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import { accessSync, constants as fsConstants, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import net from "node:net"
 import os from "node:os"
 import path from "node:path"
@@ -91,6 +91,10 @@ describe("POST /provision", () => {
     expect(existsSync(path.join(tempHome, "shared", "charter.md"))).toBe(true)
     expect(existsSync(path.join(tempHome, "shared", "captain.md"))).toBe(true)
     expect(existsSync(path.join(tempHome, "shared", "watches"))).toBe(true)
+    expect(existsSync(path.join(tempHome, "shared", "watches", "README.md"))).toBe(true)
+    const installedPrWatch = path.join(tempHome, "shared", "watches", "pr-watch")
+    expect(existsSync(installedPrWatch)).toBe(true)
+    accessSync(installedPrWatch, fsConstants.X_OK)
     for (const fileName of ["charter.md", "captain.md", "backlog.md", "projects.md", "settings.json", "AGENTS.md"]) {
       expect(existsSync(path.join(projectHome, fileName))).toBe(true)
     }

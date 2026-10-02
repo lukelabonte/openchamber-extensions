@@ -9,6 +9,8 @@ const templateContents: Record<string, string> = {
   "backlog.md": "BACKLOG TEMPLATE",
   "projects.md": "PROJECTS TEMPLATE",
   "settings.json": "{}\n",
+  "watches-README.md": "WATCHES README TEMPLATE",
+  "pr-watch": "PR WATCH TEMPLATE",
 }
 
 function templateReaderFor(contents: Record<string, string>) {
@@ -38,6 +40,9 @@ describe("provisionProject", () => {
     expect(filesystem.fileContents("/home/firstmate/shared/charter.md")).toBe("SHARED CHARTER TEMPLATE")
     expect(filesystem.fileContents("/home/firstmate/shared/captain.md")).toBe("CAPTAIN ORDERS TEMPLATE")
     expect(filesystem.directoryExists("/home/firstmate/shared/watches")).toBe(true)
+    expect(filesystem.fileContents("/home/firstmate/shared/watches/README.md")).toBe("WATCHES README TEMPLATE")
+    expect(filesystem.fileContents("/home/firstmate/shared/watches/pr-watch")).toBe("PR WATCH TEMPLATE")
+    expect(filesystem.fileIsExecutable("/home/firstmate/shared/watches/pr-watch")).toBe(true)
     expect(filesystem.fileContents("/home/firstmate/projects/sunrise/charter.md")).toBe("PROJECT CHARTER TEMPLATE")
     expect(filesystem.fileContents("/home/firstmate/projects/sunrise/captain.md")).toBe("CAPTAIN ORDERS TEMPLATE")
     expect(filesystem.fileContents("/home/firstmate/projects/sunrise/backlog.md")).toBe("BACKLOG TEMPLATE")
@@ -53,6 +58,7 @@ describe("provisionProject", () => {
   test("never overwrites a user-edited file", async () => {
     const filesystem = new InMemoryFileSystem()
     filesystem.seedFile("/home/firstmate/shared/charter.md", "CAPTAIN EDIT")
+    filesystem.seedFile("/home/firstmate/shared/watches/pr-watch", "CAPTAIN EDIT")
     filesystem.seedFile("/home/firstmate/projects/sunrise/backlog.md", "CAPTAIN EDIT")
     await provisionProject({
       filesystem: filesystem.port,
@@ -62,6 +68,7 @@ describe("provisionProject", () => {
     })
 
     expect(filesystem.fileContents("/home/firstmate/shared/charter.md")).toBe("CAPTAIN EDIT")
+    expect(filesystem.fileContents("/home/firstmate/shared/watches/pr-watch")).toBe("CAPTAIN EDIT")
     expect(filesystem.fileContents("/home/firstmate/projects/sunrise/backlog.md")).toBe("CAPTAIN EDIT")
   })
 

@@ -1,4 +1,5 @@
 import { groupBoardColumns, type BoardColumn, type BoardWorker } from "./board"
+import type { WatchRow } from "./watches"
 
 export interface RegistrationInfo {
   slug: string
@@ -21,7 +22,15 @@ export type PanelState =
   | { kind: "no-directory" }
   | { kind: "unregistered" }
   | { kind: "launching" }
-  | { kind: "registered"; registration: RegistrationInfo; coordinatorTitle?: string; board: Board }
+  | {
+      kind: "registered"
+      registration: RegistrationInfo
+      coordinatorTitle?: string
+      board: Board
+      /** The service's watch list for this project, once fetched. */
+      watches?: WatchRow[]
+      watchesError?: string
+    }
   | { kind: "cli-missing" }
   | { kind: "service-error"; message: string }
 
@@ -34,6 +43,8 @@ export type PanelEvent =
   | { type: "launch-failed"; cliMissing: boolean; message: string }
   | { type: "board-loaded"; workers: BoardWorker[]; malformedCount?: number; deliveryError?: string }
   | { type: "board-failed"; message: string }
+  | { type: "watches-loaded"; watches: WatchRow[] }
+  | { type: "watches-failed"; message: string }
   | { type: "sessions-changed"; coordinatorTitle?: string }
 
 export function initialPanelState(): PanelState {
@@ -90,6 +101,12 @@ export function reducePanelState(state: PanelState, event: PanelEvent): PanelSta
     case "board-failed":
       if (state.kind !== "registered") return state
       return { ...state, board: { kind: "error", message: event.message } }
+    case "watches-loaded":
+      if (state.kind !== "registered") return state
+      return { ...state, watches: event.watches, watchesError: undefined }
+    case "watches-failed":
+      if (state.kind !== "registered") return state
+      return { ...state, watchesError: event.message }
     case "sessions-changed":
       if (state.kind !== "registered") return state
       return {

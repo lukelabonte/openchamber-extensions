@@ -3,7 +3,7 @@ import { spawn } from "node:child_process"
 import { access, chmod, mkdir, readFile, readdir, rename, stat, writeFile, appendFile, constants as fsConstants } from "node:fs/promises"
 import { homedir } from "node:os"
 import path from "node:path"
-import { requestRelaunch, steerWorker } from "./actions"
+import { requestRelaunch, sendCoordinatorMessage, steerWorker } from "./actions"
 import { archiveSession, loadArchivedSessionIds } from "./archive"
 import { loadBacklog, type BacklogTask } from "./backlog"
 import { composeInstructions } from "./compose"
@@ -18,6 +18,7 @@ import { provisionProject } from "./provision"
 import { findRegistration, loadRegistry, type Registration } from "./registry"
 import { loadLandingRecords } from "./landing-record"
 import { parseShippingMode } from "./shipping-mode"
+import { loadSuggestions, removeSuggestion, suggestionsPath, type Suggestion } from "./suggestions"
 import { createWatchRunner, type WatchExecPort } from "./watches"
 
 const rawServicePort = process.env.OPENCHAMBER_SERVICE_PORT
@@ -692,6 +693,147 @@ async function handleShipping(url: URL, response: ServerResponse): Promise<void>
   }
 }
 
+// Suggestions: the coordinator keeps suggestions.md (one
+// `- <label> :: <what to send>` per line); the panel renders each as a
+// button. Sending relays the suggestion's text to the coordinator verbatim
+// and then removes the line; dismissing removes it without sending. A failed
+// send leaves the line on disk — the captain can press again.
+async function resolveSuggestion(
+  slug: string,
+  label: string,
+): Promise<
+  | { kind: "unknown-slug" }
+  | { kind: "unknown-label" }
+  | { kind: "found"; registration: Registration; suggestion: Suggestion }
+> {
+  const registrations = await loadRegistry(nodeFileSystem, homeRoot)
+  if (!Object.hasOwn(registrations, slug)) return { kind: "unknown-slug" }
+  const suggestions = await loadSuggestions(nodeFileSystem, suggestionsPath(homeRoot, slug))
+  const suggestion = suggestions.find((candidate) => candidate.label === label)
+  return suggestion === undefined
+    ? { kind: "unknown-label" }
+    : { kind: "found", registration: registrations[slug], suggestion }
+}
+
+async function handleSuggestions(url: URL, response: ServerResponse): Promise<void> {
+  const slug = url.searchParams.get("slug")
+  if (slug === null || slug.trim() === "") {
+    respondJson(response, 400, { error: "slug must be a non-empty string" })
+    return
+  }
+  try {
+    const registrations = await loadRegistry(nodeFileSystem, homeRoot)
+    if (!Object.hasOwn(registrations, slug)) {
+      respondJson(response, 404, { error: `no first mate registered for slug ${slug}` })
+      return
+    }
+    const suggestions = await loadSuggestions(nodeFileSystem, suggestionsPath(homeRoot, slug))
+    respondJson(response, 200, { suggestions })
+  } catch (error) {
+    respondJson(response, 500, { error: error instanceof Error ? error.message : "suggestions read failed" })
+  }
+}
+
+async function handleSuggestionSend(request: IncomingMessage, response: ServerResponse): Promise<void> {
+  const payload = await readJsonRecord(request)
+  const slug = recordString(payload, "slug")
+  const label = recordString(payload, "label")
+  if (slug === undefined || label === undefined) {
+    respondJson(response, 400, { error: "slug and label must be non-empty strings" })
+    return
+  }
+  try {
+    const context = await resolveSuggestion(slug, label)
+    if (context.kind === "unknown-slug") {
+      respondJson(response, 404, { error: `no first mate registered for slug ${slug}` })
+      return
+    }
+    if (context.kind === "unknown-label") {
+      respondJson(response, 404, { error: `no suggestion labeled "${label}" on ${slug}'s suggestions.md` })
+      return
+    }
+    await sendCoordinatorMessage({
+      exec: nodeExec,
+      coordinator: {
+        sessionId: context.registration.coordinatorSessionId,
+        directory: context.registration.homeDirectory,
+      },
+      text: context.suggestion.text,
+    })
+    // The send reached the coordinator; only then does the line leave the
+    // file, so a failed send leaves the suggestion ready to press again.
+    await removeSuggestion(nodeFileSystem, suggestionsPath(homeRoot, slug), label)
+    respondJson(response, 200, { sent: true })
+  } catch (error) {
+    respondActionError(response, error, "suggestion send failed")
+  }
+}
+
+async function handleSuggestionDismiss(request: IncomingMessage, response: ServerResponse): Promise<void> {
+  const payload = await readJsonRecord(request)
+  const slug = recordString(payload, "slug")
+  const label = recordString(payload, "label")
+  if (slug === undefined || label === undefined) {
+    respondJson(response, 400, { error: "slug and label must be non-empty strings" })
+    return
+  }
+  try {
+    const context = await resolveSuggestion(slug, label)
+    if (context.kind === "unknown-slug") {
+      respondJson(response, 404, { error: `no first mate registered for slug ${slug}` })
+      return
+    }
+    if (context.kind === "unknown-label") {
+      respondJson(response, 404, { error: `no suggestion labeled "${label}" on ${slug}'s suggestions.md` })
+      return
+    }
+    await removeSuggestion(nodeFileSystem, suggestionsPath(homeRoot, slug), label)
+    respondJson(response, 200, { dismissed: true })
+  } catch (error) {
+    respondJson(response, 500, { error: error instanceof Error ? error.message : "suggestion dismiss failed" })
+  }
+}
+
+// /bearings and /ahoy: the panel composes nothing — the command word is
+// relayed to the coordinator as the message, verbatim; the variant that also
+// writes a dated report into reports/ is spelled "bearings-file" on the wire.
+const commandPrompts: Record<string, string> = {
+  bearings: "/bearings",
+  "bearings-file": "/bearings file",
+  ahoy: "/ahoy",
+}
+
+async function handleCommand(request: IncomingMessage, response: ServerResponse): Promise<void> {
+  const payload = await readJsonRecord(request)
+  const slug = recordString(payload, "slug")
+  const command = recordString(payload, "command")
+  if (slug === undefined || command === undefined) {
+    respondJson(response, 400, { error: "slug and command must be non-empty strings" })
+    return
+  }
+  const prompt = commandPrompts[command]
+  if (prompt === undefined) {
+    respondJson(response, 400, { error: `unknown command "${command}"` })
+    return
+  }
+  try {
+    const registrations = await loadRegistry(nodeFileSystem, homeRoot)
+    if (!Object.hasOwn(registrations, slug)) {
+      respondJson(response, 404, { error: `no first mate registered for slug ${slug}` })
+      return
+    }
+    const registration = registrations[slug]
+    await sendCoordinatorMessage({
+      exec: nodeExec,
+      coordinator: { sessionId: registration.coordinatorSessionId, directory: registration.homeDirectory },
+      text: prompt,
+    })
+    respondJson(response, 200, { sent: true })
+  } catch (error) {
+    respondActionError(response, error, "command send failed")
+  }
+}
+
 async function handleRequest(request: IncomingMessage, response: ServerResponse): Promise<void> {
   if (!isAuthorized(request)) {
     respondJson(response, 401, { error: "unauthorized" })
@@ -740,6 +882,22 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse)
   }
   if (request.method === "GET" && pathname === "/shipping") {
     await handleShipping(url, response)
+    return
+  }
+  if (request.method === "GET" && pathname === "/suggestions") {
+    await handleSuggestions(url, response)
+    return
+  }
+  if (request.method === "POST" && pathname === "/suggestion/send") {
+    await handleSuggestionSend(request, response)
+    return
+  }
+  if (request.method === "POST" && pathname === "/suggestion/dismiss") {
+    await handleSuggestionDismiss(request, response)
+    return
+  }
+  if (request.method === "POST" && pathname === "/command") {
+    await handleCommand(request, response)
     return
   }
   if (request.method === "POST" && pathname === "/watches/toggle") {

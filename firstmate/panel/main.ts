@@ -2,6 +2,7 @@ import { connectHost } from "@openchamber/sdk"
 import { applyHostReady, mountBadge, type Tone } from "@openchamber/sdk/ui"
 import { parseBoardWorkers, type BoardCard, type BoardColumn } from "./board"
 import { parseShipping, shippingBadgeLabel, type ShippingInfo } from "./shipping"
+import { parseSuggestions, type SuggestionRow } from "./suggestions"
 import { initialPanelState, reducePanelState, type Board, type PanelEvent, type PanelState, type RegistrationInfo } from "./state"
 import { formatLastRun, parseWatches, watchOutcomeLabel, type WatchRow } from "./watches"
 
@@ -111,11 +112,13 @@ function startBoardFlow(registration: RegistrationInfo): void {
   void fetchBoard()
   void fetchWatches()
   void fetchShipping()
+  void fetchSuggestions()
   void ensureSessionsSubscription(registration)
   boardRefreshTimer = window.setInterval(() => {
     void fetchBoard()
     void fetchWatches()
     void fetchShipping()
+    void fetchSuggestions()
     // While the live subscription is unattached (transient host failures),
     // every refresh tick is also a re-attach attempt.
     void ensureSessionsSubscription(registration)
@@ -248,6 +251,34 @@ async function fetchShipping(): Promise<void> {
   }
 }
 
+// Suggestions ride the same cadence as the board, the watches, and the
+// shipping badge: one fetch on mount and one per refresh interval. The
+// service is the authority on suggestions.md; a send or dismiss is only sent
+// to it, and the refetch carries the file's new state back.
+async function fetchSuggestions(): Promise<void> {
+  const registration = activeRegistration
+  if (registration === null) return
+  try {
+    const result = await host.serviceRequest({ method: "GET", path: "/suggestions", query: { slug: registration.slug } })
+    if (activeRegistration !== registration) return
+    if (result.status !== 200) {
+      dispatch({ type: "suggestions-failed", message: `Reading the suggestions failed (status ${result.status}).` })
+      return
+    }
+    let body: { suggestions?: unknown }
+    try {
+      body = JSON.parse(result.body) as { suggestions?: unknown }
+    } catch {
+      dispatch({ type: "suggestions-failed", message: "Reading the suggestions failed: the service sent a malformed answer." })
+      return
+    }
+    dispatch({ type: "suggestions-loaded", suggestions: parseSuggestions(body.suggestions) })
+  } catch {
+    if (activeRegistration !== registration) return
+    dispatch({ type: "suggestions-failed", message: "Reading the suggestions failed: the service is unreachable." })
+  }
+}
+
 function dispatch(event: PanelEvent): void {
   state = reducePanelState(state, event)
   render(state)
@@ -274,6 +305,7 @@ function render(state: PanelState): void {
       break
     case "registered":
       root.append(coordinatorRow(state.registration, state.coordinatorTitle, state.shipping))
+      root.append(suggestionsSection(state))
       root.append(boardView(state.board))
       root.append(watchesCard(state))
       break
@@ -321,7 +353,47 @@ function coordinatorRow(
       : `${coordinatorTitle} (session ${registration.coordinatorSessionId})`
   if (shipping !== undefined) row.append(shippingBadge(shipping))
   row.append(openChatButton(registration.coordinatorSessionId))
+  row.append(bearingsControl(registration), ahoyButton(registration))
   return row
+}
+
+// /bearings and /ahoy reach the coordinator verbatim through POST /command —
+// the panel composes nothing. The checkbox sends the variant that also
+// writes the dated report into the home's reports/ directory; the answer
+// arrives in the coordinator's chat, which Open chat opens.
+function bearingsControl(registration: RegistrationInfo): HTMLElement {
+  const control = document.createElement("span")
+  const checkbox = document.createElement("input")
+  checkbox.type = "checkbox"
+  checkbox.setAttribute("aria-label", "Write the bearings report to a dated file")
+  const button = document.createElement("button")
+  button.textContent = "Bearings"
+  button.addEventListener("click", () => {
+    void sendCommand(registration, checkbox.checked ? "bearings-file" : "bearings")
+  })
+  control.append(checkbox, button)
+  return control
+}
+
+function ahoyButton(registration: RegistrationInfo): HTMLElement {
+  const button = document.createElement("button")
+  button.textContent = "Ahoy"
+  button.addEventListener("click", () => {
+    void sendCommand(registration, "ahoy")
+  })
+  return button
+}
+
+async function sendCommand(registration: RegistrationInfo, command: string): Promise<void> {
+  try {
+    await host.serviceRequest({
+      method: "POST",
+      path: "/command",
+      body: JSON.stringify({ slug: registration.slug, command }),
+    })
+  } catch {
+    // The service is unreachable; the next press retries.
+  }
 }
 
 // The project's shipping mode as read from projects.md via the service; a
@@ -596,6 +668,81 @@ function endButton(card: BoardCard, say: ActionFeedback): HTMLElement {
     })
   })
   return button
+}
+
+// The Suggestions section sits below the coordinator row, above the board:
+// one button per suggestion — pressed to send the suggestion's text to the
+// coordinator — with a trash button that dismisses it unsent. The refetch
+// after each call carries the file's new state; the line the service removed
+// stops rendering.
+function suggestionsSection(state: PanelState & { kind: "registered" }): HTMLElement {
+  const section = document.createElement("section")
+  const heading = document.createElement("h2")
+  heading.textContent = "Suggestions"
+  section.append(heading)
+  if (state.suggestionsError !== undefined) {
+    if (state.suggestions !== undefined) {
+      section.append(text(`${state.suggestionsError} — showing the last read suggestions.`))
+    } else {
+      section.append(text(state.suggestionsError))
+      return section
+    }
+  }
+  if (state.suggestions === undefined) {
+    section.append(text("Reading the suggestions…"))
+    return section
+  }
+  if (state.suggestions.length === 0) {
+    section.append(text("No suggestions."))
+    return section
+  }
+  for (const suggestion of state.suggestions) section.append(suggestionRow(suggestion))
+  return section
+}
+
+function suggestionRow(suggestion: SuggestionRow): HTMLElement {
+  const row = document.createElement("div")
+  const send = document.createElement("button")
+  send.textContent = suggestion.label
+  send.title = suggestion.text
+  send.addEventListener("click", () => {
+    void runSuggestionAction("/suggestion/send", suggestion.label)
+  })
+  const dismiss = document.createElement("button")
+  dismiss.textContent = "Dismiss"
+  dismiss.title = `Dismiss "${suggestion.label}" without sending`
+  dismiss.setAttribute("aria-label", `Dismiss ${suggestion.label}`)
+  dismiss.addEventListener("click", () => {
+    void runSuggestionAction("/suggestion/dismiss", suggestion.label)
+  })
+  row.append(send, dismiss)
+  return row
+}
+
+async function runSuggestionAction(pathname: string, label: string): Promise<void> {
+  const registration = activeRegistration
+  if (registration === null) return
+  try {
+    const result = await host.serviceRequest({
+      method: "POST",
+      path: pathname,
+      body: JSON.stringify({ slug: registration.slug, label }),
+    })
+    if (result.status !== 200) {
+      let message = `The action failed (status ${result.status}).`
+      try {
+        const parsed = JSON.parse(result.body) as { error?: string }
+        if (parsed.error !== undefined) message = parsed.error
+      } catch {
+        // A non-JSON body only matters through the generic message above.
+      }
+      dispatch({ type: "suggestions-failed", message })
+    }
+  } catch {
+    dispatch({ type: "suggestions-failed", message: "The action failed: the service is unreachable." })
+  } finally {
+    void fetchSuggestions()
+  }
 }
 
 // The Watches card sits below the board columns: one row per watch with its

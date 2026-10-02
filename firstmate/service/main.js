@@ -129,6 +129,13 @@ async function steerWorker(input) {
     return { coordinatorNotified: false, coordinatorError: error instanceof Error ? error.message : String(error) };
   }
 }
+async function sendCoordinatorMessage(input) {
+  await sessionSend(input.exec, {
+    sessionId: input.coordinator.sessionId,
+    directory: input.coordinator.directory,
+    prompt: input.text
+  });
+}
 async function requestRelaunch(input) {
   await sessionSend(input.exec, {
     sessionId: input.coordinator.sessionId,
@@ -983,6 +990,39 @@ function parseModeValue(value) {
   if (!isShippingMode(base))
     return { mode: null, yolo: false };
   return { mode: base, yolo };
+}
+
+// service/suggestions.ts
+function suggestionsPath(homeRoot, slug) {
+  return `${homeRoot}/projects/${slug}/suggestions.md`;
+}
+var suggestionLine = /^-\s+(.+?)\s*::\s*(.+)$/;
+function parseSuggestions(markdown) {
+  const suggestions = [];
+  for (const line of markdown.split(`
+`)) {
+    const match = suggestionLine.exec(line.trim());
+    if (match !== null)
+      suggestions.push({ label: match[1], text: match[2] });
+  }
+  return suggestions;
+}
+async function loadSuggestions(filesystem, filePath) {
+  if (!await filesystem.exists(filePath))
+    return [];
+  return parseSuggestions(await filesystem.readFile(filePath));
+}
+async function removeSuggestion(filesystem, filePath, label) {
+  if (!await filesystem.exists(filePath))
+    return;
+  const markdown = await filesystem.readFile(filePath);
+  const kept = markdown.split(`
+`).filter((line) => {
+    const match = suggestionLine.exec(line.trim());
+    return match === null || match[1] !== label;
+  });
+  await filesystem.writeFile(filePath, kept.join(`
+`));
 }
 
 // service/watch-schedule.ts
@@ -1920,6 +1960,123 @@ async function handleShipping(url, response) {
     respondJson(response, 500, { error: error instanceof Error ? error.message : "shipping read failed" });
   }
 }
+async function resolveSuggestion(slug, label) {
+  const registrations = await loadRegistry(nodeFileSystem, homeRoot);
+  if (!Object.hasOwn(registrations, slug))
+    return { kind: "unknown-slug" };
+  const suggestions = await loadSuggestions(nodeFileSystem, suggestionsPath(homeRoot, slug));
+  const suggestion = suggestions.find((candidate) => candidate.label === label);
+  return suggestion === undefined ? { kind: "unknown-label" } : { kind: "found", registration: registrations[slug], suggestion };
+}
+async function handleSuggestions(url, response) {
+  const slug = url.searchParams.get("slug");
+  if (slug === null || slug.trim() === "") {
+    respondJson(response, 400, { error: "slug must be a non-empty string" });
+    return;
+  }
+  try {
+    const registrations = await loadRegistry(nodeFileSystem, homeRoot);
+    if (!Object.hasOwn(registrations, slug)) {
+      respondJson(response, 404, { error: `no first mate registered for slug ${slug}` });
+      return;
+    }
+    const suggestions = await loadSuggestions(nodeFileSystem, suggestionsPath(homeRoot, slug));
+    respondJson(response, 200, { suggestions });
+  } catch (error) {
+    respondJson(response, 500, { error: error instanceof Error ? error.message : "suggestions read failed" });
+  }
+}
+async function handleSuggestionSend(request, response) {
+  const payload = await readJsonRecord(request);
+  const slug = recordString(payload, "slug");
+  const label = recordString(payload, "label");
+  if (slug === undefined || label === undefined) {
+    respondJson(response, 400, { error: "slug and label must be non-empty strings" });
+    return;
+  }
+  try {
+    const context = await resolveSuggestion(slug, label);
+    if (context.kind === "unknown-slug") {
+      respondJson(response, 404, { error: `no first mate registered for slug ${slug}` });
+      return;
+    }
+    if (context.kind === "unknown-label") {
+      respondJson(response, 404, { error: `no suggestion labeled "${label}" on ${slug}'s suggestions.md` });
+      return;
+    }
+    await sendCoordinatorMessage({
+      exec: nodeExec,
+      coordinator: {
+        sessionId: context.registration.coordinatorSessionId,
+        directory: context.registration.homeDirectory
+      },
+      text: context.suggestion.text
+    });
+    await removeSuggestion(nodeFileSystem, suggestionsPath(homeRoot, slug), label);
+    respondJson(response, 200, { sent: true });
+  } catch (error) {
+    respondActionError(response, error, "suggestion send failed");
+  }
+}
+async function handleSuggestionDismiss(request, response) {
+  const payload = await readJsonRecord(request);
+  const slug = recordString(payload, "slug");
+  const label = recordString(payload, "label");
+  if (slug === undefined || label === undefined) {
+    respondJson(response, 400, { error: "slug and label must be non-empty strings" });
+    return;
+  }
+  try {
+    const context = await resolveSuggestion(slug, label);
+    if (context.kind === "unknown-slug") {
+      respondJson(response, 404, { error: `no first mate registered for slug ${slug}` });
+      return;
+    }
+    if (context.kind === "unknown-label") {
+      respondJson(response, 404, { error: `no suggestion labeled "${label}" on ${slug}'s suggestions.md` });
+      return;
+    }
+    await removeSuggestion(nodeFileSystem, suggestionsPath(homeRoot, slug), label);
+    respondJson(response, 200, { dismissed: true });
+  } catch (error) {
+    respondJson(response, 500, { error: error instanceof Error ? error.message : "suggestion dismiss failed" });
+  }
+}
+var commandPrompts = {
+  bearings: "/bearings",
+  "bearings-file": "/bearings file",
+  ahoy: "/ahoy"
+};
+async function handleCommand(request, response) {
+  const payload = await readJsonRecord(request);
+  const slug = recordString(payload, "slug");
+  const command = recordString(payload, "command");
+  if (slug === undefined || command === undefined) {
+    respondJson(response, 400, { error: "slug and command must be non-empty strings" });
+    return;
+  }
+  const prompt = commandPrompts[command];
+  if (prompt === undefined) {
+    respondJson(response, 400, { error: `unknown command "${command}"` });
+    return;
+  }
+  try {
+    const registrations = await loadRegistry(nodeFileSystem, homeRoot);
+    if (!Object.hasOwn(registrations, slug)) {
+      respondJson(response, 404, { error: `no first mate registered for slug ${slug}` });
+      return;
+    }
+    const registration = registrations[slug];
+    await sendCoordinatorMessage({
+      exec: nodeExec,
+      coordinator: { sessionId: registration.coordinatorSessionId, directory: registration.homeDirectory },
+      text: prompt
+    });
+    respondJson(response, 200, { sent: true });
+  } catch (error) {
+    respondActionError(response, error, "command send failed");
+  }
+}
 async function handleRequest(request, response) {
   if (!isAuthorized(request)) {
     respondJson(response, 401, { error: "unauthorized" });
@@ -1968,6 +2125,22 @@ async function handleRequest(request, response) {
   }
   if (request.method === "GET" && pathname === "/shipping") {
     await handleShipping(url, response);
+    return;
+  }
+  if (request.method === "GET" && pathname === "/suggestions") {
+    await handleSuggestions(url, response);
+    return;
+  }
+  if (request.method === "POST" && pathname === "/suggestion/send") {
+    await handleSuggestionSend(request, response);
+    return;
+  }
+  if (request.method === "POST" && pathname === "/suggestion/dismiss") {
+    await handleSuggestionDismiss(request, response);
+    return;
+  }
+  if (request.method === "POST" && pathname === "/command") {
+    await handleCommand(request, response);
     return;
   }
   if (request.method === "POST" && pathname === "/watches/toggle") {

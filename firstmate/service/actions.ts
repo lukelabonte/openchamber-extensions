@@ -53,6 +53,20 @@ export async function steerWorker(input: {
   }
 }
 
+// Suggestion sends and the /bearings and /ahoy commands are pure relays too:
+// the panel's press becomes one coordinator message, verbatim.
+export async function sendCoordinatorMessage(input: {
+  exec: ExecRunner
+  coordinator: CoordinatorRef
+  text: string
+}): Promise<void> {
+  await sessionSend(input.exec, {
+    sessionId: input.coordinator.sessionId,
+    directory: input.coordinator.directory,
+    prompt: input.text,
+  })
+}
+
 // The coordinator is asked to launch a fresh worker in the same worktree
 // (kind: 'existing'): work on disk carries over, the conversation does not.
 // The coordinator owns the backlog edit that supersedes the old card.

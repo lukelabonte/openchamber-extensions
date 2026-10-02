@@ -1,5 +1,6 @@
 import { groupBoardColumns, type BoardColumn, type BoardWorker } from "./board"
 import type { ShippingInfo } from "./shipping"
+import type { SuggestionRow } from "./suggestions"
 import type { WatchRow } from "./watches"
 
 export interface RegistrationInfo {
@@ -33,6 +34,9 @@ export type PanelState =
       watchesError?: string
       /** The project's shipping mode, once fetched from GET /shipping. */
       shipping?: ShippingInfo
+      /** The project's suggestion rows, once fetched from GET /suggestions. */
+      suggestions?: SuggestionRow[]
+      suggestionsError?: string
     }
   | { kind: "cli-missing" }
   | { kind: "service-error"; message: string }
@@ -49,6 +53,8 @@ export type PanelEvent =
   | { type: "watches-loaded"; watches: WatchRow[] }
   | { type: "watches-failed"; message: string }
   | { type: "shipping-loaded"; shipping: ShippingInfo }
+  | { type: "suggestions-loaded"; suggestions: SuggestionRow[] }
+  | { type: "suggestions-failed"; message: string }
   | { type: "sessions-changed"; coordinatorTitle?: string }
 
 export function initialPanelState(): PanelState {
@@ -114,6 +120,12 @@ export function reducePanelState(state: PanelState, event: PanelEvent): PanelSta
     case "shipping-loaded":
       if (state.kind !== "registered") return state
       return { ...state, shipping: event.shipping }
+    case "suggestions-loaded":
+      if (state.kind !== "registered") return state
+      return { ...state, suggestions: event.suggestions, suggestionsError: undefined }
+    case "suggestions-failed":
+      if (state.kind !== "registered") return state
+      return { ...state, suggestionsError: event.message }
     case "sessions-changed":
       if (state.kind !== "registered") return state
       return {

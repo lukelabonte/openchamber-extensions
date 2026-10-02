@@ -4,7 +4,7 @@
 
 **Blocked by:** 05 (Supervision relay)
 
-**Status:** ready-for-agent
+**Status:** resolved
 
 - [ ] Mode parsing (incl. +yolo suffix) unit-tested at the service-core seam
 - [ ] Charter encodes: workers push their own branches and open their own PRs; the coordinator never force-pushes or rewrites history; landing is always a dispatched worker

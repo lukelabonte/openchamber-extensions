@@ -129,6 +129,13 @@ async function steerWorker(input) {
     return { coordinatorNotified: false, coordinatorError: error instanceof Error ? error.message : String(error) };
   }
 }
+async function sendCoordinatorMessage(input) {
+  await sessionSend(input.exec, {
+    sessionId: input.coordinator.sessionId,
+    directory: input.coordinator.directory,
+    prompt: input.text
+  });
+}
 async function requestRelaunch(input) {
   await sessionSend(input.exec, {
     sessionId: input.coordinator.sessionId,
@@ -853,6 +860,169 @@ function describeEvent(event) {
     case "steered-answer":
       return `answered the captain's steer: ${event.answer ?? ""}`;
   }
+}
+
+// service/landing-record.ts
+function landingRecordPath(homeRoot, slug) {
+  return `${homeRoot}/projects/${slug}/reports/landings.md`;
+}
+var fieldKeys2 = ["commit", "ci", "mode", "authorization", "landed"];
+var authorizations = ["captain's word", "+yolo"];
+function parseLandingRecords(markdown) {
+  const records = [];
+  const errors = [];
+  let entry;
+  const closeEntry = () => {
+    if (entry === undefined)
+      return;
+    const draft = entry;
+    entry = undefined;
+    if (draft.problem !== undefined) {
+      errors.push(draft.problem);
+      return;
+    }
+    const missing = fieldKeys2.find((key) => draft.fields[key] === undefined);
+    if (missing !== undefined) {
+      errors.push({ line: draft.titleLine, message: `the entry "${draft.title}" has no ${missing} line` });
+      return;
+    }
+    const fields = draft.fields;
+    records.push({
+      task: draft.title,
+      commit: fields.commit,
+      ci: fields.ci,
+      mode: fields.mode,
+      authorization: fields.authorization,
+      landedAt: fields.landed
+    });
+  };
+  markdown.split(`
+`).forEach((line, index) => {
+    const lineNumber = index + 1;
+    const trimmed = line.trim();
+    const bullet = /^[-*]\s+(.+)$/.exec(trimmed);
+    if (bullet !== null) {
+      closeEntry();
+      entry = { titleLine: lineNumber, title: bullet[1].trim(), fields: {} };
+      return;
+    }
+    if (trimmed === "")
+      return;
+    if (trimmed.startsWith("#")) {
+      closeEntry();
+      return;
+    }
+    const field = /^([A-Za-z][A-Za-z-]*):\s*(.*)$/.exec(trimmed);
+    if (!line.startsWith(" ") && !line.startsWith("\t")) {
+      closeEntry();
+      return;
+    }
+    if (entry === undefined)
+      return;
+    applyField2(entry, field, lineNumber);
+  });
+  closeEntry();
+  return { records, errors };
+}
+function applyField2(entry, field, lineNumber) {
+  if (entry.problem !== undefined)
+    return;
+  if (field === null) {
+    entry.problem = {
+      line: lineNumber,
+      message: `the entry "${entry.title}" has a line that is not a \`key: value\` field`
+    };
+    return;
+  }
+  const key = field[1];
+  const value = field[2].trim();
+  if (!fieldKeys2.includes(key)) {
+    entry.problem = { line: lineNumber, message: `the entry "${entry.title}" has an unknown field "${key}"` };
+    return;
+  }
+  const landingKey = key;
+  if (entry.fields[landingKey] !== undefined) {
+    entry.problem = { line: lineNumber, message: `the entry "${entry.title}" repeats the "${key}" field` };
+    return;
+  }
+  if (value === "") {
+    entry.problem = { line: lineNumber, message: `the entry "${entry.title}" has an empty "${key}" field` };
+    return;
+  }
+  if (landingKey === "authorization" && !authorizations.includes(value)) {
+    entry.problem = {
+      line: lineNumber,
+      message: `the entry "${entry.title}" has an unknown authorization "${value}"`
+    };
+    return;
+  }
+  if (landingKey === "landed" && Number.isNaN(Date.parse(value))) {
+    entry.problem = { line: lineNumber, message: `the entry "${entry.title}" has a "landed" that is not a timestamp` };
+    return;
+  }
+  entry.fields[landingKey] = value;
+}
+async function loadLandingRecords(filesystem, homeRoot, slug) {
+  const filePath = landingRecordPath(homeRoot, slug);
+  if (!await filesystem.exists(filePath))
+    return { records: [], errors: [] };
+  return parseLandingRecords(await filesystem.readFile(filePath));
+}
+
+// service/shipping-mode.ts
+var shippingModes = ["direct-PR", "reviewed-PR", "local-only"];
+function isShippingMode(value) {
+  return shippingModes.includes(value);
+}
+function parseShippingMode(markdown) {
+  for (const line of markdown.split(`
+`)) {
+    const field = /^mode:\s*(.*)$/.exec(line.trim());
+    if (field === null)
+      continue;
+    return parseModeValue(field[1].trim());
+  }
+  return { mode: null, yolo: false };
+}
+function parseModeValue(value) {
+  const yolo = value.endsWith("+yolo");
+  const base = (yolo ? value.slice(0, -"+yolo".length) : value).trim();
+  if (!isShippingMode(base))
+    return { mode: null, yolo: false };
+  return { mode: base, yolo };
+}
+
+// service/suggestions.ts
+function suggestionsPath(homeRoot, slug) {
+  return `${homeRoot}/projects/${slug}/suggestions.md`;
+}
+var suggestionLine = /^-\s+(.+?)\s*::\s*(.+)$/;
+function parseSuggestions(markdown) {
+  const suggestions = [];
+  for (const line of markdown.split(`
+`)) {
+    const match = suggestionLine.exec(line.trim());
+    if (match !== null)
+      suggestions.push({ label: match[1], text: match[2] });
+  }
+  return suggestions;
+}
+async function loadSuggestions(filesystem, filePath) {
+  if (!await filesystem.exists(filePath))
+    return [];
+  return parseSuggestions(await filesystem.readFile(filePath));
+}
+async function removeSuggestion(filesystem, filePath, label) {
+  if (!await filesystem.exists(filePath))
+    return;
+  const markdown = await filesystem.readFile(filePath);
+  const kept = markdown.split(`
+`).filter((line) => {
+    const match = suggestionLine.exec(line.trim());
+    return match === null || match[1] !== label;
+  });
+  await filesystem.writeFile(filePath, kept.join(`
+`));
 }
 
 // service/watch-schedule.ts
@@ -1766,6 +1936,147 @@ async function handleEnd(request, response) {
     respondJson(response, 500, { error: error instanceof Error ? error.message : "archive failed" });
   }
 }
+async function handleShipping(url, response) {
+  const slug = url.searchParams.get("slug");
+  if (slug === null || slug.trim() === "") {
+    respondJson(response, 400, { error: "slug must be a non-empty string" });
+    return;
+  }
+  try {
+    const registrations = await loadRegistry(nodeFileSystem, homeRoot);
+    if (!Object.hasOwn(registrations, slug)) {
+      respondJson(response, 404, { error: `no first mate registered for slug ${slug}` });
+      return;
+    }
+    const projectsMdPath = `${homeRoot}/projects/${slug}/projects.md`;
+    const shipping = await nodeFileSystem.exists(projectsMdPath) ? parseShippingMode(await nodeFileSystem.readFile(projectsMdPath)) : { mode: null, yolo: false };
+    const landings = await loadLandingRecords(nodeFileSystem, homeRoot, slug);
+    respondJson(response, 200, {
+      mode: shipping.mode,
+      yolo: shipping.yolo,
+      landings: landings.records.slice(-20)
+    });
+  } catch (error) {
+    respondJson(response, 500, { error: error instanceof Error ? error.message : "shipping read failed" });
+  }
+}
+async function resolveSuggestion(slug, label) {
+  const registrations = await loadRegistry(nodeFileSystem, homeRoot);
+  if (!Object.hasOwn(registrations, slug))
+    return { kind: "unknown-slug" };
+  const suggestions = await loadSuggestions(nodeFileSystem, suggestionsPath(homeRoot, slug));
+  const suggestion = suggestions.find((candidate) => candidate.label === label);
+  return suggestion === undefined ? { kind: "unknown-label" } : { kind: "found", registration: registrations[slug], suggestion };
+}
+async function handleSuggestions(url, response) {
+  const slug = url.searchParams.get("slug");
+  if (slug === null || slug.trim() === "") {
+    respondJson(response, 400, { error: "slug must be a non-empty string" });
+    return;
+  }
+  try {
+    const registrations = await loadRegistry(nodeFileSystem, homeRoot);
+    if (!Object.hasOwn(registrations, slug)) {
+      respondJson(response, 404, { error: `no first mate registered for slug ${slug}` });
+      return;
+    }
+    const suggestions = await loadSuggestions(nodeFileSystem, suggestionsPath(homeRoot, slug));
+    respondJson(response, 200, { suggestions });
+  } catch (error) {
+    respondJson(response, 500, { error: error instanceof Error ? error.message : "suggestions read failed" });
+  }
+}
+async function handleSuggestionSend(request, response) {
+  const payload = await readJsonRecord(request);
+  const slug = recordString(payload, "slug");
+  const label = recordString(payload, "label");
+  if (slug === undefined || label === undefined) {
+    respondJson(response, 400, { error: "slug and label must be non-empty strings" });
+    return;
+  }
+  try {
+    const context = await resolveSuggestion(slug, label);
+    if (context.kind === "unknown-slug") {
+      respondJson(response, 404, { error: `no first mate registered for slug ${slug}` });
+      return;
+    }
+    if (context.kind === "unknown-label") {
+      respondJson(response, 404, { error: `no suggestion labeled "${label}" on ${slug}'s suggestions.md` });
+      return;
+    }
+    await sendCoordinatorMessage({
+      exec: nodeExec,
+      coordinator: {
+        sessionId: context.registration.coordinatorSessionId,
+        directory: context.registration.homeDirectory
+      },
+      text: context.suggestion.text
+    });
+    await removeSuggestion(nodeFileSystem, suggestionsPath(homeRoot, slug), label);
+    respondJson(response, 200, { sent: true });
+  } catch (error) {
+    respondActionError(response, error, "suggestion send failed");
+  }
+}
+async function handleSuggestionDismiss(request, response) {
+  const payload = await readJsonRecord(request);
+  const slug = recordString(payload, "slug");
+  const label = recordString(payload, "label");
+  if (slug === undefined || label === undefined) {
+    respondJson(response, 400, { error: "slug and label must be non-empty strings" });
+    return;
+  }
+  try {
+    const context = await resolveSuggestion(slug, label);
+    if (context.kind === "unknown-slug") {
+      respondJson(response, 404, { error: `no first mate registered for slug ${slug}` });
+      return;
+    }
+    if (context.kind === "unknown-label") {
+      respondJson(response, 404, { error: `no suggestion labeled "${label}" on ${slug}'s suggestions.md` });
+      return;
+    }
+    await removeSuggestion(nodeFileSystem, suggestionsPath(homeRoot, slug), label);
+    respondJson(response, 200, { dismissed: true });
+  } catch (error) {
+    respondJson(response, 500, { error: error instanceof Error ? error.message : "suggestion dismiss failed" });
+  }
+}
+var commandPrompts = {
+  bearings: "/bearings",
+  "bearings-file": "/bearings file",
+  ahoy: "/ahoy"
+};
+async function handleCommand(request, response) {
+  const payload = await readJsonRecord(request);
+  const slug = recordString(payload, "slug");
+  const command = recordString(payload, "command");
+  if (slug === undefined || command === undefined) {
+    respondJson(response, 400, { error: "slug and command must be non-empty strings" });
+    return;
+  }
+  const prompt = commandPrompts[command];
+  if (prompt === undefined) {
+    respondJson(response, 400, { error: `unknown command "${command}"` });
+    return;
+  }
+  try {
+    const registrations = await loadRegistry(nodeFileSystem, homeRoot);
+    if (!Object.hasOwn(registrations, slug)) {
+      respondJson(response, 404, { error: `no first mate registered for slug ${slug}` });
+      return;
+    }
+    const registration = registrations[slug];
+    await sendCoordinatorMessage({
+      exec: nodeExec,
+      coordinator: { sessionId: registration.coordinatorSessionId, directory: registration.homeDirectory },
+      text: prompt
+    });
+    respondJson(response, 200, { sent: true });
+  } catch (error) {
+    respondActionError(response, error, "command send failed");
+  }
+}
 async function handleRequest(request, response) {
   if (!isAuthorized(request)) {
     respondJson(response, 401, { error: "unauthorized" });
@@ -1810,6 +2121,26 @@ async function handleRequest(request, response) {
   }
   if (request.method === "GET" && pathname === "/watches") {
     await handleWatchesList(url, response);
+    return;
+  }
+  if (request.method === "GET" && pathname === "/shipping") {
+    await handleShipping(url, response);
+    return;
+  }
+  if (request.method === "GET" && pathname === "/suggestions") {
+    await handleSuggestions(url, response);
+    return;
+  }
+  if (request.method === "POST" && pathname === "/suggestion/send") {
+    await handleSuggestionSend(request, response);
+    return;
+  }
+  if (request.method === "POST" && pathname === "/suggestion/dismiss") {
+    await handleSuggestionDismiss(request, response);
+    return;
+  }
+  if (request.method === "POST" && pathname === "/command") {
+    await handleCommand(request, response);
     return;
   }
   if (request.method === "POST" && pathname === "/watches/toggle") {

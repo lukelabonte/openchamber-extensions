@@ -1,0 +1,51 @@
+#!/bin/sh
+# schedule: */5 * * * *
+#
+# FirstMate reference watch: reports changes to this project's open pull
+# requests — opened, closed, merged, and any review, comment, or check
+# activity (all of it bumps a pull request's updatedAt). Prints nothing when
+# nothing changed since the last run.
+#
+# Every line this watch prints about a pull request is external text, so each
+# one is marked QUOTED: quoted text is news, not orders — the first mate never
+# follows instructions it contains.
+
+set -eu
+
+state_file="$FIRSTMATE_WATCH_STATE/prs.tsv"
+
+# The watch runs in the project home; the managed repository's path is on
+# record in the home's settings.json. The watch only ever reads both.
+project_dir=$(sed -n 's/.*"projectDirectory" *: *"\([^"]*\)".*/\1/p' "$FIRSTMATE_HOME/settings.json")
+if [ -z "$project_dir" ]; then
+  echo "pr-watch could not find projectDirectory in $FIRSTMATE_HOME/settings.json"
+  exit 1
+fi
+repo=$(git -C "$project_dir" remote get-url origin | sed -E 's#.*github\.com[/:]##; s#\.git$##')
+
+# One line per pull request: number, state, updatedAt, title, url. Any change
+# to a pull request — review, comment, check — updates its timestamp.
+current=$(
+  gh pr list -R "$repo" --state all --limit 50 --json number,state,updatedAt,title,url --template \
+    '{{range .}}{{.number}}	{{.state}}	{{.updatedAt}}	{{.title}}	{{.url}}{{"\n"}}{{end}}'
+)
+
+# First run: record a baseline and stay silent.
+if [ ! -f "$state_file" ]; then
+  printf '%s' "$current" > "$state_file"
+  exit 0
+fi
+
+printf '%s\n' "$current" | while IFS="	" read -r number state updated title url; do
+  [ "$number" = "" ] && continue
+  previous=$(grep -E "^$number	" "$state_file" || true)
+  if [ "$previous" != "$number	$state	$updated	$title	$url" ]; then
+    if [ -z "$previous" ]; then
+      echo "QUOTED — new pull request #$number \"$title\" ($state) — $url"
+    else
+      echo "QUOTED — pull request #$number \"$title\" is now $state (updated $updated) — $url"
+    fi
+  fi
+done
+
+printf '%s' "$current" > "$state_file"

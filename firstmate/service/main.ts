@@ -16,6 +16,8 @@ import { launchFirstMate } from "./launch"
 import { createSupervisionPoller } from "./poller"
 import { provisionProject } from "./provision"
 import { findRegistration, loadRegistry, type Registration } from "./registry"
+import { loadLandingRecords } from "./landing-record"
+import { parseShippingMode } from "./shipping-mode"
 import { createWatchRunner, type WatchExecPort } from "./watches"
 
 const rawServicePort = process.env.OPENCHAMBER_SERVICE_PORT
@@ -660,6 +662,36 @@ async function handleEnd(request: IncomingMessage, response: ServerResponse): Pr
   }
 }
 
+// Shipping: the mode parsed from the project's projects.md (the record; the
+// coordinator reads it itself, this endpoint feeds the panel) plus the
+// project's recent landing records.
+async function handleShipping(url: URL, response: ServerResponse): Promise<void> {
+  const slug = url.searchParams.get("slug")
+  if (slug === null || slug.trim() === "") {
+    respondJson(response, 400, { error: "slug must be a non-empty string" })
+    return
+  }
+  try {
+    const registrations = await loadRegistry(nodeFileSystem, homeRoot)
+    if (!Object.hasOwn(registrations, slug)) {
+      respondJson(response, 404, { error: `no first mate registered for slug ${slug}` })
+      return
+    }
+    const projectsMdPath = `${homeRoot}/projects/${slug}/projects.md`
+    const shipping = (await nodeFileSystem.exists(projectsMdPath))
+      ? parseShippingMode(await nodeFileSystem.readFile(projectsMdPath))
+      : { mode: null, yolo: false }
+    const landings = await loadLandingRecords(nodeFileSystem, homeRoot, slug)
+    respondJson(response, 200, {
+      mode: shipping.mode,
+      yolo: shipping.yolo,
+      landings: landings.records.slice(-20),
+    })
+  } catch (error) {
+    respondJson(response, 500, { error: error instanceof Error ? error.message : "shipping read failed" })
+  }
+}
+
 async function handleRequest(request: IncomingMessage, response: ServerResponse): Promise<void> {
   if (!isAuthorized(request)) {
     respondJson(response, 401, { error: "unauthorized" })
@@ -704,6 +736,10 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse)
   }
   if (request.method === "GET" && pathname === "/watches") {
     await handleWatchesList(url, response)
+    return
+  }
+  if (request.method === "GET" && pathname === "/shipping") {
+    await handleShipping(url, response)
     return
   }
   if (request.method === "POST" && pathname === "/watches/toggle") {

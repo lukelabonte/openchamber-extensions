@@ -855,6 +855,136 @@ function describeEvent(event) {
   }
 }
 
+// service/landing-record.ts
+function landingRecordPath(homeRoot, slug) {
+  return `${homeRoot}/projects/${slug}/reports/landings.md`;
+}
+var fieldKeys2 = ["commit", "ci", "mode", "authorization", "landed"];
+var authorizations = ["captain's word", "+yolo"];
+function parseLandingRecords(markdown) {
+  const records = [];
+  const errors = [];
+  let entry;
+  const closeEntry = () => {
+    if (entry === undefined)
+      return;
+    const draft = entry;
+    entry = undefined;
+    if (draft.problem !== undefined) {
+      errors.push(draft.problem);
+      return;
+    }
+    const missing = fieldKeys2.find((key) => draft.fields[key] === undefined);
+    if (missing !== undefined) {
+      errors.push({ line: draft.titleLine, message: `the entry "${draft.title}" has no ${missing} line` });
+      return;
+    }
+    const fields = draft.fields;
+    records.push({
+      task: draft.title,
+      commit: fields.commit,
+      ci: fields.ci,
+      mode: fields.mode,
+      authorization: fields.authorization,
+      landedAt: fields.landed
+    });
+  };
+  markdown.split(`
+`).forEach((line, index) => {
+    const lineNumber = index + 1;
+    const trimmed = line.trim();
+    const bullet = /^[-*]\s+(.+)$/.exec(trimmed);
+    if (bullet !== null) {
+      closeEntry();
+      entry = { titleLine: lineNumber, title: bullet[1].trim(), fields: {} };
+      return;
+    }
+    if (trimmed === "")
+      return;
+    if (trimmed.startsWith("#")) {
+      closeEntry();
+      return;
+    }
+    const field = /^([A-Za-z][A-Za-z-]*):\s*(.*)$/.exec(trimmed);
+    if (!line.startsWith(" ") && !line.startsWith("\t")) {
+      closeEntry();
+      return;
+    }
+    if (entry === undefined)
+      return;
+    applyField2(entry, field, lineNumber);
+  });
+  closeEntry();
+  return { records, errors };
+}
+function applyField2(entry, field, lineNumber) {
+  if (entry.problem !== undefined)
+    return;
+  if (field === null) {
+    entry.problem = {
+      line: lineNumber,
+      message: `the entry "${entry.title}" has a line that is not a \`key: value\` field`
+    };
+    return;
+  }
+  const key = field[1];
+  const value = field[2].trim();
+  if (!fieldKeys2.includes(key)) {
+    entry.problem = { line: lineNumber, message: `the entry "${entry.title}" has an unknown field "${key}"` };
+    return;
+  }
+  const landingKey = key;
+  if (entry.fields[landingKey] !== undefined) {
+    entry.problem = { line: lineNumber, message: `the entry "${entry.title}" repeats the "${key}" field` };
+    return;
+  }
+  if (value === "") {
+    entry.problem = { line: lineNumber, message: `the entry "${entry.title}" has an empty "${key}" field` };
+    return;
+  }
+  if (landingKey === "authorization" && !authorizations.includes(value)) {
+    entry.problem = {
+      line: lineNumber,
+      message: `the entry "${entry.title}" has an unknown authorization "${value}"`
+    };
+    return;
+  }
+  if (landingKey === "landed" && Number.isNaN(Date.parse(value))) {
+    entry.problem = { line: lineNumber, message: `the entry "${entry.title}" has a "landed" that is not a timestamp` };
+    return;
+  }
+  entry.fields[landingKey] = value;
+}
+async function loadLandingRecords(filesystem, homeRoot, slug) {
+  const filePath = landingRecordPath(homeRoot, slug);
+  if (!await filesystem.exists(filePath))
+    return { records: [], errors: [] };
+  return parseLandingRecords(await filesystem.readFile(filePath));
+}
+
+// service/shipping-mode.ts
+var shippingModes = ["direct-PR", "reviewed-PR", "local-only"];
+function isShippingMode(value) {
+  return shippingModes.includes(value);
+}
+function parseShippingMode(markdown) {
+  for (const line of markdown.split(`
+`)) {
+    const field = /^mode:\s*(.*)$/.exec(line.trim());
+    if (field === null)
+      continue;
+    return parseModeValue(field[1].trim());
+  }
+  return { mode: null, yolo: false };
+}
+function parseModeValue(value) {
+  const yolo = value.endsWith("+yolo");
+  const base = (yolo ? value.slice(0, -"+yolo".length) : value).trim();
+  if (!isShippingMode(base))
+    return { mode: null, yolo: false };
+  return { mode: base, yolo };
+}
+
 // service/watch-schedule.ts
 class ScheduleParseError extends Error {
   constructor(expression, reason) {
@@ -1766,6 +1896,30 @@ async function handleEnd(request, response) {
     respondJson(response, 500, { error: error instanceof Error ? error.message : "archive failed" });
   }
 }
+async function handleShipping(url, response) {
+  const slug = url.searchParams.get("slug");
+  if (slug === null || slug.trim() === "") {
+    respondJson(response, 400, { error: "slug must be a non-empty string" });
+    return;
+  }
+  try {
+    const registrations = await loadRegistry(nodeFileSystem, homeRoot);
+    if (!Object.hasOwn(registrations, slug)) {
+      respondJson(response, 404, { error: `no first mate registered for slug ${slug}` });
+      return;
+    }
+    const projectsMdPath = `${homeRoot}/projects/${slug}/projects.md`;
+    const shipping = await nodeFileSystem.exists(projectsMdPath) ? parseShippingMode(await nodeFileSystem.readFile(projectsMdPath)) : { mode: null, yolo: false };
+    const landings = await loadLandingRecords(nodeFileSystem, homeRoot, slug);
+    respondJson(response, 200, {
+      mode: shipping.mode,
+      yolo: shipping.yolo,
+      landings: landings.records.slice(-20)
+    });
+  } catch (error) {
+    respondJson(response, 500, { error: error instanceof Error ? error.message : "shipping read failed" });
+  }
+}
 async function handleRequest(request, response) {
   if (!isAuthorized(request)) {
     respondJson(response, 401, { error: "unauthorized" });
@@ -1810,6 +1964,10 @@ async function handleRequest(request, response) {
   }
   if (request.method === "GET" && pathname === "/watches") {
     await handleWatchesList(url, response);
+    return;
+  }
+  if (request.method === "GET" && pathname === "/shipping") {
+    await handleShipping(url, response);
     return;
   }
   if (request.method === "POST" && pathname === "/watches/toggle") {

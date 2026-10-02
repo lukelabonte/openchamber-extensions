@@ -1,6 +1,7 @@
 import { connectHost } from "@openchamber/sdk"
 import { applyHostReady, mountBadge, type Tone } from "@openchamber/sdk/ui"
 import { parseBoardWorkers, type BoardCard, type BoardColumn } from "./board"
+import { parseShipping, shippingBadgeLabel, type ShippingInfo } from "./shipping"
 import { initialPanelState, reducePanelState, type Board, type PanelEvent, type PanelState, type RegistrationInfo } from "./state"
 import { formatLastRun, parseWatches, watchOutcomeLabel, type WatchRow } from "./watches"
 
@@ -109,10 +110,12 @@ function startBoardFlow(registration: RegistrationInfo): void {
   activeRegistration = registration
   void fetchBoard()
   void fetchWatches()
+  void fetchShipping()
   void ensureSessionsSubscription(registration)
   boardRefreshTimer = window.setInterval(() => {
     void fetchBoard()
     void fetchWatches()
+    void fetchShipping()
     // While the live subscription is unattached (transient host failures),
     // every refresh tick is also a re-attach attempt.
     void ensureSessionsSubscription(registration)
@@ -228,6 +231,23 @@ async function fetchWatches(): Promise<void> {
   }
 }
 
+// The shipping mode rides the same cadence as the board and the watches: one
+// fetch on mount and one per refresh interval. A failed or malformed answer
+// means no badge this round; the next tick retries.
+async function fetchShipping(): Promise<void> {
+  const registration = activeRegistration
+  if (registration === null) return
+  try {
+    const result = await host.serviceRequest({ method: "GET", path: "/shipping", query: { slug: registration.slug } })
+    if (activeRegistration !== registration) return
+    if (result.status !== 200) return
+    const shipping = parseShipping(JSON.parse(result.body))
+    if (shipping !== undefined) dispatch({ type: "shipping-loaded", shipping })
+  } catch {
+    // Retried on the next refresh tick.
+  }
+}
+
 function dispatch(event: PanelEvent): void {
   state = reducePanelState(state, event)
   render(state)
@@ -253,7 +273,7 @@ function render(state: PanelState): void {
       root.append(text("Launching the first mate…"))
       break
     case "registered":
-      root.append(coordinatorRow(state.registration, state.coordinatorTitle))
+      root.append(coordinatorRow(state.registration, state.coordinatorTitle, state.shipping))
       root.append(boardView(state.board))
       root.append(watchesCard(state))
       break
@@ -289,14 +309,30 @@ function launchButton(): HTMLElement {
   return button
 }
 
-function coordinatorRow(registration: RegistrationInfo, coordinatorTitle: string | undefined): HTMLElement {
+function coordinatorRow(
+  registration: RegistrationInfo,
+  coordinatorTitle: string | undefined,
+  shipping: ShippingInfo | undefined,
+): HTMLElement {
   const row = document.createElement("p")
   row.textContent =
     coordinatorTitle === undefined
       ? `Coordinator session ${registration.coordinatorSessionId}`
       : `${coordinatorTitle} (session ${registration.coordinatorSessionId})`
+  if (shipping !== undefined) row.append(shippingBadge(shipping))
   row.append(openChatButton(registration.coordinatorSessionId))
   return row
+}
+
+// The project's shipping mode as read from projects.md via the service; a
+// badge only — projects.md is the record, so there is nothing to edit here.
+function shippingBadge(shipping: ShippingInfo): HTMLElement {
+  const badge = document.createElement("span")
+  mountBadge(badge, {
+    label: shippingBadgeLabel(shipping),
+    tone: shipping.mode === null ? "warning" : "neutral",
+  })
+  return badge
 }
 
 function openChatButton(sessionId: string): HTMLElement {

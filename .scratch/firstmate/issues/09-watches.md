@@ -4,7 +4,7 @@
 
 **Blocked by:** 06 (Live board panel)
 
-**Status:** ready-for-agent
+**Status:** resolved
 
 - [ ] Crontab-comment parsing and next-run computation unit-tested at the service-core seam (injected clock)
 - [ ] Watch execution via declared exec; stdout non-empty → one coordinator message naming the watch; empty → none

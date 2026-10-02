@@ -4,7 +4,7 @@
 
 **Blocked by:** 02 (Home provisioning and charter composition)
 
-**Status:** ready-for-agent
+**Status:** resolved
 
 - [ ] Panel offers Launch when the open project (from host context directory) has no first mate
 - [ ] Service creates the coordinator session with its directory set to the per-project home; runtime-verifies `session create --dir` on a non-git, unregistered directory

@@ -3,6 +3,7 @@ import { spawn } from "node:child_process"
 import { mkdir, readFile, readdir, rename, stat, writeFile } from "node:fs/promises"
 import { homedir } from "node:os"
 import path from "node:path"
+import { loadBacklog } from "./backlog"
 import { composeInstructions } from "./compose"
 import { MissingCliError, type ExecRunner } from "./control-client"
 import type { FileSystemPort } from "./file-system"
@@ -162,12 +163,11 @@ async function handleRegistryList(response: ServerResponse): Promise<void> {
 
 async function handleRegistryItem(slug: string, response: ServerResponse): Promise<void> {
   const registrations = await loadRegistry(nodeFileSystem, homeRoot)
-  const registration = registrations[slug]
-  if (registration === undefined) {
+  if (!Object.hasOwn(registrations, slug)) {
     respondJson(response, 404, { error: `no first mate registered for slug ${slug}` })
     return
   }
-  respondJson(response, 200, registration)
+  respondJson(response, 200, registrations[slug])
 }
 
 async function handleLookup(url: URL, response: ServerResponse): Promise<void> {
@@ -182,6 +182,25 @@ async function handleLookup(url: URL, response: ServerResponse): Promise<void> {
     respondJson(response, 200, { registration: registration ?? null })
   } catch (error) {
     respondJson(response, 500, { error: error instanceof Error ? error.message : "lookup failed" })
+  }
+}
+
+async function handleBacklog(url: URL, response: ServerResponse): Promise<void> {
+  const slug = url.searchParams.get("slug")
+  if (slug === null || slug.trim() === "") {
+    respondJson(response, 400, { error: "slug must be a non-empty string" })
+    return
+  }
+  try {
+    const registrations = await loadRegistry(nodeFileSystem, homeRoot)
+    if (!Object.hasOwn(registrations, slug)) {
+      respondJson(response, 404, { error: `no first mate registered for slug ${slug}` })
+      return
+    }
+    const backlog = await loadBacklog(nodeFileSystem, `${homeRoot}/projects/${slug}/backlog.md`)
+    respondJson(response, 200, backlog)
+  } catch (error) {
+    respondJson(response, 500, { error: error instanceof Error ? error.message : "backlog read failed" })
   }
 }
 
@@ -217,6 +236,10 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse)
   }
   if (request.method === "GET" && pathname === "/lookup") {
     await handleLookup(url, response)
+    return
+  }
+  if (request.method === "GET" && pathname === "/backlog") {
+    await handleBacklog(url, response)
     return
   }
   response.statusCode = 404

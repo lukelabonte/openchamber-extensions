@@ -5,6 +5,133 @@ import { mkdir, readFile, readdir, rename, stat, writeFile } from "node:fs/promi
 import { homedir } from "node:os";
 import path2 from "node:path";
 
+// service/backlog.ts
+var backlogStates = [
+  "Queued",
+  "Working",
+  "Blocked",
+  "Parked",
+  "Done",
+  "Failed",
+  "Idle"
+];
+var fieldKeys = {
+  session: "sessionId",
+  worktree: "worktreeDirectory",
+  branch: "branch",
+  "start-ref": "startRef",
+  pr: "prUrl",
+  created: "createdAt",
+  updated: "updatedAt"
+};
+var allFieldKeys = new Set(["state", ...Object.keys(fieldKeys)]);
+var timestampFields = ["createdAt", "updatedAt"];
+function parseBacklog(markdown) {
+  const tasks = [];
+  const errors = [];
+  let entry;
+  let inCodeFence = false;
+  const closeEntry = () => {
+    if (entry === undefined)
+      return;
+    const draft = entry;
+    entry = undefined;
+    if (draft.problem !== undefined) {
+      errors.push(draft.problem);
+      return;
+    }
+    const { state, ...optionalFields } = draft.fields;
+    if (state === undefined) {
+      errors.push({ line: draft.titleLine, message: `the entry "${draft.title}" has no state line` });
+      return;
+    }
+    tasks.push({ title: draft.title, ...optionalFields, state });
+  };
+  markdown.split(`
+`).forEach((line, index) => {
+    const lineNumber = index + 1;
+    const trimmed = line.trim();
+    if (trimmed.startsWith("```")) {
+      inCodeFence = !inCodeFence;
+      return;
+    }
+    if (inCodeFence || trimmed === "")
+      return;
+    const bullet = /^[-*]\s+(.+)$/.exec(trimmed);
+    if (bullet !== null) {
+      closeEntry();
+      entry = { titleLine: lineNumber, title: bullet[1].trim(), fields: {} };
+      return;
+    }
+    if (trimmed.startsWith("#")) {
+      closeEntry();
+      return;
+    }
+    const field = /^([A-Za-z][A-Za-z-]*):\s*(.*)$/.exec(trimmed);
+    const indented = line.startsWith(" ") || line.startsWith("\t");
+    if (!indented) {
+      closeEntry();
+      return;
+    }
+    if (entry === undefined) {
+      if (field !== null && allFieldKeys.has(field[1])) {
+        errors.push({ line: lineNumber, message: `the field "${field[1]}" has no entry above it` });
+      }
+      return;
+    }
+    applyField(entry, field, lineNumber);
+  });
+  closeEntry();
+  return { tasks, errors };
+}
+function applyField(entry, field, lineNumber) {
+  if (entry.problem !== undefined)
+    return;
+  if (field === null) {
+    entry.problem = {
+      line: lineNumber,
+      message: `the entry "${entry.title}" has a line that is not a \`key: value\` field`
+    };
+    return;
+  }
+  const key = field[1];
+  const value = field[2].trim();
+  if (key === "state") {
+    if (!isBacklogState(value)) {
+      entry.problem = { line: lineNumber, message: `the entry "${entry.title}" has an unknown state "${value}"` };
+    } else if (entry.fields.state !== undefined) {
+      entry.problem = { line: lineNumber, message: `the entry "${entry.title}" repeats the "state" field` };
+    } else {
+      entry.fields.state = value;
+    }
+    return;
+  }
+  const fieldName = fieldKeys[key];
+  if (fieldName === undefined) {
+    entry.problem = { line: lineNumber, message: `the entry "${entry.title}" has an unknown field "${key}"` };
+    return;
+  }
+  if (entry.fields[fieldName] !== undefined) {
+    entry.problem = { line: lineNumber, message: `the entry "${entry.title}" repeats the "${key}" field` };
+    return;
+  }
+  if (value === "") {
+    entry.problem = { line: lineNumber, message: `the entry "${entry.title}" has an empty "${key}" field` };
+    return;
+  }
+  if (timestampFields.includes(fieldName) && Number.isNaN(Date.parse(value))) {
+    entry.problem = { line: lineNumber, message: `the entry "${entry.title}" has a "${key}" that is not a timestamp` };
+    return;
+  }
+  entry.fields[fieldName] = value;
+}
+function isBacklogState(value) {
+  return backlogStates.includes(value);
+}
+async function loadBacklog(filesystem, backlogPath) {
+  return parseBacklog(await filesystem.readFile(backlogPath));
+}
+
 // service/compose.ts
 async function composeInstructions(input) {
   const { filesystem, homeRoot, slug } = input;
@@ -481,12 +608,11 @@ async function handleRegistryList(response) {
 }
 async function handleRegistryItem(slug, response) {
   const registrations = await loadRegistry(nodeFileSystem, homeRoot);
-  const registration = registrations[slug];
-  if (registration === undefined) {
+  if (!Object.hasOwn(registrations, slug)) {
     respondJson(response, 404, { error: `no first mate registered for slug ${slug}` });
     return;
   }
-  respondJson(response, 200, registration);
+  respondJson(response, 200, registrations[slug]);
 }
 async function handleLookup(url, response) {
   const directory = url.searchParams.get("directory");
@@ -500,6 +626,24 @@ async function handleLookup(url, response) {
     respondJson(response, 200, { registration: registration ?? null });
   } catch (error) {
     respondJson(response, 500, { error: error instanceof Error ? error.message : "lookup failed" });
+  }
+}
+async function handleBacklog(url, response) {
+  const slug = url.searchParams.get("slug");
+  if (slug === null || slug.trim() === "") {
+    respondJson(response, 400, { error: "slug must be a non-empty string" });
+    return;
+  }
+  try {
+    const registrations = await loadRegistry(nodeFileSystem, homeRoot);
+    if (!Object.hasOwn(registrations, slug)) {
+      respondJson(response, 404, { error: `no first mate registered for slug ${slug}` });
+      return;
+    }
+    const backlog = await loadBacklog(nodeFileSystem, `${homeRoot}/projects/${slug}/backlog.md`);
+    respondJson(response, 200, backlog);
+  } catch (error) {
+    respondJson(response, 500, { error: error instanceof Error ? error.message : "backlog read failed" });
   }
 }
 async function handleRequest(request, response) {
@@ -534,6 +678,10 @@ async function handleRequest(request, response) {
   }
   if (request.method === "GET" && pathname === "/lookup") {
     await handleLookup(url, response);
+    return;
+  }
+  if (request.method === "GET" && pathname === "/backlog") {
+    await handleBacklog(url, response);
     return;
   }
   response.statusCode = 404;

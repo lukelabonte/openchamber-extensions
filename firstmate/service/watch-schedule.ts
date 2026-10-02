@@ -147,11 +147,15 @@ function dayMatches(schedule: CronSchedule, date: Date): boolean {
   return domMatch || dowMatch
 }
 
+// The loader's line pattern, shared with the schedule-edit rewrite in
+// watches.ts so both locate the comment identically.
+export const scheduleLinePattern = /^#\s*schedule:\s*(.+?)\s*$/
+
 // The schedule comment must appear in the first 20 lines; a script without
 // one is not a watch. Returns the raw expression for parseCronExpression.
 export function extractScheduleComment(scriptText: string): string | undefined {
   for (const line of scriptText.split("\n", 20)) {
-    const match = /^#\s*schedule:\s*(.+?)\s*$/.exec(line)
+    const match = scheduleLinePattern.exec(line)
     if (match !== null) return match[1]
   }
   return undefined

@@ -82,8 +82,20 @@ describe("createWatchRunner discovery", () => {
     const runner = createWatchRunner({ filesystem: filesystem.port, exec: execStub([]).exec, clock: new FakeClock().port, homeRoot })
 
     expect(await runner.listWatches(slug)).toEqual([
-      { name: "pr-watch", source: "shared", schedule: "*/5 * * * *", enabled: true },
-      { name: "nightly", source: "project", schedule: "0 9 * * 1-5", enabled: true },
+      {
+        name: "pr-watch",
+        source: "shared",
+        schedule: "*/5 * * * *",
+        enabled: true,
+        path: `${homeRoot}/shared/watches/pr-watch`,
+      },
+      {
+        name: "nightly",
+        source: "project",
+        schedule: "0 9 * * 1-5",
+        enabled: true,
+        path: `${projectHome}/watches/nightly`,
+      },
     ])
   })
 

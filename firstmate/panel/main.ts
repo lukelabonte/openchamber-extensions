@@ -19,7 +19,7 @@ let sessionsAttachInFlight = false
 let boardRefreshTimer: number | null = null
 let boardFetchTimer: number | null = null
 let refreshLabelTimer: number | null = null
-let refreshesInFlight = 0
+let manualRefreshInFlight = false
 let lastRefreshedAt: number | null = null
 
 host.onReady((ctx) => {
@@ -134,8 +134,11 @@ function stopBoardFlow(): void {
   boardFetchTimer = null
   if (refreshLabelTimer !== null) window.clearInterval(refreshLabelTimer)
   refreshLabelTimer = null
-  refreshesInFlight = 0
+  manualRefreshInFlight = false
   lastRefreshedAt = null
+  // A directory change (or re-registration) closes any open watch editor or
+  // creation form; its drafts belonged to the previous project.
+  watchFormState = { kind: "closed" }
 }
 
 // Attaches the live onSessions subscription for the registration's project.
@@ -179,32 +182,30 @@ function scheduleBoardFetch(): void {
   if (boardFetchTimer !== null) window.clearTimeout(boardFetchTimer)
   boardFetchTimer = window.setTimeout(() => {
     boardFetchTimer = null
-    void trackedFetch(fetchBoard)
+    void fetchBoard()
   }, boardFetchDebounceMs)
 }
 
-// The header's refresh control runs the same four fetches as the interval
-// tick. Every fetch is wrapped so a run is only counted once: while any
-// fetch is in flight the control reads "Refreshing…" and cannot be pressed
-// again, and the last-settled run's time drives the relative label.
-function runFullRefresh(): void {
-  void trackedFetch(fetchBoard)
-  void trackedFetch(fetchWatches)
-  void trackedFetch(fetchShipping)
-  void trackedFetch(fetchSuggestions)
+// The periodic cycle runs the same four fetches as the manual refresh. Only
+// this cycle and the manual click move the freshness label; the
+// subscription-driven refetches stay invisible to the control, so a busy
+// session cannot keep the label pinned at "just now" or flicker it.
+async function runFullRefresh(): Promise<void> {
+  await Promise.all([fetchBoard(), fetchWatches(), fetchShipping(), fetchSuggestions()])
+  lastRefreshedAt = Date.now()
+  updateRefreshControl()
 }
 
-async function trackedFetch(refresh: () => Promise<void>): Promise<void> {
-  refreshesInFlight += 1
+// A manual press marks the control ("Refreshing…" + disabled) for the run's
+// duration and then reports the fresh age.
+async function manualRefresh(): Promise<void> {
+  manualRefreshInFlight = true
   updateRefreshControl()
   try {
-    await refresh()
+    await runFullRefresh()
   } finally {
-    refreshesInFlight = Math.max(0, refreshesInFlight - 1)
-    if (refreshesInFlight === 0) {
-      lastRefreshedAt = Date.now()
-      updateRefreshControl()
-    }
+    manualRefreshInFlight = false
+    updateRefreshControl()
   }
 }
 
@@ -212,8 +213,8 @@ function refreshButton(): HTMLElement {
   const button = document.createElement("button")
   button.className = "fm-button fm-refresh"
   button.addEventListener("click", () => {
-    if (refreshesInFlight > 0 || activeRegistration === null) return
-    runFullRefresh()
+    if (manualRefreshInFlight || activeRegistration === null) return
+    void manualRefresh()
   })
   applyRefreshLabel(button)
   return button
@@ -227,11 +228,12 @@ function updateRefreshControl(): void {
 }
 
 function applyRefreshLabel(button: HTMLButtonElement): void {
-  const inFlight = refreshesInFlight > 0
-  button.disabled = inFlight || activeRegistration === null
+  button.disabled = manualRefreshInFlight || activeRegistration === null
   // Before a freshly registered panel's first fetch settles there is no age
   // to report; the run is already under way, so say so.
-  button.textContent = inFlight || lastRefreshedAt === null ? "Refreshing…" : refreshAgeLabel(lastRefreshedAt)
+  button.textContent = manualRefreshInFlight || lastRefreshedAt === null
+    ? "Refreshing…"
+    : refreshAgeLabel(lastRefreshedAt)
 }
 
 function refreshAgeLabel(timestamp: number): string {
@@ -482,7 +484,13 @@ function coordinatorRow(
   const actions = document.createElement("div")
   actions.className = "fm-actions"
   if (shipping !== undefined) actions.append(shippingBadge(shipping))
-  actions.append(openChatButton(registration.coordinatorSessionId), bearingsControl(registration), ahoyButton(registration))
+  const saveToFile = saveToFileCheckbox()
+  actions.append(
+    openChatButton(registration.coordinatorSessionId),
+    statusReportButton(registration, saveToFile.checked),
+    ahoyButton(registration),
+    saveToFile.element,
+  )
   header.append(name, project, actions)
   return header
 }
@@ -504,12 +512,11 @@ function prettifySlug(slug: string): string {
 }
 
 // /bearings and /ahoy reach the coordinator verbatim through POST /command —
-// the panel composes nothing. The checkbox sends the variant that also
-// writes the dated report into the home's reports/ directory; the answer
-// arrives in the coordinator's chat, which Open chat opens.
-function bearingsControl(registration: RegistrationInfo): HTMLElement {
-  const control = document.createElement("span")
-  control.className = "fm-bearings"
+// the panel composes nothing. The save-to-file option at the end of the row
+// sends the variant that also writes the dated report into the home's
+// reports/ directory; the answer arrives in the coordinator's chat, which
+// Open chat opens.
+function saveToFileCheckbox(): { element: HTMLElement; checked: () => boolean } {
   // A wrapping label ties the visible text to the checkbox for free.
   const label = document.createElement("label")
   label.className = "fm-save"
@@ -517,17 +524,20 @@ function bearingsControl(registration: RegistrationInfo): HTMLElement {
   const checkbox = document.createElement("input")
   checkbox.type = "checkbox"
   checkbox.setAttribute("aria-label", "Write the bearings report to a dated file")
-  label.append(checkbox, document.createTextNode("save to file"))
+  label.append(checkbox, document.createTextNode("save report to file"))
+  return { element: label, checked: () => checkbox.checked }
+}
+
+function statusReportButton(registration: RegistrationInfo, saveToFile: () => boolean): HTMLElement {
   const button = document.createElement("button")
   button.className = "fm-button"
   button.textContent = "Status report"
   button.title =
     "Ask the coordinator for a status report (bearings): what needs your call, what landed, what is under way, what is next."
   button.addEventListener("click", () => {
-    void sendCommand(registration, checkbox.checked ? "bearings-file" : "bearings")
+    void sendCommand(registration, saveToFile() ? "bearings-file" : "bearings")
   })
-  control.append(label, button)
-  return control
+  return button
 }
 
 function ahoyButton(registration: RegistrationInfo): HTMLElement {
@@ -588,14 +598,15 @@ function openChatButton(sessionId: string): HTMLElement {
   return button
 }
 
-// Recent landings: the records the service parsed out of reports/landings.md,
-// with a prominent warning for every entry it had to drop — a partly corrupt
-// log must never read as a clean, empty one. The payload fields are untrusted
-// file contents, so they reach the DOM only through textContent.
+// Landings: all the records the service parsed out of reports/landings.md,
+// in a fixed-height scrollable box, with a prominent warning for every entry
+// it had to drop — a partly corrupt log must never read as a clean, empty
+// one. The payload fields are untrusted file contents, so they reach the DOM
+// only through textContent.
 function landingsSection(shipping: ShippingInfo, board: Board): HTMLElement {
   const section = document.createElement("section")
   const heading = document.createElement("h2")
-  heading.textContent = "Recent landings"
+  heading.textContent = "Landings"
   section.append(heading)
   for (const error of shipping.landingErrors) section.append(warningCallout(error))
   if (shipping.landings.length === 0) {
@@ -603,7 +614,10 @@ function landingsSection(shipping: ShippingInfo, board: Board): HTMLElement {
     return section
   }
   const sessions = sessionsByTitle(board)
-  for (const landing of shipping.landings) section.append(landingRow(landing, sessions.get(landing.task)))
+  const list = document.createElement("div")
+  list.className = "fm-landings"
+  for (const landing of shipping.landings) list.append(landingRow(landing, sessions.get(landing.task)))
+  section.append(list)
   return section
 }
 
@@ -869,7 +883,7 @@ async function runCardAction(pathname: string, body: Record<string, string>, say
     say("The service is unreachable.")
     return { status: 0 }
   } finally {
-    void trackedFetch(fetchBoard)
+    void fetchBoard()
   }
 }
 
@@ -1133,24 +1147,49 @@ async function runSuggestionAction(pathname: string, label: string): Promise<voi
     dispatch({ type: "suggestion-action-settled", feedback: "The action failed: the service is unreachable." })
   } finally {
     suggestionActionInFlight = false
-    void trackedFetch(fetchSuggestions)
+    void fetchSuggestions()
   }
 }
+
+// The panel re-renders on every dispatch — including the periodic refetches —
+// which would wipe a half-typed editor. The open schedule editor or creation
+// form and its drafts therefore live here, module-level on purpose: the
+// reducer models the watches the service reports, not the captain's typing.
+// The state is one slot, so exactly one editor or form is open at a time, and
+// it is cleared on close and on success.
+type WatchFormState =
+  | { kind: "closed" }
+  | { kind: "edit"; watchKey: string; schedule: string; feedback?: string; inFlight: boolean }
+  | { kind: "create"; name: string; schedule: string; command: string; feedback?: string; inFlight: boolean }
+
+let watchFormState: WatchFormState = { kind: "closed" }
+
+const watchFormKey = (watch: WatchRow): string => `${watch.source}\n${watch.name}`
+
+const defaultNewWatchSchedule = "*/30 * * * *"
 
 // The Watches card sits below the board columns: one row per watch with its
 // schedule, last run, last outcome, an on/off switch, and the expandable last
 // output. The service runs watches only while the extension runs — the copy
-// says so plainly rather than implying coverage that does not exist.
+// says so plainly rather than implying coverage that does not exist. The
+// header row carries the New watch button, which opens the creation form and
+// closes any open editor — the module state is a single slot.
 function watchesCard(state: PanelState & { kind: "registered" }): HTMLElement {
   const section = document.createElement("section")
+  const headerRow = document.createElement("div")
+  headerRow.className = "fm-watch-header"
   const heading = document.createElement("h2")
   heading.textContent = "Watches"
-  section.append(heading)
+  headerRow.append(heading)
+  if (watchFormState.kind !== "create") headerRow.append(newWatchButton())
+  section.append(headerRow)
   section.append(
     text(
       "Watches run only while OpenChamber is running. A run whose time passed while the machine was asleep fires once, late; runs missed while OpenChamber was closed are never made up.",
     ),
   )
+  const formState = watchFormState
+  if (formState.kind === "create") section.append(watchCreateForm(formState))
   if (state.watchesError !== undefined) {
     if (state.watches !== undefined) {
       section.append(text(`${state.watchesError} — showing the last read watches.`))
@@ -1179,10 +1218,20 @@ function watchRow(watch: WatchRow): HTMLElement {
   const source = document.createElement("span")
   mountBadge(source, { label: watch.source, tone: "neutral" })
   article.append(title, source, enabledSwitch(watch))
-  // Human-readable schedule; the raw cron expression stays on hover.
+  // Human-readable schedule first, with the raw cron expression always
+  // visible beside it — no hover required. When the two are identical (the
+  // expression's shape has no human phrasing), it shows once.
   const schedule = document.createElement("span")
   schedule.className = "fm-schedule"
-  schedule.textContent = formatSchedule(watch.schedule)
+  const humanSchedule = formatSchedule(watch.schedule)
+  if (humanSchedule === watch.schedule) {
+    schedule.textContent = watch.schedule
+  } else {
+    const cron = document.createElement("span")
+    cron.className = "fm-schedule-cron"
+    cron.textContent = watch.schedule
+    schedule.append(document.createTextNode(humanSchedule), cron)
+  }
   schedule.title = watch.schedule
   article.append(schedule)
   const summary = document.createElement("span")
@@ -1194,7 +1243,257 @@ function watchRow(watch: WatchRow): HTMLElement {
   if (watch.error !== undefined) summary.append(warningBadge(watch.error))
   article.append(summary)
   if (watch.lastOutput !== undefined) article.append(lastOutput(watch.lastOutput))
+  const formState = watchFormState
+  if (formState.kind === "edit" && formState.watchKey === watchFormKey(watch)) {
+    article.append(watchScheduleEditor(watch, formState))
+  } else {
+    article.append(watchEditRow(watch))
+  }
   return article
+}
+
+// One small affordance per card: Edit opens the schedule editor on the card
+// itself, closing any other open editor or form — the module state is a
+// single slot.
+function watchEditRow(watch: WatchRow): HTMLElement {
+  const row = document.createElement("div")
+  row.className = "fm-actions"
+  const edit = document.createElement("button")
+  edit.className = "fm-button"
+  edit.textContent = "Edit"
+  edit.title = "Edit this watch's schedule."
+  edit.setAttribute("aria-label", `Edit watch ${watch.name}`)
+  edit.addEventListener("click", () => {
+    watchFormState = {
+      kind: "edit",
+      watchKey: watchFormKey(watch),
+      schedule: watch.schedule,
+      inFlight: false,
+    }
+    render(state)
+  })
+  row.append(edit)
+  return row
+}
+
+// The schedule editor rendered on the card itself: a raw cron input with a
+// live human preview, the script's path, and Save / Cancel. Every field
+// restores from the module draft on each render, so a background refetch
+// cannot erase what the captain is typing; the input events write it back.
+function watchScheduleEditor(watch: WatchRow, formState: WatchFormState & { kind: "edit" }): HTMLElement {
+  const editor = document.createElement("div")
+  editor.className = "fm-watch-editor"
+  const scheduleInput = document.createElement("input")
+  scheduleInput.type = "text"
+  scheduleInput.value = formState.schedule
+  scheduleInput.placeholder = defaultNewWatchSchedule
+  scheduleInput.setAttribute("aria-label", `Schedule for watch ${watch.name}`)
+  const preview = document.createElement("span")
+  preview.className = "fm-schedule"
+  preview.textContent = formatSchedule(formState.schedule)
+  scheduleInput.addEventListener("input", () => {
+    formState.schedule = scheduleInput.value
+    preview.textContent = formatSchedule(scheduleInput.value)
+  })
+  editor.append(scheduleInput, preview)
+  if (watch.path !== undefined) {
+    // The script's absolute path: muted, selectable text, so it can be read
+    // and copied but never reads as a link.
+    const scriptPath = document.createElement("code")
+    scriptPath.className = "fm-watch-path"
+    scriptPath.textContent = watch.path
+    editor.append(scriptPath)
+  }
+  const actions = document.createElement("div")
+  actions.className = "fm-actions"
+  const save = document.createElement("button")
+  save.className = "fm-button"
+  save.textContent = "Save"
+  save.title = "Write the new schedule into the script's `# schedule:` line."
+  save.disabled = formState.inFlight
+  save.addEventListener("click", () => {
+    if (formState.inFlight) return
+    void saveWatchSchedule(watch, formState)
+  })
+  const cancel = document.createElement("button")
+  cancel.className = "fm-button"
+  cancel.textContent = "Cancel"
+  cancel.addEventListener("click", () => {
+    watchFormState = { kind: "closed" }
+    render(state)
+  })
+  const feedback = document.createElement("span")
+  feedback.className = "fm-feedback"
+  feedback.textContent = formState.feedback ?? ""
+  actions.append(save, cancel, feedback)
+  editor.append(actions)
+  return editor
+}
+
+// Save posts the raw cron expression; the service is the authority on whether
+// it parses, and its error text is the feedback. Success closes the editor;
+// the refetch carries the file's new schedule back.
+async function saveWatchSchedule(watch: WatchRow, formState: WatchFormState & { kind: "edit" }): Promise<void> {
+  const registration = activeRegistration
+  if (registration === null) return
+  formState.inFlight = true
+  formState.feedback = undefined
+  render(state)
+  try {
+    const result = await host.serviceRequest({
+      method: "POST",
+      path: "/watch/schedule",
+      body: JSON.stringify({
+        slug: registration.slug,
+        name: watch.name,
+        source: watch.source,
+        schedule: formState.schedule,
+      }),
+    })
+    if (activeRegistration !== registration) return
+    let parsed: { error?: string } = {}
+    try {
+      parsed = JSON.parse(result.body) as { error?: string }
+    } catch {
+      // A non-JSON body only matters through the generic message below.
+    }
+    if (result.status !== 200) {
+      formState.inFlight = false
+      formState.feedback = parsed.error ?? `Saving the schedule failed (status ${result.status}).`
+      render(state)
+      return
+    }
+    watchFormState = { kind: "closed" }
+    render(state)
+  } catch {
+    if (activeRegistration !== registration) return
+    formState.inFlight = false
+    formState.feedback = "Saving the schedule failed: the service is unreachable."
+    render(state)
+  } finally {
+    void fetchWatches()
+  }
+}
+
+// The header's New watch button opens the creation form on the section
+// itself, closing any open editor — the module state is a single slot.
+function newWatchButton(): HTMLElement {
+  const button = document.createElement("button")
+  button.className = "fm-button"
+  button.textContent = "New watch"
+  button.title = "Add a watch script to this project's watches folder."
+  button.addEventListener("click", () => {
+    if (watchFormState.kind === "create") return
+    watchFormState = { kind: "create", name: "", schedule: defaultNewWatchSchedule, command: "", inFlight: false }
+    render(state)
+  })
+  return button
+}
+
+// The creation form under the section header: name, schedule, and command.
+// Like the schedule editor, every field restores from the module draft on
+// each render.
+function watchCreateForm(formState: WatchFormState & { kind: "create" }): HTMLElement {
+  const form = document.createElement("div")
+  form.className = "fm-watch-editor"
+  const nameInput = document.createElement("input")
+  nameInput.type = "text"
+  nameInput.value = formState.name
+  nameInput.placeholder = "watch name, e.g. daily-check"
+  nameInput.setAttribute("aria-label", "Watch name")
+  nameInput.addEventListener("input", () => {
+    formState.name = nameInput.value
+  })
+  const scheduleInput = document.createElement("input")
+  scheduleInput.type = "text"
+  scheduleInput.value = formState.schedule
+  scheduleInput.placeholder = defaultNewWatchSchedule
+  scheduleInput.setAttribute("aria-label", "Schedule (cron expression)")
+  const preview = document.createElement("span")
+  preview.className = "fm-schedule"
+  preview.textContent = formatSchedule(formState.schedule)
+  scheduleInput.addEventListener("input", () => {
+    formState.schedule = scheduleInput.value
+    preview.textContent = formatSchedule(scheduleInput.value)
+  })
+  const commandInput = document.createElement("input")
+  commandInput.type = "text"
+  commandInput.value = formState.command
+  commandInput.placeholder = "command to run, e.g. echo hello"
+  commandInput.setAttribute("aria-label", "Command")
+  commandInput.addEventListener("input", () => {
+    formState.command = commandInput.value
+  })
+  form.append(nameInput, scheduleInput, preview, commandInput)
+  const actions = document.createElement("div")
+  actions.className = "fm-actions"
+  const create = document.createElement("button")
+  create.className = "fm-button"
+  create.textContent = "Create"
+  create.title = "Write the watch script into the project's watches folder."
+  create.disabled = formState.inFlight
+  create.addEventListener("click", () => {
+    if (formState.inFlight) return
+    void createWatchRequest(formState)
+  })
+  const cancel = document.createElement("button")
+  cancel.className = "fm-button"
+  cancel.textContent = "Cancel"
+  cancel.addEventListener("click", () => {
+    watchFormState = { kind: "closed" }
+    render(state)
+  })
+  const feedback = document.createElement("span")
+  feedback.className = "fm-feedback"
+  feedback.textContent = formState.feedback ?? ""
+  actions.append(create, cancel, feedback)
+  form.append(actions)
+  return form
+}
+
+// Create posts the form; the service validates the name, the schedule, and
+// the command, and its error text is the feedback. Success closes the form;
+// the refetch lists the new watch.
+async function createWatchRequest(formState: WatchFormState & { kind: "create" }): Promise<void> {
+  const registration = activeRegistration
+  if (registration === null) return
+  formState.inFlight = true
+  formState.feedback = undefined
+  render(state)
+  try {
+    const result = await host.serviceRequest({
+      method: "POST",
+      path: "/watch/create",
+      body: JSON.stringify({
+        slug: registration.slug,
+        name: formState.name.trim(),
+        schedule: formState.schedule.trim(),
+        command: formState.command.trim(),
+      }),
+    })
+    if (activeRegistration !== registration) return
+    let parsed: { error?: string } = {}
+    try {
+      parsed = JSON.parse(result.body) as { error?: string }
+    } catch {
+      // A non-JSON body only matters through the generic message below.
+    }
+    if (result.status !== 200) {
+      formState.inFlight = false
+      formState.feedback = parsed.error ?? `Creating the watch failed (status ${result.status}).`
+      render(state)
+      return
+    }
+    watchFormState = { kind: "closed" }
+    render(state)
+  } catch {
+    if (activeRegistration !== registration) return
+    formState.inFlight = false
+    formState.feedback = "Creating the watch failed: the service is unreachable."
+    render(state)
+  } finally {
+    void fetchWatches()
+  }
 }
 
 function enabledSwitch(watch: WatchRow): HTMLElement {

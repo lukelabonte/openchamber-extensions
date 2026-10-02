@@ -1210,10 +1210,11 @@ function dayMatches(schedule, date) {
     return domMatch;
   return domMatch || dowMatch;
 }
+var scheduleLinePattern = /^#\s*schedule:\s*(.+?)\s*$/;
 function extractScheduleComment(scriptText) {
   for (const line of scriptText.split(`
 `, 20)) {
-    const match = /^#\s*schedule:\s*(.+?)\s*$/.exec(line);
+    const match = scheduleLinePattern.exec(line);
     if (match !== null)
       return match[1];
   }
@@ -1394,6 +1395,7 @@ ${output}`
         source: watch.source,
         schedule: watch.schedule,
         enabled: isEnabled(enabledOverrides, watch.source, watch.name),
+        path: watch.scriptPath,
         ...watch.error !== undefined ? { error: watch.error } : {},
         ...runState?.lastRunAt !== undefined ? { lastRunAt: runState.lastRunAt } : {},
         ...runState?.lastOutcome !== undefined ? { lastOutcome: runState.lastOutcome } : {},
@@ -1436,7 +1438,43 @@ ${output}`
     await filesystem.rename(tempPath, settingsPath);
     return "ok";
   }
-  return { tick, listWatches, setEnabled };
+  async function setSchedule(slug, source, name, schedule) {
+    const candidates = (await discoverWatches(slug)).filter((watch) => watch.name === name);
+    const targets = source === undefined ? candidates : candidates.filter((watch) => watch.source === source);
+    if (targets.length === 0)
+      return "unknown-watch";
+    if (targets.length > 1)
+      return "ambiguous-watch";
+    const target = targets[0];
+    const lines = (await filesystem.readFile(target.scriptPath)).split(`
+`);
+    for (let index = 0;index < Math.min(lines.length, 20); index += 1) {
+      if (!scheduleLinePattern.test(lines[index]))
+        continue;
+      lines[index] = `# schedule: ${schedule}`;
+      await filesystem.writeFile(target.scriptPath, lines.join(`
+`));
+      runStates.delete(stateKey(slug, target.source, name));
+      return "ok";
+    }
+    return "unknown-watch";
+  }
+  async function createWatch(slug, name, schedule, command) {
+    const existing = await discoverWatches(slug);
+    if (existing.some((watch) => watch.name === name || watch.name === `${name}.sh`)) {
+      return "duplicate-watch";
+    }
+    const watchesDirectory = `${homeRoot}/projects/${slug}/watches`;
+    await filesystem.createDirectory(watchesDirectory);
+    const scriptPath = `${watchesDirectory}/${name}.sh`;
+    await filesystem.writeFile(scriptPath, `#!/bin/sh
+# schedule: ${schedule}
+${command}
+`);
+    await filesystem.setExecutable(scriptPath);
+    return "ok";
+  }
+  return { tick, listWatches, setEnabled, setSchedule, createWatch };
 }
 function isEnabled(overrides, source, name) {
   const entry = overrides[source]?.[name];
@@ -1986,6 +2024,93 @@ async function handleWatchesToggle(request, response) {
     respondJson(response, 500, { error: error instanceof Error ? error.message : "watch toggle failed" });
   }
 }
+function scheduleValidOrRespond(response, schedule) {
+  try {
+    parseCronExpression(schedule);
+    return true;
+  } catch (error) {
+    respondJson(response, 400, { error: error instanceof Error ? error.message : "invalid watch schedule" });
+    return false;
+  }
+}
+async function handleWatchSchedule(request, response) {
+  const payload = await readJsonRecord(request);
+  const slug = recordString(payload, "slug");
+  const name = recordString(payload, "name");
+  const schedule = recordString(payload, "schedule");
+  const source = payload?.source;
+  if (slug === undefined || name === undefined || schedule === undefined) {
+    respondJson(response, 400, { error: "slug, name, and schedule must be non-empty strings" });
+    return;
+  }
+  if (source !== undefined && source !== "shared" && source !== "project") {
+    respondJson(response, 400, { error: `source must be "shared" or "project" when given` });
+    return;
+  }
+  if (!scheduleValidOrRespond(response, schedule))
+    return;
+  try {
+    const registrations = await loadRegistry(nodeFileSystem, homeRoot);
+    if (!Object.hasOwn(registrations, slug)) {
+      respondJson(response, 404, { error: `no first mate registered for slug ${slug}` });
+      return;
+    }
+    const result = await watchRunner.setSchedule(slug, source, name, schedule);
+    if (result === "unknown-watch") {
+      respondJson(response, 404, { error: `no watch named ${name} for slug ${slug}` });
+      return;
+    }
+    if (result === "ambiguous-watch") {
+      respondJson(response, 409, {
+        error: `the watch name ${name} matches both a shared and a project watch for ${slug}; pass source "shared" or "project"`
+      });
+      return;
+    }
+    respondJson(response, 200, { updated: true, schedule });
+  } catch (error) {
+    respondJson(response, 500, { error: error instanceof Error ? error.message : "watch schedule update failed" });
+  }
+}
+var watchNamePattern = /^[a-z0-9][a-z0-9-]{0,39}$/;
+var watchCommandMaxLength = 2000;
+async function handleWatchCreate(request, response) {
+  const payload = await readJsonRecord(request);
+  const slug = recordString(payload, "slug");
+  const name = recordString(payload, "name");
+  const schedule = recordString(payload, "schedule");
+  const command = recordString(payload, "command");
+  if (slug === undefined || name === undefined || schedule === undefined || command === undefined) {
+    respondJson(response, 400, { error: "slug, name, schedule, and command must be non-empty strings" });
+    return;
+  }
+  if (!watchNamePattern.test(name)) {
+    respondJson(response, 400, {
+      error: "name must be at most 40 characters of lowercase letters, digits, and dashes, starting with a letter or digit"
+    });
+    return;
+  }
+  if (!scheduleValidOrRespond(response, schedule))
+    return;
+  if (command.length > watchCommandMaxLength) {
+    respondJson(response, 400, { error: `command must be at most ${watchCommandMaxLength} characters` });
+    return;
+  }
+  try {
+    const registrations = await loadRegistry(nodeFileSystem, homeRoot);
+    if (!Object.hasOwn(registrations, slug)) {
+      respondJson(response, 404, { error: `no first mate registered for slug ${slug}` });
+      return;
+    }
+    const result = await watchRunner.createWatch(slug, name, schedule, command);
+    if (result === "duplicate-watch") {
+      respondJson(response, 409, { error: `a watch named ${name} already exists for slug ${slug}` });
+      return;
+    }
+    respondJson(response, 200, { created: true, name });
+  } catch (error) {
+    respondJson(response, 500, { error: error instanceof Error ? error.message : "watch creation failed" });
+  }
+}
 async function handleEnd(request, response) {
   const payload = await readJsonRecord(request);
   const slug = recordString(payload, "slug");
@@ -2031,7 +2156,7 @@ async function handleShipping(url, response) {
     respondJson(response, 200, {
       mode: shipping.mode,
       yolo: shipping.yolo,
-      landings: landings.records.slice(-20),
+      landings: landings.records,
       landingErrors: landings.errors.map((error) => `line ${error.line}: ${error.message}`)
     });
   } catch (error) {
@@ -2235,6 +2360,14 @@ async function handleRequest(request, response) {
   }
   if (request.method === "POST" && pathname === "/watches/toggle") {
     await handleWatchesToggle(request, response);
+    return;
+  }
+  if (request.method === "POST" && pathname === "/watch/schedule") {
+    await handleWatchSchedule(request, response);
+    return;
+  }
+  if (request.method === "POST" && pathname === "/watch/create") {
+    await handleWatchCreate(request, response);
     return;
   }
   if (request.method === "POST" && pathname === "/steer") {

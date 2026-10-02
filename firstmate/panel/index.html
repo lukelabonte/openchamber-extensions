@@ -199,16 +199,11 @@
         margin: 0 2px;
       }
 
-      .fm-bearings {
-        display: inline-flex;
-        align-items: center;
-        gap: 6px;
-      }
-
       .fm-save {
         display: inline-flex;
         align-items: center;
         gap: 4px;
+        margin-left: auto;
         font-size: 11px;
         color: var(--fm-muted);
         cursor: pointer;
@@ -226,6 +221,42 @@
         font-size: 11px;
         color: var(--fm-muted);
         overflow-wrap: anywhere;
+      }
+
+      .fm-schedule-cron {
+        margin-left: 6px;
+        font-family: var(--fm-mono);
+        font-size: 10px;
+      }
+
+      /* Watch editing: the section header row carries the New watch button;
+         the inline editor stacks full-width fields that stay fluid at ~280px. */
+      .fm-watch-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+      }
+
+      .fm-watch-editor {
+        display: flex;
+        flex-direction: column;
+        align-items: stretch;
+        gap: 6px;
+        width: 100%;
+        margin-top: 6px;
+      }
+
+      .fm-watch-editor input[type="text"] {
+        width: 100%;
+      }
+
+      .fm-watch-path {
+        font-family: var(--fm-mono);
+        font-size: 10px;
+        color: var(--fm-muted);
+        overflow-wrap: anywhere;
+        user-select: text;
       }
 
       .fm-steer {
@@ -303,6 +334,15 @@
 
       .fm-landing-archived {
         opacity: 0.55;
+      }
+
+      /* All landings, in a box about four rows tall; the rest scrolls. */
+      .fm-landings {
+        width: 100%;
+        max-height: 320px;
+        overflow-y: auto;
+        scrollbar-width: thin;
+        scrollbar-color: var(--fm-border) transparent;
       }
 
       .fm-meta {

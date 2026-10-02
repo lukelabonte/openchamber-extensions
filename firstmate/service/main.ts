@@ -19,6 +19,7 @@ import { findRegistration, loadRegistry, type Registration } from "./registry"
 import { loadLandingRecords } from "./landing-record"
 import { parseShippingMode } from "./shipping-mode"
 import { loadSuggestions, removeSuggestion, sendSuggestion, suggestionsPath, type Suggestion } from "./suggestions"
+import { parseCronExpression } from "./watch-schedule"
 import { createWatchRunner, type WatchExecPort } from "./watches"
 
 const rawServicePort = process.env.OPENCHAMBER_SERVICE_PORT
@@ -644,6 +645,103 @@ async function handleWatchesToggle(request: IncomingMessage, response: ServerRes
   }
 }
 
+// Schedule edits and creation join the toggle: the watch is resolved by name
+// among the project's listed watches (shared ones included, an optional
+// source narrows it like the toggle), and the schedule itself is validated by
+// the service-side parser — its own message names the expression and the
+// offending field, exactly the 400 body the captain needs to fix the input.
+function scheduleValidOrRespond(response: ServerResponse, schedule: string): boolean {
+  try {
+    parseCronExpression(schedule)
+    return true
+  } catch (error) {
+    respondJson(response, 400, { error: error instanceof Error ? error.message : "invalid watch schedule" })
+    return false
+  }
+}
+
+async function handleWatchSchedule(request: IncomingMessage, response: ServerResponse): Promise<void> {
+  const payload = await readJsonRecord(request)
+  const slug = recordString(payload, "slug")
+  const name = recordString(payload, "name")
+  const schedule = recordString(payload, "schedule")
+  const source = payload?.source
+  if (slug === undefined || name === undefined || schedule === undefined) {
+    respondJson(response, 400, { error: "slug, name, and schedule must be non-empty strings" })
+    return
+  }
+  if (source !== undefined && source !== "shared" && source !== "project") {
+    respondJson(response, 400, { error: `source must be "shared" or "project" when given` })
+    return
+  }
+  if (!scheduleValidOrRespond(response, schedule)) return
+  try {
+    const registrations = await loadRegistry(nodeFileSystem, homeRoot)
+    if (!Object.hasOwn(registrations, slug)) {
+      respondJson(response, 404, { error: `no first mate registered for slug ${slug}` })
+      return
+    }
+    const result = await watchRunner.setSchedule(slug, source, name, schedule)
+    if (result === "unknown-watch") {
+      respondJson(response, 404, { error: `no watch named ${name} for slug ${slug}` })
+      return
+    }
+    if (result === "ambiguous-watch") {
+      respondJson(response, 409, {
+        error: `the watch name ${name} matches both a shared and a project watch for ${slug}; pass source "shared" or "project"`,
+      })
+      return
+    }
+    respondJson(response, 200, { updated: true, schedule })
+  } catch (error) {
+    respondJson(response, 500, { error: error instanceof Error ? error.message : "watch schedule update failed" })
+  }
+}
+
+// Created watch names become file names under the project's watches/
+// directory — lowercase letters, digits, and dashes only, so no traversal,
+// slashes, or spaces can reach the path.
+const watchNamePattern = /^[a-z0-9][a-z0-9-]{0,39}$/
+const watchCommandMaxLength = 2000
+
+async function handleWatchCreate(request: IncomingMessage, response: ServerResponse): Promise<void> {
+  const payload = await readJsonRecord(request)
+  const slug = recordString(payload, "slug")
+  const name = recordString(payload, "name")
+  const schedule = recordString(payload, "schedule")
+  const command = recordString(payload, "command")
+  if (slug === undefined || name === undefined || schedule === undefined || command === undefined) {
+    respondJson(response, 400, { error: "slug, name, schedule, and command must be non-empty strings" })
+    return
+  }
+  if (!watchNamePattern.test(name)) {
+    respondJson(response, 400, {
+      error: "name must be at most 40 characters of lowercase letters, digits, and dashes, starting with a letter or digit",
+    })
+    return
+  }
+  if (!scheduleValidOrRespond(response, schedule)) return
+  if (command.length > watchCommandMaxLength) {
+    respondJson(response, 400, { error: `command must be at most ${watchCommandMaxLength} characters` })
+    return
+  }
+  try {
+    const registrations = await loadRegistry(nodeFileSystem, homeRoot)
+    if (!Object.hasOwn(registrations, slug)) {
+      respondJson(response, 404, { error: `no first mate registered for slug ${slug}` })
+      return
+    }
+    const result = await watchRunner.createWatch(slug, name, schedule, command)
+    if (result === "duplicate-watch") {
+      respondJson(response, 409, { error: `a watch named ${name} already exists for slug ${slug}` })
+      return
+    }
+    respondJson(response, 200, { created: true, name })
+  } catch (error) {
+    respondJson(response, 500, { error: error instanceof Error ? error.message : "watch creation failed" })
+  }
+}
+
 async function handleEnd(request: IncomingMessage, response: ServerResponse): Promise<void> {
   const payload = await readJsonRecord(request)
   const slug = recordString(payload, "slug")
@@ -676,8 +774,8 @@ async function handleEnd(request: IncomingMessage, response: ServerResponse): Pr
 }
 
 // Shipping: the mode parsed from the project's projects.md (the record; the
-// coordinator reads it itself, this endpoint feeds the panel) plus the
-// project's recent landing records.
+// coordinator reads it itself, this endpoint feeds the panel) plus all of
+// the project's landing records.
 async function handleShipping(url: URL, response: ServerResponse): Promise<void> {
   const slug = url.searchParams.get("slug")
   if (slug === null || slug.trim() === "") {
@@ -698,7 +796,7 @@ async function handleShipping(url: URL, response: ServerResponse): Promise<void>
     respondJson(response, 200, {
       mode: shipping.mode,
       yolo: shipping.yolo,
-      landings: landings.records.slice(-20),
+      landings: landings.records,
       landingErrors: landings.errors.map((error) => `line ${error.line}: ${error.message}`),
     })
   } catch (error) {
@@ -941,6 +1039,14 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse)
   }
   if (request.method === "POST" && pathname === "/watches/toggle") {
     await handleWatchesToggle(request, response)
+    return
+  }
+  if (request.method === "POST" && pathname === "/watch/schedule") {
+    await handleWatchSchedule(request, response)
+    return
+  }
+  if (request.method === "POST" && pathname === "/watch/create") {
+    await handleWatchCreate(request, response)
     return
   }
   if (request.method === "POST" && pathname === "/steer") {

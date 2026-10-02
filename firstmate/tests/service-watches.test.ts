@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test"
 import { spawn, type ChildProcess } from "node:child_process"
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import { accessSync, chmodSync, constants as fsConstants, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import net from "node:net"
 import os from "node:os"
 import path from "node:path"
@@ -169,6 +169,14 @@ describe("GET /watches", () => {
   test("answers 401 without a token", async () => {
     expect((await get("/watches?slug=sunrise", { "content-type": "application/json" })).status).toBe(401)
   })
+
+  test("rows carry the watch script's absolute path", async () => {
+    const body = (await (await get("/watches?slug=sunrise")).json()) as { watches: { name: string; path: string }[] }
+    const nightly = body.watches.find((watch) => watch.name === "nightly")
+    expect(nightly?.path).toBe(path.join(tempHome, "projects", "sunrise", "watches", "nightly"))
+    const prWatch = body.watches.find((watch) => watch.name === "pr-watch")
+    expect(prWatch?.path).toBe(path.join(tempHome, "shared", "watches", "pr-watch"))
+  })
 })
 
 describe("POST /watches/toggle", () => {
@@ -224,6 +232,64 @@ describe("watch execution end to end", () => {
     const nightlyFailures = sends.filter((line) => line.includes("watch nightly failed"))
     expect(nightlyFailures.length).toBe(1)
   }, 160_000)
+})
+
+// The schedule rewrite targets the chatty watch, so these tests sit after the
+// execution describe: rewriting its schedule must not starve the two-run
+// streak assertions above.
+describe("POST /watch/schedule", () => {
+  test("rewrites only the schedule line and the list shows the new schedule", async () => {
+    const response = await post("/watch/schedule", { slug: "sunrise", name: "chatter", schedule: "15 7 * * *" })
+    expect(response.status).toBe(200)
+    expect(await response.json()).toEqual({ updated: true, schedule: "15 7 * * *" })
+    const scriptPath = path.join(tempHome, "projects", "sunrise", "watches", "chatter")
+    expect(readFileSync(scriptPath, "utf8")).toBe(`#!/bin/sh\n# schedule: 15 7 * * *\necho "QUOTED — hello from the watch"\n`)
+    // Rewriting in place keeps the exec bit the discovery depends on.
+    expect(() => accessSync(scriptPath, fsConstants.X_OK)).not.toThrow()
+    const listed = (await (await get("/watches?slug=sunrise")).json()) as { watches: { name: string; schedule: string }[] }
+    expect(listed.watches.find((watch) => watch.name === "chatter")?.schedule).toBe("15 7 * * *")
+  })
+
+  test("answers 400 with the parser's reason for an invalid schedule", async () => {
+    const response = await post("/watch/schedule", { slug: "sunrise", name: "chatter", schedule: "nonsense" })
+    expect(response.status).toBe(400)
+    const body = (await response.json()) as { error?: string }
+    expect(body.error).toContain(`invalid watch schedule "nonsense"`)
+  })
+
+  test("answers 404 for an unknown watch and an unknown slug", async () => {
+    expect((await post("/watch/schedule", { slug: "sunrise", name: "absent", schedule: "* * * * *" })).status).toBe(404)
+    expect((await post("/watch/schedule", { slug: "elsewhere", name: "chatter", schedule: "* * * * *" })).status).toBe(404)
+  })
+})
+
+describe("POST /watch/create", () => {
+  test("writes an executable script and the list shows it", async () => {
+    const response = await post("/watch/create", {
+      slug: "sunrise",
+      name: "daily-report",
+      schedule: "0 9 * * *",
+      command: `echo "created by the test"`,
+    })
+    expect(response.status).toBe(200)
+    expect(await response.json()).toEqual({ created: true, name: "daily-report" })
+    const scriptPath = path.join(tempHome, "projects", "sunrise", "watches", "daily-report.sh")
+    expect(readFileSync(scriptPath, "utf8")).toBe(`#!/bin/sh\n# schedule: 0 9 * * *\necho "created by the test"\n`)
+    expect(() => accessSync(scriptPath, fsConstants.X_OK)).not.toThrow()
+    const listed = (await (await get("/watches?slug=sunrise")).json()) as { watches: { name: string }[] }
+    expect(watchNames(listed.watches)).toContain("daily-report.sh")
+  })
+
+  test("answers 409 when a watch with that name already exists", async () => {
+    expect((await post("/watch/create", { slug: "sunrise", name: "nightly", schedule: "* * * * *", command: "echo" })).status).toBe(409)
+  })
+
+  test("answers 400 for a bad name, an invalid schedule, and a missing command", async () => {
+    expect((await post("/watch/create", { slug: "sunrise", name: "Bad Name", schedule: "* * * * *", command: "echo" })).status).toBe(400)
+    expect((await post("/watch/create", { slug: "sunrise", name: "../escape", schedule: "* * * * *", command: "echo" })).status).toBe(400)
+    expect((await post("/watch/create", { slug: "sunrise", name: "ok-name", schedule: "nonsense", command: "echo" })).status).toBe(400)
+    expect((await post("/watch/create", { slug: "sunrise", name: "ok-name", schedule: "* * * * *" })).status).toBe(400)
+  })
 })
 
 function projectHomeOf(slug: string): string {

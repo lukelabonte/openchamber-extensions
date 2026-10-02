@@ -12,6 +12,8 @@ export interface WatchRow {
   source: WatchSource
   schedule: string
   enabled: boolean
+  /** Absolute path of the watch script, when the service reports it. */
+  path?: string
   lastRunAt?: string
   lastOutcome?: WatchOutcome
   lastOutput?: string
@@ -34,12 +36,14 @@ export function parseWatches(value: unknown): WatchRow[] {
 function parseWatch(value: unknown): WatchRow | undefined {
   if (typeof value !== "object" || value === null) return undefined
   const record = value as Record<string, unknown>
-  const { name, source, schedule, enabled, lastRunAt, lastOutcome, lastOutput, error } = record
+  const { name, source, schedule, enabled, path, lastRunAt, lastOutcome, lastOutput, error } = record
   if (typeof name !== "string" || name === "") return undefined
   if (source !== "shared" && source !== "project") return undefined
   if (typeof schedule !== "string" || schedule === "") return undefined
   if (typeof enabled !== "boolean") return undefined
-  if (!isOptionalString(lastRunAt) || !isOptionalString(lastOutput) || !isOptionalString(error)) return undefined
+  if (!isOptionalString(path) || !isOptionalString(lastRunAt) || !isOptionalString(lastOutput) || !isOptionalString(error)) {
+    return undefined
+  }
   if (lastOutcome !== undefined && lastOutcome !== "ok" && lastOutcome !== "empty" && lastOutcome !== "failed") {
     return undefined
   }
@@ -48,6 +52,7 @@ function parseWatch(value: unknown): WatchRow | undefined {
     source,
     schedule,
     enabled,
+    ...(path !== undefined ? { path } : {}),
     ...(lastRunAt !== undefined ? { lastRunAt } : {}),
     ...(lastOutcome !== undefined ? { lastOutcome } : {}),
     ...(lastOutput !== undefined ? { lastOutput } : {}),

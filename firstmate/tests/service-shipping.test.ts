@@ -153,18 +153,18 @@ describe("GET /shipping", () => {
     }
     expect(body.mode).toBe("reviewed-PR")
     expect(body.yolo).toBe(true)
-    // The fixture seeds 21 landings and the endpoint keeps the last 20, so
-    // Task 1 has already fallen off the front.
-    expect(body.landings).toHaveLength(20)
+    // The fixture seeds 21 landings and the endpoint returns all of them,
+    // oldest entry first through newest.
+    expect(body.landings).toHaveLength(21)
     expect(body.landings[0]).toEqual({
-      task: "Task 2",
+      task: "Task 1",
       commit: "1a2b3c4d",
       ci: "green",
       mode: "reviewed-PR+yolo",
       authorization: "+yolo",
-      landedAt: "2026-10-01T10:02:00.000Z",
+      landedAt: "2026-10-01T10:01:00.000Z",
     })
-    expect(body.landings[19]).toEqual({
+    expect(body.landings[20]).toEqual({
       task: "Task 21",
       commit: "1a2b3c4d",
       ci: "green",
@@ -174,12 +174,12 @@ describe("GET /shipping", () => {
     })
   })
 
-  test("keeps only the last 20 landing records", async () => {
+  test("returns all landing records", async () => {
     const response = await fetchShipping("?slug=sunrise")
     const body = (await response.json()) as { landings: Array<{ task: string }> }
-    expect(body.landings).toHaveLength(20)
-    expect(body.landings[0].task).toBe("Task 2")
-    expect(body.landings[19].task).toBe("Task 21")
+    expect(body.landings).toHaveLength(21)
+    expect(body.landings[0].task).toBe("Task 1")
+    expect(body.landings[20].task).toBe("Task 21")
   })
 
   test("answers the unset result when projects.md keeps the template default", async () => {

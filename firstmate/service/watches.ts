@@ -1,6 +1,6 @@
 import type { FileSystemPort } from "./file-system"
 import { loadRegistry, type Registration } from "./registry"
-import { computeNextRun, extractScheduleComment, parseCronExpression } from "./watch-schedule"
+import { computeNextRun, extractScheduleComment, parseCronExpression, scheduleLinePattern } from "./watch-schedule"
 
 // Watches: executable scripts in a home's shared/watches/ (available to every
 // project, executed in each project's context) and projects/<slug>/watches/,
@@ -18,6 +18,8 @@ export interface WatchInfo {
   source: WatchSource
   schedule: string
   enabled: boolean
+  /** Absolute path of the script file on disk. */
+  path: string
   /** Present when the schedule expression does not parse; such a watch never runs. */
   error?: string
   lastRunAt?: string
@@ -57,6 +59,15 @@ export interface WatchRunner {
     name: string,
     enabled: boolean,
   ): Promise<"ok" | "unknown-watch" | "ambiguous-watch">
+  /** Rewrites only the `# schedule:` line of the named watch's script. */
+  setSchedule(
+    slug: string,
+    source: WatchSource | undefined,
+    name: string,
+    schedule: string,
+  ): Promise<"ok" | "unknown-watch" | "ambiguous-watch">
+  /** Writes a new executable watch script into the project's watches/ directory. */
+  createWatch(slug: string, name: string, schedule: string, command: string): Promise<"ok" | "duplicate-watch">
 }
 
 // The project's settings.json is the switch board for its watches; a file
@@ -280,6 +291,7 @@ export function createWatchRunner(input: {
         source: watch.source,
         schedule: watch.schedule,
         enabled: isEnabled(enabledOverrides, watch.source, watch.name),
+        path: watch.scriptPath,
         ...(watch.error !== undefined ? { error: watch.error } : {}),
         ...(runState?.lastRunAt !== undefined ? { lastRunAt: runState.lastRunAt } : {}),
         ...(runState?.lastOutcome !== undefined ? { lastOutcome: runState.lastOutcome } : {}),
@@ -331,7 +343,55 @@ export function createWatchRunner(input: {
     return "ok"
   }
 
-  return { tick, listWatches, setEnabled }
+  // The schedule edit resolves the watch exactly like the toggle (by name,
+  // optionally narrowed to a source) and rewrites only the `# schedule:` line
+  // the loader matches, leaving every other byte of the script alone. The
+  // file is written in place, so its exec permission — the property discovery
+  // depends on — is never touched. The in-memory run state is dropped so the
+  // new schedule takes effect on the next tick ("next run after now", like a
+  // first sight).
+  async function setSchedule(
+    slug: string,
+    source: WatchSource | undefined,
+    name: string,
+    schedule: string,
+  ): Promise<"ok" | "unknown-watch" | "ambiguous-watch"> {
+    const candidates = (await discoverWatches(slug)).filter((watch) => watch.name === name)
+    const targets = source === undefined ? candidates : candidates.filter((watch) => watch.source === source)
+    if (targets.length === 0) return "unknown-watch"
+    if (targets.length > 1) return "ambiguous-watch"
+    const target = targets[0]
+    const lines = (await filesystem.readFile(target.scriptPath)).split("\n")
+    // The comment must live in the first 20 lines — the loader's own bound.
+    for (let index = 0; index < Math.min(lines.length, 20); index += 1) {
+      if (!scheduleLinePattern.test(lines[index])) continue
+      lines[index] = `# schedule: ${schedule}`
+      await filesystem.writeFile(target.scriptPath, lines.join("\n"))
+      runStates.delete(stateKey(slug, target.source, name))
+      return "ok"
+    }
+    return "unknown-watch"
+  }
+
+  // Creation mirrors the provision mechanism for template watches: write the
+  // script, then set the exec bit — discovery lists executable files only, so
+  // a created watch must carry it from birth. The duplicate check covers both
+  // sources; a created script is discovered under its file name, so a name
+  // collides with or without the .sh suffix.
+  async function createWatch(slug: string, name: string, schedule: string, command: string): Promise<"ok" | "duplicate-watch"> {
+    const existing = await discoverWatches(slug)
+    if (existing.some((watch) => watch.name === name || watch.name === `${name}.sh`)) {
+      return "duplicate-watch"
+    }
+    const watchesDirectory = `${homeRoot}/projects/${slug}/watches`
+    await filesystem.createDirectory(watchesDirectory)
+    const scriptPath = `${watchesDirectory}/${name}.sh`
+    await filesystem.writeFile(scriptPath, `#!/bin/sh\n# schedule: ${schedule}\n${command}\n`)
+    await filesystem.setExecutable(scriptPath)
+    return "ok"
+  }
+
+  return { tick, listWatches, setEnabled, setSchedule, createWatch }
 }
 
 type EnabledOverrides = Partial<Record<WatchSource, Record<string, unknown>>>

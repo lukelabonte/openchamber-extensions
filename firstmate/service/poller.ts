@@ -3,6 +3,8 @@ import { loadArchivedSessionIds } from "./archive"
 import { buildBoardWorker, type BoardWorker, type WorkerObservation } from "./board"
 import { sessionMessagesLastAssistant, sessionStatus, type ExecRunner } from "./control-client"
 import type { FileSystemPort } from "./file-system"
+import type { HttpFetcher, InterruptSupport } from "./interrupt"
+import { setSessionPermissionAuto } from "./permissions"
 import { loadRegistry, type Registration } from "./registry"
 
 export type WorkerEventKind = "finished" | "failed" | "waiting-question" | "waiting-permission" | "steered-answer"
@@ -48,8 +50,13 @@ export function createSupervisionPoller(input: {
   filesystem: FileSystemPort
   exec: ExecRunner
   homeRoot: string
+  fetcher: HttpFetcher
+  // Support is resolved lazily at first sight, not once at construction: a
+  // host that gains or loses the desktop proxy between service start and a
+  // later poll must not be frozen out by a boot-time answer.
+  resolveSupport: () => Promise<InterruptSupport>
 }): SupervisionPoller {
-  const { filesystem, exec, homeRoot } = input
+  const { filesystem, exec, homeRoot, fetcher, resolveSupport } = input
   const observations = new Map<string, WorkerObservation>()
   const pollErrors = new Map<string, string>()
   const deliveryErrors = new Map<string, string>()
@@ -60,6 +67,12 @@ export function createSupervisionPoller(input: {
   // a restart drops pending marks, and the steer's answer is simply not
   // forwarded.
   const steeredBaselines = new Map<string, string | undefined>()
+  // Worker sessions already set to auto-approve permissions this service's
+  // lifetime. Rounds never overlap, so marking before the call makes first
+  // sight exactly one attempt; a failed or unsupported attempt is not retried
+  // — the poll goes on, and a waiting-permission notification is where a
+  // persisting prompt would surface from.
+  const autoAcceptedSessions = new Set<string>()
 
   const observationKey = (slug: string, sessionId: string): string => `${slug}\n${sessionId}`
 
@@ -108,6 +121,15 @@ export function createSupervisionPoller(input: {
       const previous = observations.get(key)
       try {
         const directory = registration.projectDirectory
+        if (!autoAcceptedSessions.has(task.sessionId)) {
+          autoAcceptedSessions.add(task.sessionId)
+          await setSessionPermissionAuto({
+            fetcher,
+            support: await resolveSupport(),
+            sessionId: task.sessionId,
+            directory,
+          })
+        }
         const status = await sessionStatus(exec, { sessionId: task.sessionId, directory })
         const lastWord = await sessionMessagesLastAssistant(exec, { sessionId: task.sessionId, directory })
         const current: WorkerObservation = { status, ...(lastWord !== undefined ? { lastWord } : {}) }
@@ -194,7 +216,7 @@ function describeEvent(event: WorkerEvent): string {
     case "waiting-question":
       return "is waiting on a question. Open the session to read and answer it."
     case "waiting-permission":
-      return "is waiting on a permission. Open the session to approve or deny it."
+      return "was waiting on a permission; the service auto-approves worker permissions, so this should clear itself. If it persists, tell the captain."
     case "steered-answer":
       return `answered the captain's steer: ${event.answer ?? ""}`
   }

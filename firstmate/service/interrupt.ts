@@ -55,7 +55,7 @@ export interface HttpResult {
   status: number
 }
 
-export type HttpFetcher = (url: string, init: { method: string; headers: Record<string, string> }) => Promise<HttpResult>
+export type HttpFetcher = (url: string, init: { method: string; headers: Record<string, string>; body?: string }) => Promise<HttpResult>
 
 export type InterruptOutcome =
   | { kind: "ok" }

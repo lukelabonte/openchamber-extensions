@@ -423,6 +423,35 @@ async function interruptWorker(input) {
   }
 }
 
+// service/permissions.ts
+async function setSessionPermissionAuto(input) {
+  if (input.support.kind === "unsupported") {
+    return { kind: "unsupported", reason: input.support.reason };
+  }
+  const url = `http://127.0.0.1:${input.support.port}/api/permission-auto-accept/sessions/${input.sessionId}`;
+  const headers = { "content-type": "application/json" };
+  if (input.support.token !== undefined)
+    headers.authorization = `Bearer ${input.support.token}`;
+  try {
+    const result = await input.fetcher(url, {
+      method: "PUT",
+      headers,
+      body: JSON.stringify({ mode: "auto", directory: input.directory })
+    });
+    if (result.status >= 200 && result.status < 300)
+      return { kind: "ok" };
+    if (result.status === 401 || result.status === 403) {
+      return {
+        kind: "unsupported",
+        reason: `the auto-accept call was rejected with status ${result.status}: this host requires credentials that were not offered`
+      };
+    }
+    return { kind: "failed", message: `the auto-accept call answered with status ${result.status}` };
+  } catch (error) {
+    return { kind: "failed", message: error instanceof Error ? error.message : String(error) };
+  }
+}
+
 // service/slug.ts
 import path from "node:path";
 var HASH_HEX_LENGTH = 8;
@@ -617,6 +646,7 @@ async function launchOnce(input) {
   const registrations = await loadRegistry(filesystem, homeRoot);
   const existing = findRegistration(registrations, normalizedDirectory);
   if (existing !== undefined) {
+    await autoAcceptCoordinator(input, existing.coordinatorSessionId, existing.homeDirectory);
     return { registration: existing, adopted: true };
   }
   const { slug, projectHomeDirectory } = await provisionProject({
@@ -637,6 +667,7 @@ async function launchOnce(input) {
       createdAt: new Date().toISOString()
     };
     await saveRegistry(filesystem, homeRoot, { ...registrations, [slug]: registration });
+    await autoAcceptCoordinator(input, priorSessionId, projectHomeDirectory);
     return { registration, adopted: true };
   }
   let coordinatorSessionId;
@@ -651,6 +682,7 @@ async function launchOnce(input) {
     throw new Error(`could not create the coordinator session: ${error instanceof Error ? error.message : String(error)}`);
   }
   await recordCoordinatorSessionId(filesystem, settingsPath, coordinatorSessionId);
+  await autoAcceptCoordinator(input, coordinatorSessionId, projectHomeDirectory);
   const registration = {
     slug,
     projectDirectory: normalizedDirectory,
@@ -660,6 +692,9 @@ async function launchOnce(input) {
   };
   await saveRegistry(filesystem, homeRoot, { ...registrations, [slug]: registration });
   return { registration, adopted: false };
+}
+async function autoAcceptCoordinator(input, sessionId, directory) {
+  await setSessionPermissionAuto({ fetcher: input.fetcher, support: input.support, sessionId, directory });
 }
 async function readCoordinatorSessionId(filesystem, settingsPath) {
   let parsed;
@@ -732,11 +767,12 @@ function truncateLastWord(text) {
 
 // service/poller.ts
 function createSupervisionPoller(input) {
-  const { filesystem, exec, homeRoot } = input;
+  const { filesystem, exec, homeRoot, fetcher, resolveSupport } = input;
   const observations = new Map;
   const pollErrors = new Map;
   const deliveryErrors = new Map;
   const steeredBaselines = new Map;
+  const autoAcceptedSessions = new Set;
   const observationKey = (slug, sessionId) => `${slug}
 ${sessionId}`;
   async function poll() {
@@ -778,6 +814,15 @@ ${sessionId}`;
       const previous = observations.get(key);
       try {
         const directory = registration.projectDirectory;
+        if (!autoAcceptedSessions.has(task.sessionId)) {
+          autoAcceptedSessions.add(task.sessionId);
+          await setSessionPermissionAuto({
+            fetcher,
+            support: await resolveSupport(),
+            sessionId: task.sessionId,
+            directory
+          });
+        }
         const status = await sessionStatus(exec, { sessionId: task.sessionId, directory });
         const lastWord = await sessionMessagesLastAssistant(exec, { sessionId: task.sessionId, directory });
         const current = { status, ...lastWord !== undefined ? { lastWord } : {} };
@@ -856,7 +901,7 @@ function describeEvent(event) {
     case "waiting-question":
       return "is waiting on a question. Open the session to read and answer it.";
     case "waiting-permission":
-      return "is waiting on a permission. Open the session to approve or deny it.";
+      return "was waiting on a permission; the service auto-approves worker permissions, so this should clear itself. If it persists, tell the captain.";
     case "steered-answer":
       return `answered the captain's steer: ${event.answer ?? ""}`;
   }
@@ -1531,7 +1576,13 @@ function readWatchIntervalMs() {
 var pollIntervalMs = readPollIntervalMs();
 var watchIntervalMs = readWatchIntervalMs();
 var clock = createNodeClock();
-var supervisionPoller = createSupervisionPoller({ filesystem: nodeFileSystem, exec: nodeExec, homeRoot });
+var supervisionPoller = createSupervisionPoller({
+  filesystem: nodeFileSystem,
+  exec: nodeExec,
+  homeRoot,
+  fetcher: nodeFetcher,
+  resolveSupport: () => discoverSupport({ filesystem: nodeFileSystem, settingsPath: openchamberSettingsPath })
+});
 var watchRunner = createWatchRunner({ filesystem: nodeFileSystem, exec: nodeWatchExec, clock, homeRoot });
 var roundInFlight = false;
 async function runSupervisionRound() {
@@ -1644,12 +1695,15 @@ async function handleLaunch(request, response) {
     return;
   }
   try {
+    const support = await discoverSupport({ filesystem: nodeFileSystem, settingsPath: openchamberSettingsPath });
     const { registration } = await launchFirstMate({
       filesystem: nodeFileSystem,
       exec: nodeExec,
       templateReader,
       homeRoot,
-      projectDirectory
+      projectDirectory,
+      fetcher: nodeFetcher,
+      support
     });
     respondJson(response, 200, registration);
   } catch (error) {

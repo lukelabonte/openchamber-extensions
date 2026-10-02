@@ -3,6 +3,7 @@ import { parseBacklog } from "../service/backlog"
 import { archivePath, archiveSession } from "../service/archive"
 import type { ExecRunner } from "../service/control-client"
 import type { FileSystemPort } from "../service/file-system"
+import type { HttpFetcher, InterruptSupport } from "../service/interrupt"
 import { createSupervisionPoller } from "../service/poller"
 import { InMemoryFileSystem } from "./helpers/in-memory-file-system"
 
@@ -59,6 +60,39 @@ function statusExec(activity: string, outcome: string | null = null): { exec: Ex
   )
 }
 
+const noopFetcher: HttpFetcher = async () => ({ status: 200 })
+const supported = { kind: "supported", port: 4096 } as const
+
+function makePoller(input: {
+  filesystem: FileSystemPort
+  exec: ExecRunner
+  fetcher?: HttpFetcher
+  resolveSupport?: () => Promise<InterruptSupport>
+}): ReturnType<typeof createSupervisionPoller> {
+  return createSupervisionPoller({
+    homeRoot,
+    fetcher: noopFetcher,
+    resolveSupport: async () => supported,
+    ...input,
+  })
+}
+
+interface RecordedCall {
+  url: string
+  init: { method: string; body?: string }
+}
+
+function recordingFetcher(answer: () => { status: number } | "throw"): { fetcher: HttpFetcher; calls: RecordedCall[] } {
+  const calls: RecordedCall[] = []
+  const fetcher: HttpFetcher = async (url, init) => {
+    calls.push({ url, init })
+    const result = answer()
+    if (result === "throw") throw new Error("connection refused")
+    return { status: result.status }
+  }
+  return { fetcher, calls }
+}
+
 describe("createSupervisionPoller", () => {
   test("polls each backlog worker with a session id and forwards one message per project per round", async () => {
     const filesystem = new InMemoryFileSystem()
@@ -81,7 +115,7 @@ describe("createSupervisionPoller", () => {
     )
     const { exec, calls } = statusExec("waiting-question")
 
-    const poller = createSupervisionPoller({ filesystem: filesystem.port, exec, homeRoot })
+    const poller = makePoller({ filesystem: filesystem.port, exec })
     const round = await poller.poll()
 
     // Guard, in the style of the control-client argv tests: the first status
@@ -108,7 +142,7 @@ describe("createSupervisionPoller", () => {
       subcommand(args) === "status" ? '{"type":"idle","outcome":"completed"}' : '{"text":"done, pushed"}',
     )
 
-    const poller = createSupervisionPoller({ filesystem: filesystem.port, exec, homeRoot })
+    const poller = makePoller({ filesystem: filesystem.port, exec })
     const round = await poller.poll()
 
     expect(round.notifications[0].message).toContain("finished")
@@ -123,7 +157,7 @@ describe("createSupervisionPoller", () => {
       subcommand(args) === "status" ? '{"type":"idle","outcome":"failed"}' : '{"text":"tests went red"}',
     )
 
-    const poller = createSupervisionPoller({ filesystem: filesystem.port, exec, homeRoot })
+    const poller = makePoller({ filesystem: filesystem.port, exec })
     const round = await poller.poll()
 
     expect(round.notifications[0].message).toContain("failed")
@@ -135,10 +169,11 @@ describe("createSupervisionPoller", () => {
     seedBacklog(filesystem, ["- Fix flaky login test", "  state: Working", "  session: ses_11bb"].join("\n"))
     const { exec } = statusExec("waiting-permission")
 
-    const poller = createSupervisionPoller({ filesystem: filesystem.port, exec, homeRoot })
+    const poller = makePoller({ filesystem: filesystem.port, exec })
     const round = await poller.poll()
 
     expect(round.notifications[0].message).toContain("waiting on a permission")
+    expect(round.notifications[0].message).toContain("auto-approves")
   })
 
   test("a transition is reported once, not again on the next poll", async () => {
@@ -147,7 +182,7 @@ describe("createSupervisionPoller", () => {
     seedBacklog(filesystem, ["- Fix flaky login test", "  state: Working", "  session: ses_11bb"].join("\n"))
     const { exec } = statusExec("waiting-question")
 
-    const poller = createSupervisionPoller({ filesystem: filesystem.port, exec, homeRoot })
+    const poller = makePoller({ filesystem: filesystem.port, exec })
     const firstRound = await poller.poll()
     const secondRound = await poller.poll()
 
@@ -165,7 +200,7 @@ describe("createSupervisionPoller", () => {
       return subcommand(args) === "status" ? '{"type":"waiting-question"}' : '{"text":"word"}'
     }
 
-    const poller = createSupervisionPoller({ filesystem: filesystem.port, exec, homeRoot })
+    const poller = makePoller({ filesystem: filesystem.port, exec })
     await poller.poll()
 
     const tasks = [{ title: "Fix flaky login test", state: "Working" as const, sessionId: "ses_11bb" }]
@@ -199,7 +234,7 @@ describe("createSupervisionPoller", () => {
     )
     const { exec } = statusExec("waiting-question")
 
-    const poller = createSupervisionPoller({ filesystem: filesystem.port, exec, homeRoot })
+    const poller = makePoller({ filesystem: filesystem.port, exec })
     await poller.poll()
 
     const backlog = filesystem.fileContents(`${homeRoot}/projects/sunrise/backlog.md`)
@@ -224,7 +259,7 @@ describe("createSupervisionPoller", () => {
     seedRegistry(filesystem)
     const { exec } = statusExec("waiting-question")
 
-    const poller = createSupervisionPoller({ filesystem: filesystem.port, exec, homeRoot })
+    const poller = makePoller({ filesystem: filesystem.port, exec })
     const round = await poller.poll()
 
     expect(round.notifications).toEqual([])
@@ -252,7 +287,7 @@ describe("createSupervisionPoller", () => {
     })
     const { exec, calls } = statusExec("waiting-question")
 
-    const poller = createSupervisionPoller({ filesystem: filesystem.port, exec, homeRoot })
+    const poller = makePoller({ filesystem: filesystem.port, exec })
     const round = await poller.poll()
 
     const statusCalls = calls.filter((args) => subcommand(args) === "status")
@@ -280,7 +315,7 @@ describe("createSupervisionPoller", () => {
     }
     const { exec, calls } = statusExec("waiting-question")
 
-    const poller = createSupervisionPoller({ filesystem: brokenPort, exec, homeRoot })
+    const poller = makePoller({ filesystem: brokenPort, exec })
     const round = await poller.poll()
 
     expect(calls.filter((args) => subcommand(args) === "status")).toEqual([])
@@ -295,7 +330,7 @@ describe("createSupervisionPoller", () => {
     const { exec } = scriptExec((args) =>
       subcommand(args) === "status" ? '{"type":"idle"}' : `{"text":"${lastWord}"}`,
     )
-    const poller = createSupervisionPoller({ filesystem: filesystem.port, exec, homeRoot })
+    const poller = makePoller({ filesystem: filesystem.port, exec })
 
     await poller.poll() // baseline: the last word the captain steered against
     poller.markSteered("sunrise", "ses_11bb")
@@ -321,7 +356,7 @@ describe("createSupervisionPoller", () => {
     const { exec } = scriptExec((args) =>
       subcommand(args) === "status" ? '{"type":"idle"}' : '{"text":"stuck on the flake"}',
     )
-    const poller = createSupervisionPoller({ filesystem: filesystem.port, exec, homeRoot })
+    const poller = makePoller({ filesystem: filesystem.port, exec })
 
     await poller.poll()
     poller.markSteered("sunrise", "ses_11bb")
@@ -340,7 +375,7 @@ describe("createSupervisionPoller", () => {
     const { exec } = scriptExec((args) =>
       subcommand(args) === "status" ? '{"type":"idle"}' : `{"text":"${lastWord}"}`,
     )
-    const poller = createSupervisionPoller({ filesystem: filesystem.port, exec, homeRoot })
+    const poller = makePoller({ filesystem: filesystem.port, exec })
 
     await poller.poll()
     poller.markSteered("sunrise", "ses_11bb")
@@ -355,5 +390,45 @@ describe("createSupervisionPoller", () => {
     const reAnswered = await poller.poll()
     expect(reAnswered.notifications).toHaveLength(1)
     expect(reAnswered.notifications[0].message).toContain("second answer")
+  })
+
+  test("a worker session is set to auto-accept permissions on first sight, once", async () => {
+    const filesystem = new InMemoryFileSystem()
+    seedRegistry(filesystem)
+    seedBacklog(filesystem, ["- Fix flaky login test", "  state: Working", "  session: ses_11bb"].join("\n"))
+    const { exec } = statusExec("waiting-permission")
+    const { fetcher, calls } = recordingFetcher(() => ({ status: 200 }))
+
+    const poller = makePoller({
+      filesystem: filesystem.port,
+      exec,
+      fetcher,
+      resolveSupport: async () => ({ kind: "supported", port: 4096, token: "tok_local" }),
+    })
+    await poller.poll()
+    await poller.poll()
+
+    expect(calls).toHaveLength(1)
+    expect(calls[0].url).toBe("http://127.0.0.1:4096/api/permission-auto-accept/sessions/ses_11bb")
+    expect(calls[0].init.method).toBe("PUT")
+    expect(calls[0].init.body).toBe(JSON.stringify({ mode: "auto", directory: projectDirectory }))
+  })
+
+  test("a failing auto-accept neither fails the round nor retries", async () => {
+    const filesystem = new InMemoryFileSystem()
+    seedRegistry(filesystem)
+    seedBacklog(filesystem, ["- Fix flaky login test", "  state: Working", "  session: ses_11bb"].join("\n"))
+    const { exec } = statusExec("waiting-permission")
+    const { fetcher, calls } = recordingFetcher(() => "throw")
+
+    const poller = makePoller({ filesystem: filesystem.port, exec, fetcher })
+    const round = await poller.poll()
+    const second = await poller.poll()
+
+    // The poll went on (the transition is still reported) and the mark was
+    // taken at first sight, so the next round does not re-fire.
+    expect(round.notifications).toHaveLength(1)
+    expect(second.notifications).toHaveLength(0)
+    expect(calls).toHaveLength(1)
   })
 })

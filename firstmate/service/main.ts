@@ -184,7 +184,13 @@ function readWatchIntervalMs(): number {
 const pollIntervalMs = readPollIntervalMs()
 const watchIntervalMs = readWatchIntervalMs()
 const clock = createNodeClock()
-const supervisionPoller = createSupervisionPoller({ filesystem: nodeFileSystem, exec: nodeExec, homeRoot })
+const supervisionPoller = createSupervisionPoller({
+  filesystem: nodeFileSystem,
+  exec: nodeExec,
+  homeRoot,
+  fetcher: nodeFetcher,
+  resolveSupport: () => discoverSupport({ filesystem: nodeFileSystem, settingsPath: openchamberSettingsPath }),
+})
 const watchRunner = createWatchRunner({ filesystem: nodeFileSystem, exec: nodeWatchExec, clock, homeRoot })
 
 // One supervision round: poll every registered project's workers, then
@@ -324,12 +330,18 @@ async function handleLaunch(request: IncomingMessage, response: ServerResponse):
     return
   }
   try {
+    // Auto-accept is discovered per launch like the interrupt fallback: the
+    // coordinator session is switched to auto-approve permissions, and a host
+    // without that surface simply launches without it.
+    const support = await discoverSupport({ filesystem: nodeFileSystem, settingsPath: openchamberSettingsPath })
     const { registration } = await launchFirstMate({
       filesystem: nodeFileSystem,
       exec: nodeExec,
       templateReader,
       homeRoot,
       projectDirectory,
+      fetcher: nodeFetcher,
+      support,
     })
     respondJson(response, 200, registration)
   } catch (error) {

@@ -17,7 +17,7 @@ One backlog item becomes exactly one worker, always in this order:
 2. Create the worker with the `openchamber` agent tool's `session.create` action, passing a worktree with a name unique to the task and prefixed `fm/`, a branch named after the task, and a pinned start reference — the repository's current default-branch HEAD by default, recording the exact commit sha you used. Every worker session is created with the title `[FM] <task title>` (CLI: `--title "[FM] <task title>"`), so the captain can spot FirstMate workers in OpenChamber's sidebar at a glance. (CLI equivalent: `openchamber session create --dir <repo> --worktree <name> --branch <branch> --start-ref <sha> --title "[FM] <task title>" --prompt <brief>`.)
 3. Record the worker in `backlog.md` — task title, session id, worktree directory, branch, start ref, timestamps — and move its state from Queued to Working.
 
-You never run a git mutation yourself: no commits, no merges, no branch changes, no cleanup. Only workers touch repositories.
+You never run a git mutation yourself: no commits, no merges, no branch changes, no cleanup. Only workers touch repositories. The first mate service sets every worker session to auto-approve permissions (on first poll; pending prompts reconcile automatically), so a worker waiting on a permission should clear itself — if it persists, tell the captain.
 
 ## Shipping
 

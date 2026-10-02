@@ -1,6 +1,8 @@
 import { createSession, type ExecRunner, MissingCliError } from "./control-client"
 import { composeInstructions } from "./compose"
 import type { FileSystemPort } from "./file-system"
+import type { HttpFetcher, InterruptSupport } from "./interrupt"
+import { setSessionPermissionAuto } from "./permissions"
 import { provisionProject } from "./provision"
 import { findRegistration, loadRegistry, saveRegistry, type Registration } from "./registry"
 import { normalizeProjectDirectory } from "./slug"
@@ -11,6 +13,8 @@ interface LaunchFirstMateInput {
   templateReader: (templateName: string) => Promise<string>
   homeRoot: string
   projectDirectory: string
+  fetcher: HttpFetcher
+  support: InterruptSupport
 }
 
 interface LaunchFirstMateResult {
@@ -44,6 +48,7 @@ async function launchOnce(input: LaunchFirstMateInput): Promise<LaunchFirstMateR
   const registrations = await loadRegistry(filesystem, homeRoot)
   const existing = findRegistration(registrations, normalizedDirectory)
   if (existing !== undefined) {
+    await autoAcceptCoordinator(input, existing.coordinatorSessionId, existing.homeDirectory)
     return { registration: existing, adopted: true }
   }
 
@@ -68,6 +73,7 @@ async function launchOnce(input: LaunchFirstMateInput): Promise<LaunchFirstMateR
       createdAt: new Date().toISOString(),
     }
     await saveRegistry(filesystem, homeRoot, { ...registrations, [slug]: registration })
+    await autoAcceptCoordinator(input, priorSessionId, projectHomeDirectory)
     return { registration, adopted: true }
   }
 
@@ -82,6 +88,7 @@ async function launchOnce(input: LaunchFirstMateInput): Promise<LaunchFirstMateR
     throw new Error(`could not create the coordinator session: ${error instanceof Error ? error.message : String(error)}`)
   }
   await recordCoordinatorSessionId(filesystem, settingsPath, coordinatorSessionId)
+  await autoAcceptCoordinator(input, coordinatorSessionId, projectHomeDirectory)
 
   const registration: Registration = {
     slug,
@@ -92,6 +99,14 @@ async function launchOnce(input: LaunchFirstMateInput): Promise<LaunchFirstMateR
   }
   await saveRegistry(filesystem, homeRoot, { ...registrations, [slug]: registration })
   return { registration, adopted: false }
+}
+
+// Best-effort: the coordinator session is set to auto-approve permissions so
+// a prompt never blocks it. A host without the surface, or a failed call,
+// changes nothing about the launch — setSessionPermissionAuto classifies and
+// never throws, and the outcome is deliberately ignored.
+async function autoAcceptCoordinator(input: LaunchFirstMateInput, sessionId: string, directory: string): Promise<void> {
+  await setSessionPermissionAuto({ fetcher: input.fetcher, support: input.support, sessionId, directory })
 }
 
 async function readCoordinatorSessionId(filesystem: FileSystemPort, settingsPath: string): Promise<string | undefined> {

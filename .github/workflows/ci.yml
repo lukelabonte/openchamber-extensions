@@ -1,0 +1,15 @@
+name: CI
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Trivial check (controllable green/red)
+        run: |
+          if [ -f .ci-red ]; then echo "CI forced red"; exit 1; fi
+          echo "CI green"

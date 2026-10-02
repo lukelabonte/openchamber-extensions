@@ -403,7 +403,7 @@ async function interruptWorker(input) {
   if (input.support.kind === "unsupported") {
     return { kind: "unsupported", reason: input.support.reason };
   }
-  const url = `http://127.0.0.1:${input.support.port}/api/session/${input.sessionId}/abort?directory=${encodeURIComponent(input.directory)}`;
+  const url = `http://127.0.0.1:${input.support.port}/api/session/${input.sessionId}/interrupt?directory=${encodeURIComponent(input.directory)}`;
   const headers = {};
   if (input.support.token !== undefined)
     headers.authorization = `Bearer ${input.support.token}`;

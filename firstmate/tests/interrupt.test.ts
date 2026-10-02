@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test"
 import { discoverSupport, interruptWorker, type HttpFetcher } from "../service/interrupt"
 import { InMemoryFileSystem } from "./helpers/in-memory-file-system"
 
-// Discovery and the abort call are pure ports: the filesystem and the HTTP
+// Discovery and the interrupt call are pure ports: the filesystem and the HTTP
 // fetcher are fakes, so no test reads the real OpenChamber config or touches
 // the network.
 
@@ -80,7 +80,7 @@ function recordingFetcher(answer: (call: RecordedCall) => { status: number } | "
 const supported = { kind: "supported", port: 4096, token: "tok_local" } as const
 
 describe("interruptWorker", () => {
-  test("posts the abort to the managed opencode server with the local-client token and directory", async () => {
+  test("posts the interrupt to the managed opencode server with the local-client token and directory", async () => {
     const { fetcher, calls } = recordingFetcher(() => ({ status: 200 }))
 
     const outcome = await interruptWorker({
@@ -92,7 +92,7 @@ describe("interruptWorker", () => {
 
     expect(outcome).toEqual({ kind: "ok" })
     expect(calls).toHaveLength(1)
-    expect(calls[0].url).toBe("http://127.0.0.1:4096/api/session/ses_11bb/abort?directory=%2Frepos%2Fsunrise")
+    expect(calls[0].url).toBe("http://127.0.0.1:4096/api/session/ses_11bb/interrupt?directory=%2Frepos%2Fsunrise")
     expect(calls[0].init.method).toBe("POST")
     expect(calls[0].init.headers.authorization).toBe("Bearer tok_local")
   })
@@ -112,7 +112,7 @@ describe("interruptWorker", () => {
     expect(calls[0].init.headers.authorization).toBeUndefined()
   })
 
-  test("a 401 or 403 abort answer classifies as unsupported", async () => {
+  test("a 401 or 403 interrupt answer classifies as unsupported", async () => {
     for (const status of [401, 403]) {
       const { fetcher } = recordingFetcher(() => ({ status }))
 
@@ -126,7 +126,7 @@ describe("interruptWorker", () => {
     }
   })
 
-  test("a non-2xx abort answer is a failed outcome, not a throw", async () => {
+  test("a non-2xx interrupt answer is a failed outcome, not a throw", async () => {
     const { fetcher } = recordingFetcher(() => ({ status: 500 }))
 
     const outcome = await interruptWorker({ fetcher, support: supported, sessionId: "ses_11bb", directory: "/repos/sunrise" })

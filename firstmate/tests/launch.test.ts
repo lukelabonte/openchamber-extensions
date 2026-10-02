@@ -121,6 +121,31 @@ describe("launchFirstMate", () => {
     expect(fake.calls).toHaveLength(1)
   })
 
+  test("adopts an existing registration when launched with the first mate's home directory", async () => {
+    const filesystem = new InMemoryFileSystem()
+    const fake = fakeExec()
+    filesystem.seedFile(
+      "/home/firstmate/registry.json",
+      JSON.stringify({
+        sunrise: {
+          slug: "sunrise",
+          projectDirectory,
+          homeDirectory: "/home/firstmate/projects/sunrise",
+          coordinatorSessionId: "ses_existing",
+          createdAt: "2026-01-01T00:00:00.000Z",
+        },
+      }),
+    )
+
+    const result = await launchFirstMate(
+      makeInput({ filesystem: filesystem.port, exec: fake.exec, projectDirectory: "/home/firstmate/projects/sunrise" }),
+    )
+
+    expect(result.adopted).toBe(true)
+    expect(result.registration.coordinatorSessionId).toBe("ses_existing")
+    expect(fake.calls).toHaveLength(0)
+  })
+
   test("two concurrent launches for one project create only one session", async () => {
     const filesystem = new InMemoryFileSystem()
     const fake = countingExec()

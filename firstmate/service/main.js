@@ -622,7 +622,7 @@ async function saveRegistry(filesystem, homeRoot, registrations) {
 }
 function findRegistration(registrations, projectDirectory) {
   const normalizedDirectory = normalizeProjectDirectory(projectDirectory);
-  return Object.values(registrations).find((registration) => registration.projectDirectory === normalizedDirectory);
+  return Object.values(registrations).find((registration) => normalizeProjectDirectory(registration.projectDirectory) === normalizedDirectory || normalizeProjectDirectory(registration.homeDirectory) === normalizedDirectory);
 }
 function isRegistration(value) {
   if (!isPlainObject(value))

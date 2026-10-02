@@ -55,12 +55,18 @@ export async function saveRegistry(
   await filesystem.rename(tempPath, filePath)
 }
 
+// A directory matches when it is the project directory or the first mate's
+// own home, so a session in either place resolves to that project's context.
 export function findRegistration(
   registrations: Record<string, Registration>,
   projectDirectory: string,
 ): Registration | undefined {
   const normalizedDirectory = normalizeProjectDirectory(projectDirectory)
-  return Object.values(registrations).find((registration) => registration.projectDirectory === normalizedDirectory)
+  return Object.values(registrations).find(
+    (registration) =>
+      normalizeProjectDirectory(registration.projectDirectory) === normalizedDirectory ||
+      normalizeProjectDirectory(registration.homeDirectory) === normalizedDirectory,
+  )
 }
 
 function isRegistration(value: unknown): value is Registration {

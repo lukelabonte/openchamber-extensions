@@ -167,17 +167,38 @@ describe("POST /launch and the registry endpoints", () => {
     expect(readFileSync(shimLogPath, "utf8").trim().split("\n")).toHaveLength(shimCallCountBefore)
   })
 
+  test("launching with a first mate's home directory adopts the existing registration", async () => {
+    const projectDirectory = path.join(tempRoot, "home-adopt-me")
+    mkdirSync(projectDirectory)
+    const firstResponse = await launch(servicePort, { projectDirectory })
+    const first = (await firstResponse.json()) as Record<string, unknown>
+    const shimCallCountBefore = readFileSync(shimLogPath, "utf8").trim().split("\n").length
+
+    const secondResponse = await launch(servicePort, { projectDirectory: first.homeDirectory as string })
+
+    expect(secondResponse.status).toBe(200)
+    expect(await secondResponse.json()).toEqual(first)
+    expect(readFileSync(shimLogPath, "utf8").trim().split("\n")).toHaveLength(shimCallCountBefore)
+  })
+
   test("GET /lookup answers the registration for a registered directory and null otherwise", async () => {
     const projectDirectory = path.join(tempRoot, "lookup-me")
     mkdirSync(projectDirectory)
     const launchResponse = await launch(servicePort, { projectDirectory })
-    const registration = await launchResponse.json()
+    const registration = (await launchResponse.json()) as Record<string, unknown>
 
     const found = await fetch(serviceUrl(servicePort, "lookup", `?directory=${encodeURIComponent(projectDirectory)}`), {
       headers: { authorization: `Bearer ${serviceToken}` },
     })
     expect(found.status).toBe(200)
     expect(await found.json()).toEqual({ registration })
+
+    const homeLookup = await fetch(
+      serviceUrl(servicePort, "lookup", `?directory=${encodeURIComponent(registration.homeDirectory as string)}`),
+      { headers: { authorization: `Bearer ${serviceToken}` } },
+    )
+    expect(homeLookup.status).toBe(200)
+    expect(await homeLookup.json()).toEqual({ registration })
 
     const none = await fetch(serviceUrl(servicePort, "lookup", `?directory=${encodeURIComponent(path.join(tempRoot, "elsewhere"))}`), {
       headers: { authorization: `Bearer ${serviceToken}` },

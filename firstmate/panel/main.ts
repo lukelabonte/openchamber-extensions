@@ -146,7 +146,12 @@ async function ensureSessionsSubscription(registration: RegistrationInfo): Promi
   try {
     const projects = await host.listProjects()
     if (activeRegistration !== registration) return
-    const project = projects.projects.find((candidate) => candidate.directory === currentDirectory)
+    // A session opened in the first mate's home (e.g. the coordinator's own
+    // session) resolves through the registration but has no matching
+    // currentDirectory; the project's directory is the subscription target.
+    const project =
+      projects.projects.find((candidate) => candidate.directory === currentDirectory) ??
+      projects.projects.find((candidate) => candidate.directory === registration.projectDirectory)
     if (project === undefined) return
     const unsubscribe = await host.onSessions(project.id, (snapshot) => {
       if (snapshot.state !== "ready") return

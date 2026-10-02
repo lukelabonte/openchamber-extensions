@@ -384,6 +384,33 @@ async function deliverNotification(input) {
   }
 }
 
+// service/desktop-proxy.ts
+async function callDesktopProxy(input) {
+  if (input.support.kind === "unsupported") {
+    return { kind: "unsupported", reason: input.support.reason };
+  }
+  const url = `http://127.0.0.1:${input.support.port}${input.path}`;
+  const headers = {};
+  if (input.body !== undefined)
+    headers["content-type"] = "application/json";
+  if (input.support.token !== undefined)
+    headers.authorization = `Bearer ${input.support.token}`;
+  try {
+    const result = await input.fetcher(url, { method: input.method, headers, ...input.body !== undefined ? { body: input.body } : {} });
+    if (result.status >= 200 && result.status < 300)
+      return { kind: "ok" };
+    if (result.status === 401 || result.status === 403) {
+      return {
+        kind: "unsupported",
+        reason: `the ${input.label} call was rejected with status ${result.status}: this host requires credentials that were not offered`
+      };
+    }
+    return { kind: "failed", message: `the ${input.label} call answered with status ${result.status}` };
+  } catch (error) {
+    return { kind: "failed", message: error instanceof Error ? error.message : String(error) };
+  }
+}
+
 // service/interrupt.ts
 async function discoverSupport(input) {
   let raw;
@@ -414,56 +441,25 @@ async function discoverSupport(input) {
   return { kind: "supported", port, ...usableToken !== undefined ? { token: usableToken } : {} };
 }
 async function interruptWorker(input) {
-  if (input.support.kind === "unsupported") {
-    return { kind: "unsupported", reason: input.support.reason };
-  }
-  const url = `http://127.0.0.1:${input.support.port}/api/session/${input.sessionId}/interrupt?directory=${encodeURIComponent(input.directory)}`;
-  const headers = {};
-  if (input.support.token !== undefined)
-    headers.authorization = `Bearer ${input.support.token}`;
-  try {
-    const result = await input.fetcher(url, { method: "POST", headers });
-    if (result.status >= 200 && result.status < 300)
-      return { kind: "ok" };
-    if (result.status === 401 || result.status === 403) {
-      return {
-        kind: "unsupported",
-        reason: `the abort call was rejected with status ${result.status}: this host requires credentials that were not offered`
-      };
-    }
-    return { kind: "failed", message: `the abort call answered with status ${result.status}` };
-  } catch (error) {
-    return { kind: "failed", message: error instanceof Error ? error.message : String(error) };
-  }
+  return callDesktopProxy({
+    fetcher: input.fetcher,
+    support: input.support,
+    method: "POST",
+    path: `/api/session/${input.sessionId}/interrupt?directory=${encodeURIComponent(input.directory)}`,
+    label: "abort"
+  });
 }
 
 // service/permissions.ts
 async function setSessionPermissionAuto(input) {
-  if (input.support.kind === "unsupported") {
-    return { kind: "unsupported", reason: input.support.reason };
-  }
-  const url = `http://127.0.0.1:${input.support.port}/api/permission-auto-accept/sessions/${input.sessionId}`;
-  const headers = { "content-type": "application/json" };
-  if (input.support.token !== undefined)
-    headers.authorization = `Bearer ${input.support.token}`;
-  try {
-    const result = await input.fetcher(url, {
-      method: "PUT",
-      headers,
-      body: JSON.stringify({ mode: "auto", directory: input.directory })
-    });
-    if (result.status >= 200 && result.status < 300)
-      return { kind: "ok" };
-    if (result.status === 401 || result.status === 403) {
-      return {
-        kind: "unsupported",
-        reason: `the auto-accept call was rejected with status ${result.status}: this host requires credentials that were not offered`
-      };
-    }
-    return { kind: "failed", message: `the auto-accept call answered with status ${result.status}` };
-  } catch (error) {
-    return { kind: "failed", message: error instanceof Error ? error.message : String(error) };
-  }
+  return callDesktopProxy({
+    fetcher: input.fetcher,
+    support: input.support,
+    method: "PUT",
+    path: `/api/permission-auto-accept/sessions/${input.sessionId}`,
+    body: JSON.stringify({ mode: "auto", directory: input.directory }),
+    label: "auto-accept"
+  });
 }
 
 // service/slug.ts
@@ -829,13 +825,15 @@ ${sessionId}`;
       try {
         const directory = registration.projectDirectory;
         if (!autoAcceptedSessions.has(task.sessionId)) {
-          autoAcceptedSessions.add(task.sessionId);
-          await setSessionPermissionAuto({
+          const outcome = await setSessionPermissionAuto({
             fetcher,
             support: await resolveSupport(),
             sessionId: task.sessionId,
             directory
           });
+          if (outcome.kind === "ok" || outcome.kind === "unsupported") {
+            autoAcceptedSessions.add(task.sessionId);
+          }
         }
         const status = await sessionStatus(exec, { sessionId: task.sessionId, directory });
         const lastWord = await sessionMessagesLastAssistant(exec, { sessionId: task.sessionId, directory });
@@ -870,7 +868,7 @@ ${sessionId}`;
     if (activity === "waiting-permission" && previous?.status.activity !== "waiting-permission")
       events.push(emit("waiting-permission"));
     const outcomeFinished = outcome === "completed" && previous?.status.outcome !== "completed";
-    const idleFinished = activity === "idle" && previous?.status.activity === "running";
+    const idleFinished = activity === "idle" && (previous === undefined ? task.state === "Working" : previous.status.activity === "running");
     if (outcomeFinished || idleFinished)
       events.push(emit("finished"));
     return events;
@@ -2078,7 +2076,7 @@ function acquireSuggestionProject(slug) {
   busySuggestionProjects.add(slug);
   return true;
 }
-async function handleSuggestionSend(request, response) {
+async function handleSuggestionAction(request, response, action) {
   const payload = await readJsonRecord(request);
   const slug = recordString(payload, "slug");
   const label = recordString(payload, "label");
@@ -2104,54 +2102,35 @@ async function handleSuggestionSend(request, response) {
       respondJson(response, 409, { error: `the label "${label}" appears more than once in ${slug}'s suggestions.md` });
       return;
     }
-    const outcome = await sendSuggestion(nodeFileSystem, suggestionsPath(homeRoot, slug), context.suggestion, (text) => sendCoordinatorMessage({
-      exec: nodeExec,
-      coordinator: {
-        sessionId: context.registration.coordinatorSessionId,
-        directory: context.registration.homeDirectory
-      },
-      text
-    }));
-    respondJson(response, 200, outcome);
-  } catch (error) {
-    respondActionError(response, error, "suggestion send failed");
-  } finally {
-    busySuggestionProjects.delete(slug);
-  }
-}
-async function handleSuggestionDismiss(request, response) {
-  const payload = await readJsonRecord(request);
-  const slug = recordString(payload, "slug");
-  const label = recordString(payload, "label");
-  if (slug === undefined || label === undefined) {
-    respondJson(response, 400, { error: "slug and label must be non-empty strings" });
-    return;
-  }
-  if (!acquireSuggestionProject(slug)) {
-    respondJson(response, 409, { error: `another suggestion action for ${slug} is still in flight` });
-    return;
-  }
-  try {
-    const context = await resolveSuggestion(slug, label);
-    if (context.kind === "unknown-slug") {
-      respondJson(response, 404, { error: `no first mate registered for slug ${slug}` });
-      return;
-    }
-    if (context.kind === "unknown-label") {
-      respondJson(response, 404, { error: `no suggestion labeled "${label}" on ${slug}'s suggestions.md` });
-      return;
-    }
-    if (context.kind === "duplicate-label") {
-      respondJson(response, 409, { error: `the label "${label}" appears more than once in ${slug}'s suggestions.md` });
+    if (action === "send") {
+      const outcome = await sendSuggestion(nodeFileSystem, suggestionsPath(homeRoot, slug), context.suggestion, (text) => sendCoordinatorMessage({
+        exec: nodeExec,
+        coordinator: {
+          sessionId: context.registration.coordinatorSessionId,
+          directory: context.registration.homeDirectory
+        },
+        text
+      }));
+      respondJson(response, 200, outcome);
       return;
     }
     await removeSuggestion(nodeFileSystem, suggestionsPath(homeRoot, slug), label);
     respondJson(response, 200, { dismissed: true });
   } catch (error) {
+    if (action === "send") {
+      respondActionError(response, error, "suggestion send failed");
+      return;
+    }
     respondJson(response, 500, { error: error instanceof Error ? error.message : "suggestion dismiss failed" });
   } finally {
     busySuggestionProjects.delete(slug);
   }
+}
+async function handleSuggestionSend(request, response) {
+  await handleSuggestionAction(request, response, "send");
+}
+async function handleSuggestionDismiss(request, response) {
+  await handleSuggestionAction(request, response, "dismiss");
 }
 var commandPrompts = {
   bearings: "/bearings",

@@ -35,7 +35,9 @@ export interface PollRound {
 // when the previous observation differs, so one message per worker per
 // transition — and all of one project's events in a round arrive together as
 // one message for the coordinator. Poll state is in-memory: after a service
-// restart the first poll re-reports what it sees.
+// restart the first poll re-reports what it sees — a worker already idle at
+// first sight is re-reported finished (the backlog state says whether work
+// was in flight), so a restart never swallows a finished turn.
 export interface SupervisionPoller {
   poll(): Promise<PollRound>
   getBoardWorkers(slug: string, tasks: BacklogTask[]): BoardWorker[]
@@ -68,10 +70,13 @@ export function createSupervisionPoller(input: {
   // forwarded.
   const steeredBaselines = new Map<string, string | undefined>()
   // Worker sessions already set to auto-approve permissions this service's
-  // lifetime. Rounds never overlap, so marking before the call makes first
-  // sight exactly one attempt; a failed or unsupported attempt is not retried
-  // — the poll goes on, and a waiting-permission notification is where a
-  // persisting prompt would surface from.
+  // lifetime. Rounds never overlap, so first sight is exactly one attempt
+  // while it succeeds or answers unsupported; a failed attempt leaves the
+  // session unmarked so the next round retries — one transient failure must
+  // not block auto-approve for the session's lifetime. Unsupported is
+  // terminal: the host offers no auto-approve path, so a retry would only
+  // fail again. A waiting-permission notification is where a persisting
+  // prompt would surface from.
   const autoAcceptedSessions = new Set<string>()
 
   const observationKey = (slug: string, sessionId: string): string => `${slug}\n${sessionId}`
@@ -122,13 +127,15 @@ export function createSupervisionPoller(input: {
       try {
         const directory = registration.projectDirectory
         if (!autoAcceptedSessions.has(task.sessionId)) {
-          autoAcceptedSessions.add(task.sessionId)
-          await setSessionPermissionAuto({
+          const outcome = await setSessionPermissionAuto({
             fetcher,
             support: await resolveSupport(),
             sessionId: task.sessionId,
             directory,
           })
+          if (outcome.kind === "ok" || outcome.kind === "unsupported") {
+            autoAcceptedSessions.add(task.sessionId)
+          }
         }
         const status = await sessionStatus(exec, { sessionId: task.sessionId, directory })
         const lastWord = await sessionMessagesLastAssistant(exec, { sessionId: task.sessionId, directory })
@@ -166,11 +173,15 @@ export function createSupervisionPoller(input: {
     // The verified host class reports only busy/idle (mapped to running/idle
     // here) and exposes no outcome field, so "finished" must also fire on the
     // running→idle transition; waiting-* and outcome-based "failed" can only
-    // fire on host classes that report richer statuses. The two detections
-    // share one emit so a transition alongside a completed outcome reports
-    // exactly once.
+    // fire on host classes that report richer statuses. First sight counts as
+    // well — poll state is in-memory, so a worker already idle when the first
+    // poll sees it (after a restart, or before supervision began) is
+    // re-reported finished, but only when the backlog state says the work was
+    // in flight. The detections share one emit so a transition alongside a
+    // completed outcome reports exactly once.
     const outcomeFinished = outcome === "completed" && previous?.status.outcome !== "completed"
-    const idleFinished = activity === "idle" && previous?.status.activity === "running"
+    const idleFinished =
+      activity === "idle" && (previous === undefined ? task.state === "Working" : previous.status.activity === "running")
     if (outcomeFinished || idleFinished) events.push(emit("finished"))
     return events
   }

@@ -768,7 +768,7 @@ function acquireSuggestionProject(slug: string): boolean {
   return true
 }
 
-async function handleSuggestionSend(request: IncomingMessage, response: ServerResponse): Promise<void> {
+async function handleSuggestionAction(request: IncomingMessage, response: ServerResponse, action: "send" | "dismiss"): Promise<void> {
   const payload = await readJsonRecord(request)
   const slug = recordString(payload, "slug")
   const label = recordString(payload, "label")
@@ -794,61 +794,43 @@ async function handleSuggestionSend(request: IncomingMessage, response: ServerRe
       respondJson(response, 409, { error: `the label "${label}" appears more than once in ${slug}'s suggestions.md` })
       return
     }
-    // The send-then-remove composition lives in suggestions.ts: a failed send
-    // throws unchanged (the line stays ready to press again), while a failed
-    // removal after a successful send is answered as a warning, not an error
-    // — the coordinator already has the message.
-    const outcome = await sendSuggestion(nodeFileSystem, suggestionsPath(homeRoot, slug), context.suggestion, (text) =>
-      sendCoordinatorMessage({
-        exec: nodeExec,
-        coordinator: {
-          sessionId: context.registration.coordinatorSessionId,
-          directory: context.registration.homeDirectory,
-        },
-        text,
-      }),
-    )
-    respondJson(response, 200, outcome)
-  } catch (error) {
-    respondActionError(response, error, "suggestion send failed")
-  } finally {
-    busySuggestionProjects.delete(slug)
-  }
-}
-
-async function handleSuggestionDismiss(request: IncomingMessage, response: ServerResponse): Promise<void> {
-  const payload = await readJsonRecord(request)
-  const slug = recordString(payload, "slug")
-  const label = recordString(payload, "label")
-  if (slug === undefined || label === undefined) {
-    respondJson(response, 400, { error: "slug and label must be non-empty strings" })
-    return
-  }
-  if (!acquireSuggestionProject(slug)) {
-    respondJson(response, 409, { error: `another suggestion action for ${slug} is still in flight` })
-    return
-  }
-  try {
-    const context = await resolveSuggestion(slug, label)
-    if (context.kind === "unknown-slug") {
-      respondJson(response, 404, { error: `no first mate registered for slug ${slug}` })
-      return
-    }
-    if (context.kind === "unknown-label") {
-      respondJson(response, 404, { error: `no suggestion labeled "${label}" on ${slug}'s suggestions.md` })
-      return
-    }
-    if (context.kind === "duplicate-label") {
-      respondJson(response, 409, { error: `the label "${label}" appears more than once in ${slug}'s suggestions.md` })
+    if (action === "send") {
+      // The send-then-remove composition lives in suggestions.ts: a failed send
+      // throws unchanged (the line stays ready to press again), while a failed
+      // removal after a successful send is answered as a warning, not an error
+      // — the coordinator already has the message.
+      const outcome = await sendSuggestion(nodeFileSystem, suggestionsPath(homeRoot, slug), context.suggestion, (text) =>
+        sendCoordinatorMessage({
+          exec: nodeExec,
+          coordinator: {
+            sessionId: context.registration.coordinatorSessionId,
+            directory: context.registration.homeDirectory,
+          },
+          text,
+        }),
+      )
+      respondJson(response, 200, outcome)
       return
     }
     await removeSuggestion(nodeFileSystem, suggestionsPath(homeRoot, slug), label)
     respondJson(response, 200, { dismissed: true })
   } catch (error) {
+    if (action === "send") {
+      respondActionError(response, error, "suggestion send failed")
+      return
+    }
     respondJson(response, 500, { error: error instanceof Error ? error.message : "suggestion dismiss failed" })
   } finally {
     busySuggestionProjects.delete(slug)
   }
+}
+
+async function handleSuggestionSend(request: IncomingMessage, response: ServerResponse): Promise<void> {
+  await handleSuggestionAction(request, response, "send")
+}
+
+async function handleSuggestionDismiss(request: IncomingMessage, response: ServerResponse): Promise<void> {
+  await handleSuggestionAction(request, response, "dismiss")
 }
 
 // /bearings and /ahoy: the panel composes nothing — the command word is

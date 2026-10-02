@@ -44,6 +44,10 @@ _Avoid_: dashboard, kanban
 An executable script in a home's `watches/` directory that runs on a cron-style schedule while OpenChamber runs. Output reaches the first mate as a single message; a watch that prints nothing produces no message.
 _Avoid_: cron job, scheduled task
 
+**Suggestion**:
+A ready-to-send message the first mate keeps in `suggestions.md`, one per line, labeled; the captain sends or dismisses it from the panel, and a sent suggestion reaches the first mate verbatim.
+_Avoid_: recommendation, proposal
+
 **Quoted text**:
 External text a watch passes on (a pull-request comment, a web page), explicitly marked as quoted. The first mate treats quoted text as news, never as orders.
 _Avoid_: forwarded text

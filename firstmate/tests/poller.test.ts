@@ -171,7 +171,7 @@ describe("createSupervisionPoller", () => {
     expect(message.split("finished its turn")).toHaveLength(2)
   })
 
-  test("an idle→idle poll emits no finished event", async () => {
+  test("a first-sight idle worker reports finished exactly once, then stays quiet", async () => {
     const filesystem = new InMemoryFileSystem()
     seedRegistry(filesystem)
     seedBacklog(filesystem, ["- Fix flaky login test", "  state: Working", "  session: ses_11bb"].join("\n"))
@@ -181,8 +181,21 @@ describe("createSupervisionPoller", () => {
     const firstRound = await poller.poll()
     const secondRound = await poller.poll()
 
-    expect(firstRound.notifications).toEqual([])
+    expect(firstRound.notifications).toHaveLength(1)
+    expect(firstRound.notifications[0].message.split("finished its turn")).toHaveLength(2)
     expect(secondRound.notifications).toEqual([])
+  })
+
+  test("a first-sight idle worker on a Queued task reports nothing", async () => {
+    const filesystem = new InMemoryFileSystem()
+    seedRegistry(filesystem)
+    seedBacklog(filesystem, ["- Fix flaky login test", "  state: Queued", "  session: ses_11bb"].join("\n"))
+    const { exec } = statusExec("idle")
+
+    const poller = makePoller({ filesystem: filesystem.port, exec })
+    const firstRound = await poller.poll()
+
+    expect(firstRound.notifications).toEqual([])
   })
 
   test("a first-sight running observation stays quiet until the idle transition", async () => {
@@ -488,21 +501,40 @@ describe("createSupervisionPoller", () => {
     expect(calls[0].init.body).toBe(JSON.stringify({ mode: "auto", directory: projectDirectory }))
   })
 
-  test("a failing auto-accept neither fails the round nor retries", async () => {
+  test("a failed auto-accept is retried on the next poll and marked on success", async () => {
     const filesystem = new InMemoryFileSystem()
     seedRegistry(filesystem)
     seedBacklog(filesystem, ["- Fix flaky login test", "  state: Working", "  session: ses_11bb"].join("\n"))
     const { exec } = statusExec("waiting-permission")
-    const { fetcher, calls } = recordingFetcher(() => "throw")
+    let attempts = 0
+    const { fetcher, calls } = recordingFetcher(() => {
+      attempts += 1
+      return attempts === 1 ? "throw" : { status: 200 }
+    })
 
     const poller = makePoller({ filesystem: filesystem.port, exec, fetcher })
     const round = await poller.poll()
-    const second = await poller.poll()
+    await poller.poll()
+    await poller.poll()
 
-    // The poll went on (the transition is still reported) and the mark was
-    // taken at first sight, so the next round does not re-fire.
+    // The failed attempt left the session unmarked, so the next round retried
+    // and the successful retry marked it; the third round made no call. The
+    // round's own transitions were reported throughout.
     expect(round.notifications).toHaveLength(1)
-    expect(second.notifications).toHaveLength(0)
+    expect(calls).toHaveLength(2)
+  })
+
+  test("an unsupported auto-accept is not retried", async () => {
+    const filesystem = new InMemoryFileSystem()
+    seedRegistry(filesystem)
+    seedBacklog(filesystem, ["- Fix flaky login test", "  state: Working", "  session: ses_11bb"].join("\n"))
+    const { exec } = statusExec("waiting-permission")
+    const { fetcher, calls } = recordingFetcher(() => ({ status: 401 }))
+
+    const poller = makePoller({ filesystem: filesystem.port, exec, fetcher })
+    await poller.poll()
+    await poller.poll()
+
     expect(calls).toHaveLength(1)
   })
 })

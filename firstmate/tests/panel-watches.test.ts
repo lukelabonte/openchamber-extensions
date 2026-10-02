@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import { initialPanelState, reducePanelState, type PanelEvent, type RegistrationInfo } from "../panel/state"
-import { formatLastRun, parseWatches, watchOutcomeLabel } from "../panel/watches"
+import { formatLastRun, formatSchedule, parseWatches, watchOutcomeLabel } from "../panel/watches"
 
 const registration: RegistrationInfo = {
   slug: "sunrise",
@@ -74,6 +74,32 @@ describe("watch row display mapping", () => {
     for (const lastOutcome of ["ok", "empty", "failed"] as const) {
       expect(watchOutcomeLabel({ name: "w", source: "shared", schedule: "*", enabled: true, lastOutcome })).toBe(lastOutcome)
     }
+  })
+})
+
+describe("formatSchedule", () => {
+  test("reads the known cron shapes as plain language", () => {
+    expect(formatSchedule("*/5 * * * *")).toBe("Every 5 minutes")
+    expect(formatSchedule("*/15 * * * *")).toBe("Every 15 minutes")
+    expect(formatSchedule("0 * * * *")).toBe("Every hour")
+    expect(formatSchedule("30 * * * *")).toBe("Every hour at :30")
+    expect(formatSchedule("0 9 * * *")).toBe("Daily at 9:00 AM")
+    expect(formatSchedule("5 13 * * *")).toBe("Daily at 1:05 PM")
+    expect(formatSchedule("30 9 * * 1")).toBe("Weekly on Monday at 9:30 AM")
+    expect(formatSchedule("0 12 * * 0")).toBe("Weekly on Sunday at 12:00 PM")
+  })
+
+  test("normalizes day-of-week 7 to Sunday", () => {
+    expect(formatSchedule("0 8 * * 7")).toBe("Weekly on Sunday at 8:00 AM")
+  })
+
+  test("leaves expressions outside the known shapes raw", () => {
+    expect(formatSchedule("* * * * *")).toBe("* * * * *")
+    expect(formatSchedule("0 9 * * 1-5")).toBe("0 9 * * 1-5")
+    expect(formatSchedule("0,30 6 * * 1,3,5")).toBe("0,30 6 * * 1,3,5")
+    expect(formatSchedule("*/15 * * * 1")).toBe("*/15 * * * 1")
+    expect(formatSchedule("0 9 1 * *")).toBe("0 9 1 * *")
+    expect(formatSchedule("nonsense")).toBe("nonsense")
   })
 })
 

@@ -73,3 +73,39 @@ export function watchOutcomeLabel(watch: WatchRow): string {
   if (watch.error !== undefined) return "invalid schedule"
   return watch.lastOutcome ?? "no run yet"
 }
+
+const weekdayNames = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
+
+// Human-readable summary of the five-field cron expression for the watches
+// card. Only the shapes the panel can state without guessing are translated;
+// anything else stays the raw string so the source is never paraphrased into
+// a lie.
+export function formatSchedule(cron: string): string {
+  const fields = cron.trim().split(/\s+/)
+  if (fields.length !== 5) return cron
+  const [minute, hour, dayOfMonth, , dayOfWeek] = fields
+  if (dayOfMonth !== "*") return cron
+  const stepped = /^\*\/(\d+)$/.exec(minute)
+  if (stepped !== null && hour === "*" && dayOfWeek === "*") return `Every ${stepped[1]} minutes`
+  if (!isCronNumber(minute, 59)) return cron
+  if (hour === "*" && dayOfWeek === "*") {
+    return minute === "0" ? "Every hour" : `Every hour at :${minute.padStart(2, "0")}`
+  }
+  if (isCronNumber(hour, 23) && dayOfWeek === "*") {
+    return `Daily at ${twelveHourTime(Number(hour), minute)}`
+  }
+  if (isCronNumber(hour, 23) && isCronNumber(dayOfWeek, 7)) {
+    return `Weekly on ${weekdayNames[Number(dayOfWeek) % 7]} at ${twelveHourTime(Number(hour), minute)}`
+  }
+  return cron
+}
+
+function isCronNumber(field: string, max: number): boolean {
+  return /^\d+$/.test(field) && Number(field) <= max
+}
+
+function twelveHourTime(hour: number, minute: string): string {
+  const period = hour < 12 ? "AM" : "PM"
+  const normalized = hour % 12 === 0 ? 12 : hour % 12
+  return `${normalized}:${minute.padStart(2, "0")} ${period}`
+}

@@ -4,7 +4,7 @@ import { parseBoardWorkers, type BoardCard, type BoardColumn } from "./board"
 import { parseShipping, shippingBadgeLabel, type LandingRow, type ShippingInfo } from "./shipping"
 import { parseSuggestions, type SuggestionRow } from "./suggestions"
 import { initialPanelState, reducePanelState, type Board, type PanelEvent, type PanelState, type RegistrationInfo } from "./state"
-import { formatLastRun, parseWatches, watchOutcomeLabel, type WatchRow } from "./watches"
+import { formatLastRun, formatSchedule, parseWatches, watchOutcomeLabel, type WatchRow } from "./watches"
 
 const host = connectHost()
 
@@ -18,6 +18,9 @@ let unsubscribeSessions: (() => void) | null = null
 let sessionsAttachInFlight = false
 let boardRefreshTimer: number | null = null
 let boardFetchTimer: number | null = null
+let refreshLabelTimer: number | null = null
+let refreshesInFlight = 0
+let lastRefreshedAt: number | null = null
 
 host.onReady((ctx) => {
   applyHostReady(ctx, document.documentElement)
@@ -109,20 +112,16 @@ function startBoardFlow(registration: RegistrationInfo): void {
   }
   stopBoardFlow()
   activeRegistration = registration
-  void fetchBoard()
-  void fetchWatches()
-  void fetchShipping()
-  void fetchSuggestions()
+  runFullRefresh()
   void ensureSessionsSubscription(registration)
   boardRefreshTimer = window.setInterval(() => {
-    void fetchBoard()
-    void fetchWatches()
-    void fetchShipping()
-    void fetchSuggestions()
+    runFullRefresh()
     // While the live subscription is unattached (transient host failures),
     // every refresh tick is also a re-attach attempt.
     void ensureSessionsSubscription(registration)
   }, boardRefreshIntervalMs)
+  // Keeps the header's relative freshness label current between ticks.
+  refreshLabelTimer = window.setInterval(updateRefreshControl, boardRefreshIntervalMs)
 }
 
 function stopBoardFlow(): void {
@@ -133,6 +132,10 @@ function stopBoardFlow(): void {
   boardRefreshTimer = null
   if (boardFetchTimer !== null) window.clearTimeout(boardFetchTimer)
   boardFetchTimer = null
+  if (refreshLabelTimer !== null) window.clearInterval(refreshLabelTimer)
+  refreshLabelTimer = null
+  refreshesInFlight = 0
+  lastRefreshedAt = null
 }
 
 // Attaches the live onSessions subscription for the registration's project.
@@ -176,8 +179,67 @@ function scheduleBoardFetch(): void {
   if (boardFetchTimer !== null) window.clearTimeout(boardFetchTimer)
   boardFetchTimer = window.setTimeout(() => {
     boardFetchTimer = null
-    void fetchBoard()
+    void trackedFetch(fetchBoard)
   }, boardFetchDebounceMs)
+}
+
+// The header's refresh control runs the same four fetches as the interval
+// tick. Every fetch is wrapped so a run is only counted once: while any
+// fetch is in flight the control reads "Refreshing…" and cannot be pressed
+// again, and the last-settled run's time drives the relative label.
+function runFullRefresh(): void {
+  void trackedFetch(fetchBoard)
+  void trackedFetch(fetchWatches)
+  void trackedFetch(fetchShipping)
+  void trackedFetch(fetchSuggestions)
+}
+
+async function trackedFetch(refresh: () => Promise<void>): Promise<void> {
+  refreshesInFlight += 1
+  updateRefreshControl()
+  try {
+    await refresh()
+  } finally {
+    refreshesInFlight = Math.max(0, refreshesInFlight - 1)
+    if (refreshesInFlight === 0) {
+      lastRefreshedAt = Date.now()
+      updateRefreshControl()
+    }
+  }
+}
+
+function refreshButton(): HTMLElement {
+  const button = document.createElement("button")
+  button.className = "fm-button fm-refresh"
+  button.addEventListener("click", () => {
+    if (refreshesInFlight > 0 || activeRegistration === null) return
+    runFullRefresh()
+  })
+  applyRefreshLabel(button)
+  return button
+}
+
+// The rendered button is found fresh on every update: each dispatch rebuilds
+// the DOM, so a cached element reference would go stale.
+function updateRefreshControl(): void {
+  const button = document.querySelector<HTMLButtonElement>("button.fm-refresh")
+  if (button !== null) applyRefreshLabel(button)
+}
+
+function applyRefreshLabel(button: HTMLButtonElement): void {
+  const inFlight = refreshesInFlight > 0
+  button.disabled = inFlight || activeRegistration === null
+  // Before a freshly registered panel's first fetch settles there is no age
+  // to report; the run is already under way, so say so.
+  button.textContent = inFlight || lastRefreshedAt === null ? "Refreshing…" : refreshAgeLabel(lastRefreshedAt)
+}
+
+function refreshAgeLabel(timestamp: number): string {
+  const elapsed = Date.now() - timestamp
+  if (elapsed < 60_000) return "Refreshed just now"
+  const minutes = Math.floor(elapsed / 60_000)
+  if (minutes < 60) return `Refreshed ${minutes}m ago`
+  return `Refreshed ${Math.floor(minutes / 60)}h ago`
 }
 
 async function fetchBoard(): Promise<void> {
@@ -293,24 +355,24 @@ function render(state: PanelState): void {
   const root = document.getElementById("firstmate-root")
   if (!root) return
   root.replaceChildren()
-  root.append(heading())
+  root.append(heading(state.kind === "registered"))
 
   switch (state.kind) {
     case "loading":
       root.append(text("Reading the project…"))
       break
     case "no-directory":
-      root.append(text("Open a project to launch its first mate."))
+      root.append(noDirectoryCard())
       break
     case "unregistered":
-      root.append(text("This project has no first mate yet."), launchButton())
+      root.append(welcomeCard())
       break
     case "launching":
       root.append(text("Launching the first mate…"))
       break
     case "registered":
       root.append(coordinatorRow(state.registration, state.coordinatorTitle, state.shipping))
-      if (state.shipping !== undefined) root.append(landingsSection(state.shipping))
+      if (state.shipping !== undefined) root.append(landingsSection(state.shipping, state.board))
       root.append(suggestionsSection(state))
       root.append(boardView(state.board))
       root.append(watchesCard(state))
@@ -324,10 +386,17 @@ function render(state: PanelState): void {
   }
 }
 
-function heading(): HTMLElement {
-  const heading = document.createElement("h1")
-  heading.textContent = "FirstMate"
-  return heading
+// Top header row: the panel title on the left; once a first mate is
+// registered, the refresh control on the right shows how stale the data is
+// and re-runs the fetches.
+function heading(withRefresh: boolean): HTMLElement {
+  const row = document.createElement("div")
+  row.className = "fm-heading"
+  const title = document.createElement("h1")
+  title.textContent = "FirstMate"
+  row.append(title)
+  if (withRefresh) row.append(refreshButton())
+  return row
 }
 
 function text(contents: string): HTMLElement {
@@ -338,6 +407,7 @@ function text(contents: string): HTMLElement {
 
 function launchButton(): HTMLElement {
   const button = document.createElement("button")
+  button.className = "fm-button fm-button-primary"
   button.textContent = "Launch first mate"
   button.addEventListener("click", () => {
     if (currentDirectory !== null) {
@@ -347,20 +417,90 @@ function launchButton(): HTMLElement {
   return button
 }
 
+// A project with no first mate yet gets an introduction instead of a bare
+// line: what the first mate is, how it works, and the launch action with an
+// explicit safety note. Presentation only — the button is the same launch
+// flow with the same guards as before.
+function welcomeCard(): HTMLElement {
+  const card = document.createElement("article")
+  card.className = "fm-welcome"
+  const intro = document.createElement("p")
+  intro.className = "fm-welcome-intro"
+  intro.textContent =
+    "A first mate runs this project for you: it turns what you need into supervised coding workers — each in its own git worktree on its own branch — and brings you finished pull requests. It writes only to its own home folder; your repository is only ever changed by the workers it dispatches."
+  const heading = document.createElement("h2")
+  heading.textContent = "How it works"
+  const steps = document.createElement("ul")
+  steps.className = "fm-welcome-steps"
+  for (const step of [
+    "You describe the work — or it picks up your backlog.",
+    "It briefs a worker and dispatches it into an isolated worktree.",
+    "It supervises the worker and reports back; landings wait for your word (unless the project runs +yolo).",
+  ]) {
+    const item = document.createElement("li")
+    item.textContent = step
+    steps.append(item)
+  }
+  const actions = document.createElement("div")
+  actions.className = "fm-welcome-actions"
+  actions.append(
+    launchButton(),
+    mutedNote("Starts a session in this project's FirstMate home — nothing is written to your repository."),
+  )
+  card.append(intro, heading, steps, actions)
+  return card
+}
+
+// The no-directory state gets the same card treatment, stripped to a single
+// line: there is nothing to introduce until a project is open.
+function noDirectoryCard(): HTMLElement {
+  const card = document.createElement("article")
+  card.className = "fm-welcome"
+  card.append(text("Open a project to launch its first mate."))
+  return card
+}
+
 function coordinatorRow(
   registration: RegistrationInfo,
   coordinatorTitle: string | undefined,
   shipping: ShippingInfo | undefined,
 ): HTMLElement {
-  const row = document.createElement("p")
-  row.textContent =
-    coordinatorTitle === undefined
-      ? `Coordinator session ${registration.coordinatorSessionId}`
-      : `${coordinatorTitle} (session ${registration.coordinatorSessionId})`
-  if (shipping !== undefined) row.append(shippingBadge(shipping))
-  row.append(openChatButton(registration.coordinatorSessionId))
-  row.append(bearingsControl(registration), ahoyButton(registration))
-  return row
+  const header = document.createElement("header")
+  header.className = "fm-coordinator"
+  // The raw session id means nothing at a glance, so it leaves the visible
+  // text and stays available as a hover tooltip on the whole header (with
+  // the session title in front when the live subscription knows one).
+  header.title = coordinatorTitle === undefined
+    ? registration.coordinatorSessionId
+    : `${coordinatorTitle} (${registration.coordinatorSessionId})`
+  const name = document.createElement("span")
+  name.className = "fm-coordinator-name"
+  name.textContent = "Coordinator"
+  const project = document.createElement("span")
+  project.className = "fm-coordinator-project"
+  project.textContent = prettifySlug(registration.slug)
+  const actions = document.createElement("div")
+  actions.className = "fm-actions"
+  if (shipping !== undefined) actions.append(shippingBadge(shipping))
+  actions.append(openChatButton(registration.coordinatorSessionId), bearingsControl(registration), ahoyButton(registration))
+  header.append(name, project, actions)
+  return header
+}
+
+// "openchamber-extensions" → "OpenChamber Extensions": split on "-", then
+// capitalize each word. Slugs whose words carry internal capitals keep their
+// canonical spelling through the display-name table.
+const slugDisplayNames: Record<string, string> = {
+  "openchamber-extensions": "OpenChamber Extensions",
+}
+
+function prettifySlug(slug: string): string {
+  const known = slugDisplayNames[slug]
+  if (known !== undefined) return known
+  return slug
+    .split("-")
+    .map((word) => (word === "" ? word : word[0].toUpperCase() + word.slice(1)))
+    .join(" ")
 }
 
 // /bearings and /ahoy reach the coordinator verbatim through POST /command —
@@ -369,21 +509,33 @@ function coordinatorRow(
 // arrives in the coordinator's chat, which Open chat opens.
 function bearingsControl(registration: RegistrationInfo): HTMLElement {
   const control = document.createElement("span")
+  control.className = "fm-bearings"
+  // A wrapping label ties the visible text to the checkbox for free.
+  const label = document.createElement("label")
+  label.className = "fm-save"
+  label.title = "Also write the report to a dated file in the project's reports folder."
   const checkbox = document.createElement("input")
   checkbox.type = "checkbox"
   checkbox.setAttribute("aria-label", "Write the bearings report to a dated file")
+  label.append(checkbox, document.createTextNode("save to file"))
   const button = document.createElement("button")
-  button.textContent = "Bearings"
+  button.className = "fm-button"
+  button.textContent = "Status report"
+  button.title =
+    "Ask the coordinator for a status report (bearings): what needs your call, what landed, what is under way, what is next."
   button.addEventListener("click", () => {
     void sendCommand(registration, checkbox.checked ? "bearings-file" : "bearings")
   })
-  control.append(checkbox, button)
+  control.append(label, button)
   return control
 }
 
 function ahoyButton(registration: RegistrationInfo): HTMLElement {
   const button = document.createElement("button")
-  button.textContent = "Ahoy"
+  button.className = "fm-button"
+  button.textContent = "Catch me up"
+  button.title =
+    "Ask the coordinator to summarize what happened since your last exchange, with every open decision and a recommendation."
   button.addEventListener("click", () => {
     void sendCommand(registration, "ahoy")
   })
@@ -404,18 +556,31 @@ async function sendCommand(registration: RegistrationInfo, command: string): Pro
 
 // The project's shipping mode as read from projects.md via the service; a
 // badge only — projects.md is the record, so there is nothing to edit here.
+// The tooltip spells the mode out because the short label alone says nothing.
+const shippingModeTitles: Record<string, string> = {
+  "direct-PR": "Shipping mode: workers open pull requests directly; landings wait for your word.",
+  "reviewed-PR": "Shipping mode: workers review their diff and wait for CI before asking for your word.",
+  "local-only": "Shipping mode: no remote; work stays on a clean branch and lands only on your word.",
+}
+
+const yoloTitleSuffix = " +yolo: green, in-scope work lands without asking."
+
 function shippingBadge(shipping: ShippingInfo): HTMLElement {
   const badge = document.createElement("span")
   mountBadge(badge, {
     label: shippingBadgeLabel(shipping),
     tone: shipping.mode === null ? "warning" : "neutral",
   })
+  const baseTitle = shipping.mode === null ? undefined : shippingModeTitles[shipping.mode]
+  if (baseTitle !== undefined) badge.title = shipping.yolo ? baseTitle + yoloTitleSuffix : baseTitle
   return badge
 }
 
 function openChatButton(sessionId: string): HTMLElement {
   const button = document.createElement("button")
+  button.className = "fm-button"
   button.textContent = "Open chat"
+  button.title = "Open the coordinator's chat."
   // The sandboxed iframe cannot open the session itself; the host does it.
   button.addEventListener("click", () => {
     void host.openSession(sessionId)
@@ -427,28 +592,124 @@ function openChatButton(sessionId: string): HTMLElement {
 // with a prominent warning for every entry it had to drop — a partly corrupt
 // log must never read as a clean, empty one. The payload fields are untrusted
 // file contents, so they reach the DOM only through textContent.
-function landingsSection(shipping: ShippingInfo): HTMLElement {
+function landingsSection(shipping: ShippingInfo, board: Board): HTMLElement {
   const section = document.createElement("section")
   const heading = document.createElement("h2")
   heading.textContent = "Recent landings"
   section.append(heading)
-  for (const error of shipping.landingErrors) section.append(warningBadge(error))
+  for (const error of shipping.landingErrors) section.append(warningCallout(error))
   if (shipping.landings.length === 0) {
     if (shipping.landingErrors.length === 0) section.append(text("No landings."))
     return section
   }
-  for (const landing of shipping.landings) section.append(landingRow(landing))
+  const sessions = sessionsByTitle(board)
+  for (const landing of shipping.landings) section.append(landingRow(landing, sessions.get(landing.task)))
   return section
 }
 
-function landingRow(landing: LandingRow): HTMLElement {
-  const row = document.createElement("p")
-  row.textContent = `${landing.task} — commit ${landing.commit} — CI ${landing.ci} — mode ${landing.mode} — ${landing.authorization} — landed ${landing.landedAt}`
+// Live workers by exact board title, so a landing can open the worker's
+// session. This only reads the already-fetched board; the reducer is untouched.
+function sessionsByTitle(board: Board): Map<string, string> {
+  const sessions = new Map<string, string>()
+  if (board.kind !== "ready") return sessions
+  for (const column of board.columns) {
+    for (const card of column.cards) {
+      if (card.sessionId !== undefined) sessions.set(card.title, card.sessionId)
+    }
+  }
+  return sessions
+}
+
+function landingRow(landing: LandingRow, sessionId: string | undefined): HTMLElement {
+  const row = document.createElement("article")
+  row.className = "fm-landing"
+  if (sessionId === undefined) {
+    // The landing's worker is gone from the board; the row stays readable
+    // but gives no false affordance of being clickable.
+    row.classList.add("fm-landing-archived")
+    row.title = "No live worker session to open."
+  } else {
+    row.classList.add("fm-landing-open")
+    row.title = "Open the worker's session"
+    row.setAttribute("role", "button")
+    row.tabIndex = 0
+    // The sandboxed iframe cannot open the session itself; the host does it.
+    row.addEventListener("click", () => {
+      void host.openSession(sessionId)
+    })
+    row.addEventListener("keydown", (event) => {
+      if (event.key !== "Enter" && event.key !== " ") return
+      event.preventDefault()
+      void host.openSession(sessionId)
+    })
+  }
+  const task = document.createElement("strong")
+  task.className = "fm-landing-task"
+  task.textContent = landing.task
+  const meta = document.createElement("span")
+  meta.className = "fm-landing-meta"
+  meta.append(
+    metaPiece("commit", commitChip(landing.commit)),
+    metaPiece("CI", ciBadge(landing.ci)),
+    metaPiece("mode", metaValue(landing.mode)),
+    metaPiece("authorization", metaValue(landing.authorization)),
+    metaPiece("landed", metaValue(formatLanded(landing.landedAt))),
+  )
+  row.append(task, meta)
   return row
+}
+
+// One labeled piece of the landing meta line: muted label, then the value.
+function metaPiece(label: string, value: HTMLElement): HTMLElement {
+  const piece = document.createElement("span")
+  piece.className = "fm-meta"
+  const name = document.createElement("span")
+  name.className = "fm-meta-label"
+  name.textContent = label
+  piece.append(name, value)
+  return piece
+}
+
+function metaValue(value: string): HTMLElement {
+  const span = document.createElement("span")
+  span.textContent = value
+  return span
+}
+
+// Short sha in the row, full sha on hover.
+function commitChip(commit: string): HTMLElement {
+  const chip = document.createElement("code")
+  chip.className = "fm-mono"
+  chip.textContent = commit.slice(0, 8)
+  chip.title = commit
+  return chip
+}
+
+// The charter records the CI result as a free word ("green" in practice);
+// known pass/fail words pick the tone, anything else stays neutral.
+function ciBadge(ci: string): HTMLElement {
+  const badge = document.createElement("span")
+  const result = ci.trim().toLowerCase()
+  const tone: Tone = result.includes("green") || result.includes("pass")
+    ? "success"
+    : result.includes("red") || result.includes("fail")
+      ? "error"
+      : "neutral"
+  mountBadge(badge, { label: ci, tone })
+  return badge
+}
+
+// landedAt is an ISO 8601 timestamp; a value that fails to parse is shown as-is.
+function formatLanded(iso: string): string {
+  const parsed = new Date(iso)
+  return Number.isNaN(parsed.getTime())
+    ? iso
+    : parsed.toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" })
 }
 
 function boardView(board: Board): HTMLElement {
   const container = document.createElement("div")
+  container.className = "fm-board"
   switch (board.kind) {
     case "loading":
       container.append(text("Reading the board…"))
@@ -457,7 +718,6 @@ function boardView(board: Board): HTMLElement {
       container.append(text(board.message))
       break
     case "ready":
-      if (board.refreshing) container.append(text("Refreshing…"))
       if (board.warning !== undefined) container.append(warningBadge(board.warning))
       if (board.columns.length === 0) {
         container.append(text("The board is empty."))
@@ -474,6 +734,14 @@ function boardColumn(column: BoardColumn): HTMLElement {
   const heading = document.createElement("h2")
   heading.textContent = column.id
   section.append(heading)
+  if (column.id === "Done") {
+    // Done cards confuse the eye: they look finished but keep live actions.
+    // The caption explains what the column is for before the captain asks.
+    const caption = document.createElement("p")
+    caption.className = "fm-caption"
+    caption.textContent = "Completed tasks — kept for reference. Relaunch to continue work, or End to archive the card."
+    section.append(caption)
+  }
   for (const card of column.cards) section.append(boardCard(card))
   return section
 }
@@ -490,14 +758,37 @@ const badgeTones: Record<BoardCard["state"], Tone> = {
 
 function boardCard(card: BoardCard): HTMLElement {
   const article = document.createElement("article")
+  article.className = "fm-card"
   const title = document.createElement("strong")
   title.textContent = card.title
   article.append(title, stateBadge(card))
   if (card.warning !== undefined) article.append(warningBadge(card.warning))
+  if (card.branch !== undefined) article.append(branchMeta(card.branch, card.worktree))
   if (card.lastWord !== undefined) article.append(text(card.lastWord))
   if (card.prUrl !== undefined) article.append(prLink(card))
-  article.append(cardActions(card))
+  if (card.sessionId === undefined) {
+    // A card with no session (e.g. a task landed by direct PR merge) has
+    // nothing for the action row to act on; a muted note says why instead of
+    // a row of buttons disabled with no explanation.
+    article.append(mutedNote("Merged directly — no worker session to act on."))
+  } else {
+    article.append(cardActions(card))
+  }
   return article
+}
+
+// Muted branch line; the worktree the branch was checked out in rides on hover.
+function branchMeta(branch: string, worktree: string | undefined): HTMLElement {
+  const value = metaValue(branch)
+  if (worktree !== undefined) value.title = worktree
+  return metaPiece("branch", value)
+}
+
+function mutedNote(message: string): HTMLElement {
+  const note = document.createElement("p")
+  note.className = "fm-note"
+  note.textContent = message
+  return note
 }
 
 function stateBadge(card: BoardCard): HTMLElement {
@@ -515,9 +806,20 @@ function warningBadge(label: string): HTMLElement {
   return badge
 }
 
+// Long drop messages (e.g. landing-line parse failures) read better as a
+// wrapping callout than as a pill; the tone is the same warning color.
+function warningCallout(message: string): HTMLElement {
+  const callout = document.createElement("div")
+  callout.className = "fm-warning"
+  callout.textContent = message
+  return callout
+}
+
 function prLink(card: BoardCard): HTMLElement {
   const button = document.createElement("button")
-  button.textContent = "Open pull request"
+  button.className = "fm-button"
+  button.textContent = "Open PR on GitHub"
+  button.title = "Open the pull request in your browser."
   button.disabled = card.prOpenable !== true
   // The sandboxed iframe cannot open links itself; the host opens it.
   button.addEventListener("click", () => {
@@ -526,7 +828,7 @@ function prLink(card: BoardCard): HTMLElement {
   return button
 }
 
-// Card actions: Watch opens the worker session in the host; Steer and
+// Card actions: Open session opens the worker session in the host; Steer and
 // Relaunch relay through the service (the coordinator owns the backlog and
 // the relaunch itself); Interrupt asks the service to stop the worker's
 // current turn; End archives the card in extension state — the session and
@@ -536,6 +838,7 @@ type ActionFeedback = (message: string) => void
 
 function actionFeedback(): { element: HTMLElement; say: ActionFeedback } {
   const element = document.createElement("span")
+  element.className = "fm-feedback"
   return { element, say: (message) => { element.textContent = message } }
 }
 
@@ -566,12 +869,13 @@ async function runCardAction(pathname: string, body: Record<string, string>, say
     say("The service is unreachable.")
     return { status: 0 }
   } finally {
-    void fetchBoard()
+    void trackedFetch(fetchBoard)
   }
 }
 
 function cardActions(card: BoardCard): HTMLElement {
   const row = document.createElement("div")
+  row.className = "fm-actions"
   const { element, say } = actionFeedback()
   row.append(watchButton(card), interruptButton(card, say), steerControl(card, say), relaunchControl(card, say), endButton(card, say), element)
   return row
@@ -586,7 +890,9 @@ const interruptUnsupportedSessions = new Set<string>()
 
 function interruptButton(card: BoardCard, say: ActionFeedback): HTMLElement {
   const button = document.createElement("button")
+  button.className = "fm-button"
   button.textContent = "Interrupt"
+  button.title = "Stop the worker's current turn."
   button.disabled = card.sessionId === undefined || interruptUnsupportedSessions.has(card.sessionId)
   button.addEventListener("click", () => {
     const sessionId = card.sessionId
@@ -609,7 +915,9 @@ function interruptButton(card: BoardCard, say: ActionFeedback): HTMLElement {
 
 function watchButton(card: BoardCard): HTMLElement {
   const button = document.createElement("button")
-  button.textContent = "Watch"
+  button.className = "fm-button"
+  button.textContent = "Open session"
+  button.title = "Open this worker's session in OpenChamber"
   button.disabled = card.sessionId === undefined
   // The sandboxed iframe cannot open the session itself; the host does it.
   button.addEventListener("click", () => {
@@ -623,11 +931,16 @@ function steerControl(card: BoardCard, say: ActionFeedback): HTMLElement {
   input.type = "text"
   input.placeholder = "Steer the worker…"
   const send = document.createElement("button")
+  send.className = "fm-button"
   send.textContent = "Steer"
   // A Done worker is off the board's working set; steering it makes no sense.
-  // Send stays disabled until the captain has typed something.
+  // Send stays disabled until the captain has typed something, and the
+  // tooltip names the Done state instead of leaving the disabled button mute.
   const updateSend = (): void => {
     send.disabled = input.value.trim() === "" || card.sessionId === undefined || card.state === "Done"
+    send.title = card.state === "Done"
+      ? "This task is Done — relaunch the worker to continue."
+      : "Send this message to the worker."
   }
   updateSend()
   input.addEventListener("input", updateSend)
@@ -642,6 +955,7 @@ function steerControl(card: BoardCard, say: ActionFeedback): HTMLElement {
     })
   })
   const control = document.createElement("span")
+  control.className = "fm-steer"
   control.append(input, send)
   return control
 }
@@ -651,7 +965,9 @@ function relaunchControl(card: BoardCard, say: ActionFeedback): HTMLElement {
   input.type = "text"
   input.placeholder = "Note for the relaunch…"
   const send = document.createElement("button")
+  send.className = "fm-button"
   send.textContent = "Relaunch"
+  send.title = "Start a fresh worker in this task's worktree with your note."
   // The coordinator relaunches into the recorded worktree; without one the
   // service could not name where the fresh worker goes. The session id
   // identifies the backlog entry to supersede. Send stays disabled until the
@@ -678,7 +994,9 @@ function relaunchControl(card: BoardCard, say: ActionFeedback): HTMLElement {
 
 function endButton(card: BoardCard, say: ActionFeedback): HTMLElement {
   const button = document.createElement("button")
+  button.className = "fm-button"
   button.textContent = "End"
+  button.title = "Archive this card; the session and worktree are left as they are."
   button.disabled = card.sessionId === undefined
   // Two-click confirm instead of window.confirm: a sandboxed iframe without
   // allow-modals swallows dialogs silently.
@@ -701,16 +1019,20 @@ function endButton(card: BoardCard, say: ActionFeedback): HTMLElement {
 }
 
 // The Suggestions section sits below the coordinator row, above the board:
-// one button per suggestion — pressed to send the suggestion's text to the
-// coordinator — with a trash button that dismisses it unsent. The refetch
-// after each call carries the file's new state; the line the service removed
-// stops rendering. Action feedback lives in its own persistent slot so the
+// project-level messages the coordinator proposes, each shown as a label
+// line with Send and Dismiss buttons — Send relays the suggestion's text to
+// the coordinator verbatim; Dismiss drops it unsent. The refetch after each
+// call carries the file's new state; the line the service removed stops
+// rendering. Action feedback lives in its own persistent slot so the
 // refetch that follows every action cannot erase why the line stayed.
 function suggestionsSection(state: PanelState & { kind: "registered" }): HTMLElement {
   const section = document.createElement("section")
   const heading = document.createElement("h2")
   heading.textContent = "Suggestions"
-  section.append(heading)
+  const caption = document.createElement("p")
+  caption.className = "fm-caption"
+  caption.textContent = "Messages the coordinator suggests — Send relays it to the coordinator."
+  section.append(heading, caption)
   if (state.suggestionActionFeedback !== undefined) section.append(warningBadge(state.suggestionActionFeedback))
   if (state.suggestionsError !== undefined) {
     if (state.suggestions !== undefined) {
@@ -736,9 +1058,19 @@ function suggestionsSection(state: PanelState & { kind: "registered" }): HTMLEle
 
 function suggestionRow(suggestion: SuggestionRow, actionPending: boolean): HTMLElement {
   const row = document.createElement("div")
+  row.className = "fm-suggestion"
+  const label = document.createElement("span")
+  label.className = "fm-suggestion-label"
+  label.textContent = suggestion.label
+  // The full suggestion text is longer than the label; it stays on hover.
+  label.title = suggestion.text
+  const actions = document.createElement("div")
+  actions.className = "fm-suggestion-actions"
   const send = document.createElement("button")
-  send.textContent = suggestion.label
+  send.className = "fm-button"
+  send.textContent = "Send"
   send.title = suggestion.text
+  send.setAttribute("aria-label", `Send ${suggestion.label}`)
   send.disabled = actionPending
   // The in-flight flag is checked in the handler as well as via the disabled
   // attribute: a re-render between the click and the answer rebuilds the row
@@ -748,6 +1080,7 @@ function suggestionRow(suggestion: SuggestionRow, actionPending: boolean): HTMLE
     void runSuggestionAction("/suggestion/send", suggestion.label)
   })
   const dismiss = document.createElement("button")
+  dismiss.className = "fm-button"
   dismiss.textContent = "Dismiss"
   dismiss.title = `Dismiss "${suggestion.label}" without sending`
   dismiss.setAttribute("aria-label", `Dismiss ${suggestion.label}`)
@@ -756,7 +1089,8 @@ function suggestionRow(suggestion: SuggestionRow, actionPending: boolean): HTMLE
     if (suggestionActionInFlight) return
     void runSuggestionAction("/suggestion/dismiss", suggestion.label)
   })
-  row.append(send, dismiss)
+  actions.append(send, dismiss)
+  row.append(label, actions)
   return row
 }
 
@@ -799,7 +1133,7 @@ async function runSuggestionAction(pathname: string, label: string): Promise<voi
     dispatch({ type: "suggestion-action-settled", feedback: "The action failed: the service is unreachable." })
   } finally {
     suggestionActionInFlight = false
-    void fetchSuggestions()
+    void trackedFetch(fetchSuggestions)
   }
 }
 
@@ -839,11 +1173,23 @@ function watchesCard(state: PanelState & { kind: "registered" }): HTMLElement {
 
 function watchRow(watch: WatchRow): HTMLElement {
   const article = document.createElement("article")
+  article.className = "fm-card"
   const title = document.createElement("strong")
-  title.textContent = `${watch.name} (${watch.source})`
-  article.append(title, enabledSwitch(watch))
-  const summary = text(
-    `${watch.schedule} — last run ${formatLastRun(watch.lastRunAt)} — ${watchOutcomeLabel(watch)}`,
+  title.textContent = watch.name
+  const source = document.createElement("span")
+  mountBadge(source, { label: watch.source, tone: "neutral" })
+  article.append(title, source, enabledSwitch(watch))
+  // Human-readable schedule; the raw cron expression stays on hover.
+  const schedule = document.createElement("span")
+  schedule.className = "fm-schedule"
+  schedule.textContent = formatSchedule(watch.schedule)
+  schedule.title = watch.schedule
+  article.append(schedule)
+  const summary = document.createElement("span")
+  summary.className = "fm-landing-meta"
+  summary.append(
+    metaPiece("last run", metaValue(formatLastRun(watch.lastRunAt))),
+    metaPiece("outcome", metaValue(watchOutcomeLabel(watch))),
   )
   if (watch.error !== undefined) summary.append(warningBadge(watch.error))
   article.append(summary)

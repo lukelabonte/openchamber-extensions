@@ -29,6 +29,8 @@ export interface BoardCard {
   sessionId?: string
   /** The worker's worktree directory from the backlog record; Relaunch needs it. */
   worktree?: string
+  /** The worker's branch from the backlog record; shown as the card's meta line. */
+  branch?: string
 }
 
 export interface BoardColumn {
@@ -118,6 +120,7 @@ export function toBoardCard(worker: BoardWorker): BoardCard {
   if (warning !== undefined) card.warning = warning
   if (worker.sessionId !== undefined) card.sessionId = worker.sessionId
   if (worker.worktree !== undefined) card.worktree = worker.worktree
+  if (worker.branch !== undefined) card.branch = worker.branch
   return card
 }
 

@@ -3,6 +3,449 @@
   <head>
     <meta charset="utf-8" />
     <title>FirstMate</title>
+    <style>
+      /* Palette: host theme tokens first (applyHostReady paints --oc-* on the
+         document element), brief's dark values as fallbacks. */
+      :root {
+        --fm-bg: var(--oc-bg, #1e1e1e);
+        --fm-panel: var(--oc-elevated, #252526);
+        --fm-fg: var(--oc-fg, #d4d4d4);
+        --fm-muted: var(--oc-muted, #9a9a9a);
+        --fm-border: var(--oc-border, #3c3c3c);
+        --fm-accent: var(--oc-primary, #4da3ff);
+        --fm-success: var(--oc-success-text, #4ec9b0);
+        --fm-danger: var(--oc-error-text, #f14c4c);
+        --fm-warning: var(--oc-warning-text, #e5c07b);
+        --fm-mono: var(--oc-mono, ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace);
+      }
+
+      *,
+      *::before,
+      *::after {
+        box-sizing: border-box;
+        min-width: 0;
+      }
+
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+      }
+
+      body {
+        background: var(--fm-bg);
+        color: var(--fm-fg);
+        font-family: var(--oc-font, -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif);
+        font-size: 12px;
+        line-height: 1.5;
+        overflow-x: hidden;
+        overflow-y: auto;
+      }
+
+      #firstmate-root {
+        padding: 10px 12px 16px;
+      }
+
+      h1 {
+        margin: 0;
+        font-size: 15px;
+        font-weight: 600;
+        letter-spacing: 0.01em;
+      }
+
+      .fm-heading {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 8px;
+        margin: 0 0 10px;
+      }
+
+      h2 {
+        margin: 0 0 6px;
+        font-size: 11px;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+        color: var(--fm-muted);
+      }
+
+      p {
+        margin: 4px 0;
+        overflow-wrap: anywhere;
+      }
+
+      section {
+        background: var(--fm-panel);
+        border: 1px solid var(--fm-border);
+        border-radius: 8px;
+        padding: 8px 10px;
+        margin: 10px 0;
+      }
+
+      .fm-board {
+        margin: 10px 0;
+      }
+
+      .fm-card {
+        display: flex;
+        flex-direction: column;
+        align-items: flex-start;
+        gap: 4px;
+        background: var(--fm-panel);
+        border: 1px solid var(--fm-border);
+        border-radius: 8px;
+        padding: 8px 10px;
+        margin: 8px 0;
+      }
+
+      .fm-coordinator {
+        display: flex;
+        flex-direction: column;
+        align-items: flex-start;
+        gap: 2px;
+        background: var(--fm-panel);
+        border: 1px solid var(--fm-border);
+        border-radius: 8px;
+        padding: 8px 10px;
+        margin: 10px 0;
+      }
+
+      .fm-coordinator-name {
+        font-size: 13px;
+        font-weight: 600;
+        overflow-wrap: anywhere;
+      }
+
+      .fm-coordinator-project {
+        color: var(--fm-muted);
+        overflow-wrap: anywhere;
+      }
+
+      button.fm-button {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        font: inherit;
+        font-size: 11.5px;
+        line-height: 1;
+        color: var(--fm-fg);
+        background: color-mix(in srgb, var(--fm-fg) 10%, var(--fm-panel));
+        border: 1px solid var(--fm-border);
+        border-radius: 6px;
+        padding: 4px 10px;
+        cursor: pointer;
+        white-space: nowrap;
+        transition: background 120ms ease-out, border-color 120ms ease-out;
+      }
+
+      button.fm-button:hover:enabled {
+        background: color-mix(in srgb, var(--fm-fg) 16%, var(--fm-panel));
+        border-color: color-mix(in srgb, var(--fm-fg) 35%, transparent);
+      }
+
+      button.fm-button:active:enabled {
+        background: color-mix(in srgb, var(--fm-fg) 22%, var(--fm-panel));
+      }
+
+      button.fm-button:focus-visible {
+        outline: none;
+        border-color: var(--fm-accent);
+        box-shadow: 0 0 0 2px color-mix(in srgb, var(--fm-accent) 35%, transparent);
+      }
+
+      button.fm-button:disabled {
+        opacity: 0.45;
+        cursor: default;
+      }
+
+      button.fm-button-primary {
+        color: var(--fm-accent);
+        border-color: color-mix(in srgb, var(--fm-accent) 50%, transparent);
+      }
+
+      button.fm-button-primary:hover:enabled {
+        background: color-mix(in srgb, var(--fm-accent) 12%, var(--fm-panel));
+        border-color: var(--fm-accent);
+      }
+
+      input[type="text"] {
+        font: inherit;
+        font-size: 11.5px;
+        color: var(--fm-fg);
+        background: var(--fm-bg);
+        border: 1px solid var(--fm-border);
+        border-radius: 6px;
+        padding: 3px 8px;
+      }
+
+      input[type="text"]::placeholder {
+        color: var(--fm-muted);
+      }
+
+      input[type="text"]:focus-visible {
+        outline: none;
+        border-color: var(--fm-accent);
+        box-shadow: 0 0 0 2px color-mix(in srgb, var(--fm-accent) 35%, transparent);
+      }
+
+      input[type="text"]:disabled {
+        opacity: 0.45;
+        cursor: default;
+      }
+
+      input[type="checkbox"] {
+        accent-color: var(--fm-accent);
+        margin: 0 2px;
+      }
+
+      .fm-bearings {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+      }
+
+      .fm-save {
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        font-size: 11px;
+        color: var(--fm-muted);
+        cursor: pointer;
+        white-space: nowrap;
+      }
+
+      .fm-note {
+        margin: 0;
+        font-size: 11px;
+        color: var(--fm-muted);
+        overflow-wrap: anywhere;
+      }
+
+      .fm-schedule {
+        font-size: 11px;
+        color: var(--fm-muted);
+        overflow-wrap: anywhere;
+      }
+
+      .fm-steer {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 4px;
+        width: 100%;
+        margin-top: 6px;
+      }
+
+      .fm-steer input[type="text"] {
+        flex: 1 1 110px;
+      }
+
+      .fm-actions {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 4px;
+        margin-top: 6px;
+      }
+
+      .fm-feedback {
+        font-size: 11px;
+        color: var(--fm-muted);
+        overflow-wrap: anywhere;
+      }
+
+      .fm-caption {
+        margin: 0 0 2px;
+        font-size: 11px;
+        color: var(--fm-muted);
+        overflow-wrap: anywhere;
+      }
+
+      .fm-landing {
+        display: flex;
+        flex-direction: column;
+        align-items: flex-start;
+        gap: 3px;
+        background: color-mix(in srgb, var(--fm-fg) 3%, var(--fm-panel));
+        border: 1px solid var(--fm-border);
+        border-radius: 8px;
+        padding: 6px 8px;
+        margin: 6px 0 0;
+      }
+
+      .fm-landing-task {
+        overflow-wrap: anywhere;
+      }
+
+      .fm-landing-meta {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 3px 10px;
+      }
+
+      .fm-landing-open {
+        cursor: pointer;
+        transition: background 120ms ease-out, border-color 120ms ease-out;
+      }
+
+      .fm-landing-open:hover {
+        background: color-mix(in srgb, var(--fm-fg) 8%, var(--fm-panel));
+        border-color: color-mix(in srgb, var(--fm-fg) 30%, transparent);
+      }
+
+      .fm-landing-open:focus-visible {
+        outline: none;
+        border-color: var(--fm-accent);
+        box-shadow: 0 0 0 2px color-mix(in srgb, var(--fm-accent) 35%, transparent);
+      }
+
+      .fm-landing-archived {
+        opacity: 0.55;
+      }
+
+      .fm-meta {
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        overflow-wrap: anywhere;
+      }
+
+      .fm-meta-label {
+        color: var(--fm-muted);
+      }
+
+      .fm-suggestion {
+        display: flex;
+        flex-direction: column;
+        align-items: flex-start;
+        gap: 4px;
+        background: color-mix(in srgb, var(--fm-fg) 3%, var(--fm-panel));
+        border: 1px solid var(--fm-border);
+        border-radius: 8px;
+        padding: 6px 8px;
+        margin: 6px 0 0;
+        overflow-wrap: anywhere;
+      }
+
+      .fm-suggestion-label {
+        overflow-wrap: anywhere;
+      }
+
+      .fm-suggestion-actions {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 4px;
+      }
+
+      /* Welcome card: the unregistered-project introduction and the plain
+         no-directory line. Same card language as landings and suggestions,
+         with a touch more presence — roomier padding, comfortable
+         line-height, and spacing between sections. */
+      .fm-welcome {
+        display: flex;
+        flex-direction: column;
+        align-items: flex-start;
+        gap: 8px;
+        background: var(--fm-panel);
+        border: 1px solid var(--fm-border);
+        border-radius: 8px;
+        padding: 12px;
+        margin: 10px 0;
+        max-width: 100%;
+      }
+
+      .fm-welcome-intro {
+        margin: 0;
+        line-height: 1.55;
+        overflow-wrap: anywhere;
+      }
+
+      .fm-welcome h2 {
+        margin: 4px 0 0;
+      }
+
+      .fm-welcome-steps {
+        margin: 0;
+        padding-left: 18px;
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+        color: var(--fm-muted);
+        line-height: 1.5;
+        overflow-wrap: anywhere;
+      }
+
+      .fm-welcome-actions {
+        display: flex;
+        flex-direction: column;
+        align-items: flex-start;
+        gap: 6px;
+        margin-top: 4px;
+      }
+
+      /* The SDK's badge CSS fixes nowrap; long warnings must wrap instead of
+         pushing the rail wide. */
+      #firstmate-root .oc-sdk-badge {
+        white-space: normal;
+        max-width: 100%;
+        overflow-wrap: anywhere;
+      }
+
+      .fm-warning {
+        background: color-mix(in srgb, var(--fm-warning) 10%, transparent);
+        border: 1px solid color-mix(in srgb, var(--fm-warning) 35%, transparent);
+        color: var(--fm-warning);
+        border-radius: 6px;
+        padding: 5px 8px;
+        font-size: 11px;
+        line-height: 1.45;
+        overflow-wrap: anywhere;
+        margin: 6px 0 0;
+      }
+
+      .fm-mono,
+      pre {
+        font-family: var(--fm-mono);
+        font-size: 11px;
+      }
+
+      code.fm-mono {
+        padding: 1px 4px;
+        background: color-mix(in srgb, var(--fm-fg) 8%, transparent);
+        border-radius: 4px;
+        overflow-wrap: anywhere;
+      }
+
+      pre {
+        margin: 6px 0 0;
+        padding: 6px 8px;
+        align-self: stretch;
+        background: var(--fm-bg);
+        border: 1px solid var(--fm-border);
+        border-radius: 6px;
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+      }
+
+      details {
+        align-self: stretch;
+        margin: 4px 0 0;
+      }
+
+      summary {
+        cursor: pointer;
+        color: var(--fm-muted);
+        font-size: 11.5px;
+        transition: color 120ms ease-out;
+      }
+
+      summary:hover {
+        color: var(--fm-fg);
+      }
+    </style>
   </head>
   <body>
     <div id="firstmate-root"></div>

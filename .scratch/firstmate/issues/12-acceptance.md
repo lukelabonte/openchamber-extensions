@@ -14,4 +14,5 @@
 - [ ] Same +yolo project, red CI: refuses to land
 - [ ] Non-yolo project, green CI: refuses to land and asks for the captain's word
 - [ ] Proof the coordinator performed no repository write at any point; all its writes confined to its home
+- [ ] Runtime-verify: the poller's `session status --dir <projectDirectory>` resolves worker sessions that live in worktrees of the project; if the control service scopes by exact directory only, switch the poller to the worker's worktree directory
 - [ ] If ticket 08 found no supported interrupt path: the report names the capability, the evidence, and the workaround state instead

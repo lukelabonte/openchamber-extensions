@@ -167,6 +167,18 @@ ${body}
   return composed;
 }
 
+// service/clock.ts
+function createNodeClock() {
+  return {
+    nowMs: () => Date.now(),
+    delay: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+    startInterval: (callback, intervalMs) => {
+      const timer = setInterval(callback, intervalMs);
+      return { cancel: () => clearInterval(timer) };
+    }
+  };
+}
+
 // service/control-client.ts
 class MissingCliError extends Error {
   constructor() {
@@ -174,22 +186,51 @@ class MissingCliError extends Error {
     this.name = "MissingCliError";
   }
 }
-async function createSession(exec, input) {
-  let output;
-  try {
-    output = await exec("openchamber", ["session", "create", "--dir", input.directory, "--title", input.title, "--json"]);
-  } catch (error) {
-    if (error?.code === "ENOENT") {
-      throw new MissingCliError;
-    }
-    throw error;
+
+class SessionBusyError extends Error {
+  constructor() {
+    super("the session is busy and cannot accept a message right now");
+    this.name = "SessionBusyError";
   }
+}
+async function createSession(exec, input) {
+  const output = await runControlCommand(exec, ["session", "create", "--dir", input.directory, "--title", input.title, "--json"]);
   const parsed = parseJsonOutput(output);
   const sessionId = extractSessionId(parsed);
   if (sessionId === undefined) {
     throw new Error("openchamber session create output did not include a session id");
   }
   return sessionId;
+}
+async function sessionStatus(exec, input) {
+  const output = await runControlCommand(exec, ["session", "status", "--session", input.sessionId, "--dir", input.directory, "--json"]);
+  const parsed = parseJsonOutput(output);
+  return { activity: extractActivity(parsed), outcome: extractOutcome(parsed) };
+}
+async function sessionMessagesLastAssistant(exec, input) {
+  const output = await runControlCommand(exec, ["session", "messages", "--session", input.sessionId, "--dir", input.directory, "--last-assistant", "--json"]);
+  const parsed = parseJsonOutput(output);
+  return extractAssistantText(parsed);
+}
+async function sessionSend(exec, input) {
+  try {
+    await runControlCommand(exec, ["session", "send", "--session", input.sessionId, "--dir", input.directory, "--prompt", input.prompt, "--json"]);
+  } catch (error) {
+    if (error instanceof Error && /busy/i.test(error.message)) {
+      throw new SessionBusyError;
+    }
+    throw error;
+  }
+}
+async function runControlCommand(exec, args) {
+  try {
+    return await exec("openchamber", args);
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      throw new MissingCliError;
+    }
+    throw error;
+  }
 }
 function parseJsonOutput(output) {
   try {
@@ -208,8 +249,61 @@ function extractSessionId(parsed) {
   }
   return;
 }
+var knownActivities = ["unknown", "idle", "running", "retrying", "waiting-permission", "waiting-question"];
+function extractActivity(parsed) {
+  if (!isRecord(parsed))
+    return "unknown";
+  for (const key of ["type", "activity", "status"]) {
+    const value = parsed[key];
+    if (typeof value === "string" && knownActivities.includes(value)) {
+      return value;
+    }
+  }
+  return "unknown";
+}
+function extractOutcome(parsed) {
+  if (!isRecord(parsed))
+    return null;
+  const value = parsed.outcome;
+  if (value === "completed" || value === "failed")
+    return value;
+  return null;
+}
+function extractAssistantText(parsed) {
+  if (typeof parsed === "string")
+    return parsed === "" ? undefined : parsed;
+  if (!isRecord(parsed))
+    return;
+  for (const key of ["text", "content", "message"]) {
+    const value = parsed[key];
+    if (typeof value === "string" && value !== "")
+      return value;
+  }
+  return;
+}
 function isRecord(value) {
   return typeof value === "object" && value !== null;
+}
+
+// service/forwarder.ts
+var busyRetryDelaysMs = [30000, 120000, 300000];
+var steadyRetryDelayMs = 300000;
+async function deliverNotification(input) {
+  const { exec, clock, notification } = input;
+  for (let attempt = 0;; attempt += 1) {
+    try {
+      await sessionSend(exec, {
+        sessionId: notification.coordinatorSessionId,
+        directory: notification.homeDirectory,
+        prompt: notification.message
+      });
+      return;
+    } catch (error) {
+      if (!(error instanceof SessionBusyError))
+        throw error;
+      await clock.delay(attempt < busyRetryDelaysMs.length ? busyRetryDelaysMs[attempt] : steadyRetryDelayMs);
+    }
+  }
 }
 
 // service/slug.ts
@@ -471,6 +565,158 @@ async function recordCoordinatorSessionId(filesystem, settingsPath, coordinatorS
 `);
 }
 
+// service/board.ts
+var lastWordMaxLength = 280;
+function mapBoardState(input) {
+  const { backlogState, live } = input;
+  if (backlogState !== "Queued" && backlogState !== "Working") {
+    return { state: backlogState };
+  }
+  if (live === undefined)
+    return { state: backlogState };
+  if (live.outcome === "failed")
+    return { state: "Failed" };
+  if (live.activity === "waiting-question")
+    return { state: "Blocked", blockedReason: "question" };
+  if (live.activity === "waiting-permission")
+    return { state: "Blocked", blockedReason: "permission" };
+  if (live.activity === "running" || live.activity === "retrying")
+    return { state: "Working" };
+  if (backlogState === "Working" && live.activity === "idle") {
+    return { state: live.outcome === "completed" ? "Working" : "Idle" };
+  }
+  return { state: backlogState };
+}
+function buildBoardWorker(task, observation) {
+  const refined = task.sessionId === undefined ? { state: task.state, blockedReason: undefined } : mapBoardState({ backlogState: task.state, live: observation?.status });
+  const worker = {
+    title: task.title,
+    state: refined.state,
+    ...refined.blockedReason !== undefined ? { blockedReason: refined.blockedReason } : {},
+    ...task.prUrl !== undefined ? { prUrl: task.prUrl } : {},
+    ...task.sessionId !== undefined ? { sessionId: task.sessionId } : {},
+    ...task.worktreeDirectory !== undefined ? { worktree: task.worktreeDirectory } : {},
+    ...task.branch !== undefined ? { branch: task.branch } : {}
+  };
+  const lastWord = observation?.lastWord;
+  if (lastWord !== undefined)
+    worker.lastWord = truncateLastWord(lastWord);
+  if (observation?.error !== undefined)
+    worker.lastPollError = observation.error;
+  return worker;
+}
+function truncateLastWord(text) {
+  return text.length > lastWordMaxLength ? `${text.slice(0, lastWordMaxLength)}…` : text;
+}
+
+// service/poller.ts
+function createSupervisionPoller(input) {
+  const { filesystem, exec, homeRoot } = input;
+  const observations = new Map;
+  const pollErrors = new Map;
+  const deliveryErrors = new Map;
+  const observationKey = (slug, sessionId) => `${slug}
+${sessionId}`;
+  async function poll() {
+    const notifications = [];
+    let registrations;
+    try {
+      registrations = await loadRegistry(filesystem, homeRoot);
+    } catch {
+      return { notifications };
+    }
+    for (const registration of Object.values(registrations)) {
+      const events = await pollProject(registration);
+      if (events.length > 0) {
+        notifications.push(composeNotification(registration, events));
+      }
+    }
+    return { notifications };
+  }
+  async function pollProject(registration) {
+    const events = [];
+    let backlog;
+    try {
+      backlog = await loadBacklog(filesystem, `${homeRoot}/projects/${registration.slug}/backlog.md`);
+    } catch {
+      return events;
+    }
+    for (const task of backlog.tasks) {
+      if (task.sessionId === undefined)
+        continue;
+      const key = observationKey(registration.slug, task.sessionId);
+      const previous = observations.get(key);
+      try {
+        const directory = registration.projectDirectory;
+        const status = await sessionStatus(exec, { sessionId: task.sessionId, directory });
+        const lastWord = await sessionMessagesLastAssistant(exec, { sessionId: task.sessionId, directory });
+        const current = { status, ...lastWord !== undefined ? { lastWord } : {} };
+        observations.set(key, current);
+        pollErrors.delete(key);
+        events.push(...detectEvents(task, previous, current));
+      } catch (error) {
+        pollErrors.set(key, error instanceof Error ? error.message : String(error));
+      }
+    }
+    return events;
+  }
+  function detectEvents(task, previous, current) {
+    const events = [];
+    const emit = (kind) => ({ taskTitle: task.title, sessionId: task.sessionId, kind });
+    const activity = current.status.activity;
+    const outcome = current.status.outcome;
+    if (outcome === "failed" && previous?.status.outcome !== "failed")
+      events.push(emit("failed"));
+    if (activity === "waiting-question" && previous?.status.activity !== "waiting-question")
+      events.push(emit("waiting-question"));
+    if (activity === "waiting-permission" && previous?.status.activity !== "waiting-permission")
+      events.push(emit("waiting-permission"));
+    if (outcome === "completed" && previous?.status.outcome !== "completed")
+      events.push(emit("finished"));
+    return events;
+  }
+  function getBoardWorkers(slug, tasks) {
+    return tasks.map((task) => {
+      const observation = task.sessionId === undefined ? undefined : observations.get(observationKey(slug, task.sessionId));
+      const error = task.sessionId === undefined ? undefined : pollErrors.get(observationKey(slug, task.sessionId));
+      const merged = observation === undefined && error === undefined ? undefined : { ...observation ?? { status: { activity: "unknown", outcome: null } }, ...error !== undefined ? { error } : {} };
+      return buildBoardWorker(task, merged);
+    });
+  }
+  function getDeliveryError(slug) {
+    return deliveryErrors.get(slug);
+  }
+  function recordDeliveryError(slug, message) {
+    deliveryErrors.set(slug, message);
+  }
+  function clearDeliveryError(slug) {
+    deliveryErrors.delete(slug);
+  }
+  return { poll, getBoardWorkers, getDeliveryError, recordDeliveryError, clearDeliveryError };
+}
+function composeNotification(registration, events) {
+  const lines = events.map((event) => `- "${event.taskTitle}" (${event.sessionId}): ${describeEvent(event)}`);
+  return {
+    slug: registration.slug,
+    coordinatorSessionId: registration.coordinatorSessionId,
+    homeDirectory: registration.homeDirectory,
+    message: [`FirstMate (${registration.slug}) worker update:`, ...lines].join(`
+`)
+  };
+}
+function describeEvent(event) {
+  switch (event.kind) {
+    case "finished":
+      return "finished its turn (outcome: completed). Review the work and mark the task Done when satisfied — completed never means Done.";
+    case "failed":
+      return "failed (outcome: failed).";
+    case "waiting-question":
+      return "is waiting on a question. Open the session to read and answer it.";
+    case "waiting-permission":
+      return "is waiting on a permission. Open the session to approve or deny it.";
+  }
+}
+
 // service/main.ts
 var rawServicePort = process.env.OPENCHAMBER_SERVICE_PORT;
 var serviceToken = process.env.OPENCHAMBER_SERVICE_TOKEN;
@@ -522,6 +768,39 @@ var nodeExec = (command, args) => new Promise((resolve, reject) => {
   });
 });
 var templateReader = (templateName) => readFile(path2.join(templatesDirectory, templateName), "utf8");
+var defaultPollIntervalMs = 15000;
+function readPollIntervalMs() {
+  const raw = process.env.FIRSTMATE_POLL_MS;
+  if (raw === undefined || raw.trim() === "")
+    return defaultPollIntervalMs;
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value <= 0) {
+    throw new Error("FIRSTMATE_POLL_MS must be a positive integer");
+  }
+  return value;
+}
+var pollIntervalMs = readPollIntervalMs();
+var clock = createNodeClock();
+var supervisionPoller = createSupervisionPoller({ filesystem: nodeFileSystem, exec: nodeExec, homeRoot });
+var roundInFlight = false;
+async function runSupervisionRound() {
+  if (roundInFlight)
+    return;
+  roundInFlight = true;
+  try {
+    const round = await supervisionPoller.poll();
+    for (const notification of round.notifications) {
+      try {
+        await deliverNotification({ exec: nodeExec, clock, notification });
+        supervisionPoller.clearDeliveryError(notification.slug);
+      } catch (error) {
+        supervisionPoller.recordDeliveryError(notification.slug, error instanceof Error ? error.message : String(error));
+      }
+    }
+  } finally {
+    roundInFlight = false;
+  }
+}
 function isAuthorized(request) {
   return request.headers.authorization === `Bearer ${serviceToken}`;
 }
@@ -628,6 +907,26 @@ async function handleLookup(url, response) {
     respondJson(response, 500, { error: error instanceof Error ? error.message : "lookup failed" });
   }
 }
+async function handleBoard(url, response) {
+  const slug = url.searchParams.get("slug");
+  if (slug === null || slug.trim() === "") {
+    respondJson(response, 400, { error: "slug must be a non-empty string" });
+    return;
+  }
+  try {
+    const registrations = await loadRegistry(nodeFileSystem, homeRoot);
+    if (!Object.hasOwn(registrations, slug)) {
+      respondJson(response, 404, { error: `no first mate registered for slug ${slug}` });
+      return;
+    }
+    const backlog = await loadBacklog(nodeFileSystem, `${homeRoot}/projects/${slug}/backlog.md`);
+    const workers = supervisionPoller.getBoardWorkers(slug, backlog.tasks);
+    const deliveryError = supervisionPoller.getDeliveryError(slug);
+    respondJson(response, 200, deliveryError === undefined ? { workers } : { workers, deliveryError });
+  } catch (error) {
+    respondJson(response, 500, { error: error instanceof Error ? error.message : "board read failed" });
+  }
+}
 async function handleBacklog(url, response) {
   const slug = url.searchParams.get("slug");
   if (slug === null || slug.trim() === "") {
@@ -684,13 +983,28 @@ async function handleRequest(request, response) {
     await handleBacklog(url, response);
     return;
   }
+  if (request.method === "GET" && pathname === "/board") {
+    await handleBoard(url, response);
+    return;
+  }
   response.statusCode = 404;
   response.end();
 }
-createServer((request, response) => {
+var server = createServer((request, response) => {
   handleRequest(request, response).catch(() => {
     if (!response.writableEnded) {
       respondJson(response, 500, { error: "internal error" });
     }
   });
-}).listen(servicePort, "127.0.0.1");
+});
+server.listen(servicePort, "127.0.0.1");
+var pollTimer = clock.startInterval(() => {
+  runSupervisionRound();
+}, pollIntervalMs);
+function stopService() {
+  pollTimer.cancel();
+  server.close(() => process.exit(0));
+  setTimeout(() => process.exit(0), 500).unref();
+}
+process.on("SIGTERM", stopService);
+process.on("SIGINT", stopService);

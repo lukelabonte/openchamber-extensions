@@ -4,7 +4,7 @@
 
 **Blocked by:** 03 (First-mate launch and registration)
 
-**Status:** ready-for-agent
+**Status:** resolved
 
 - [ ] Charter instructs: one backlog item → one worker; brief written before dispatch; worktree name unique per task; start ref recorded
 - [ ] Observed: two independent tasks produce two workers in two distinct worktrees on two distinct branches (acceptance precursor)

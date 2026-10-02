@@ -5,9 +5,12 @@ import { homedir } from "node:os"
 import path from "node:path"
 import { loadBacklog } from "./backlog"
 import { composeInstructions } from "./compose"
+import { createNodeClock } from "./clock"
 import { MissingCliError, type ExecRunner } from "./control-client"
 import type { FileSystemPort } from "./file-system"
+import { deliverNotification } from "./forwarder"
 import { launchFirstMate } from "./launch"
+import { createSupervisionPoller } from "./poller"
 import { provisionProject } from "./provision"
 import { findRegistration, loadRegistry } from "./registry"
 
@@ -68,6 +71,49 @@ const nodeExec: ExecRunner = (command, args) =>
 
 const templateReader = (templateName: string): Promise<string> =>
   readFile(path.join(templatesDirectory, templateName), "utf8")
+
+const defaultPollIntervalMs = 15_000
+
+function readPollIntervalMs(): number {
+  const raw = process.env.FIRSTMATE_POLL_MS
+  if (raw === undefined || raw.trim() === "") return defaultPollIntervalMs
+  const value = Number(raw)
+  if (!Number.isInteger(value) || value <= 0) {
+    throw new Error("FIRSTMATE_POLL_MS must be a positive integer")
+  }
+  return value
+}
+
+const pollIntervalMs = readPollIntervalMs()
+const clock = createNodeClock()
+const supervisionPoller = createSupervisionPoller({ filesystem: nodeFileSystem, exec: nodeExec, homeRoot })
+
+// One supervision round: poll every registered project's workers, then
+// deliver each project's notification to its coordinator. A failed delivery is
+// recorded for the board, never thrown into the interval. Rounds never overlap:
+// the interval can fire while a round's CLI calls are still in flight, and an
+// overlapping round would observe the same not-yet-recorded transitions and
+// send the coordinator the same notification twice — so an in-flight round
+// makes the next tick a no-op.
+let roundInFlight = false
+
+async function runSupervisionRound(): Promise<void> {
+  if (roundInFlight) return
+  roundInFlight = true
+  try {
+    const round = await supervisionPoller.poll()
+    for (const notification of round.notifications) {
+      try {
+        await deliverNotification({ exec: nodeExec, clock, notification })
+        supervisionPoller.clearDeliveryError(notification.slug)
+      } catch (error) {
+        supervisionPoller.recordDeliveryError(notification.slug, error instanceof Error ? error.message : String(error))
+      }
+    }
+  } finally {
+    roundInFlight = false
+  }
+}
 
 function isAuthorized(request: IncomingMessage): boolean {
   return request.headers.authorization === `Bearer ${serviceToken}`
@@ -185,6 +231,27 @@ async function handleLookup(url: URL, response: ServerResponse): Promise<void> {
   }
 }
 
+async function handleBoard(url: URL, response: ServerResponse): Promise<void> {
+  const slug = url.searchParams.get("slug")
+  if (slug === null || slug.trim() === "") {
+    respondJson(response, 400, { error: "slug must be a non-empty string" })
+    return
+  }
+  try {
+    const registrations = await loadRegistry(nodeFileSystem, homeRoot)
+    if (!Object.hasOwn(registrations, slug)) {
+      respondJson(response, 404, { error: `no first mate registered for slug ${slug}` })
+      return
+    }
+    const backlog = await loadBacklog(nodeFileSystem, `${homeRoot}/projects/${slug}/backlog.md`)
+    const workers = supervisionPoller.getBoardWorkers(slug, backlog.tasks)
+    const deliveryError = supervisionPoller.getDeliveryError(slug)
+    respondJson(response, 200, deliveryError === undefined ? { workers } : { workers, deliveryError })
+  } catch (error) {
+    respondJson(response, 500, { error: error instanceof Error ? error.message : "board read failed" })
+  }
+}
+
 async function handleBacklog(url: URL, response: ServerResponse): Promise<void> {
   const slug = url.searchParams.get("slug")
   if (slug === null || slug.trim() === "") {
@@ -242,14 +309,32 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse)
     await handleBacklog(url, response)
     return
   }
+  if (request.method === "GET" && pathname === "/board") {
+    await handleBoard(url, response)
+    return
+  }
   response.statusCode = 404
   response.end()
 }
 
-createServer((request, response) => {
+const server = createServer((request, response) => {
   handleRequest(request, response).catch(() => {
     if (!response.writableEnded) {
       respondJson(response, 500, { error: "internal error" })
     }
   })
-}).listen(servicePort, "127.0.0.1")
+})
+server.listen(servicePort, "127.0.0.1")
+
+const pollTimer = clock.startInterval(() => {
+  void runSupervisionRound()
+}, pollIntervalMs)
+
+function stopService(): void {
+  pollTimer.cancel()
+  server.close(() => process.exit(0))
+  // A lingering keep-alive connection must not keep the host's child alive.
+  setTimeout(() => process.exit(0), 500).unref()
+}
+process.on("SIGTERM", stopService)
+process.on("SIGINT", stopService)

@@ -193,6 +193,7 @@ async function fetchBoard(): Promise<void> {
       deliveryError: body.deliveryError,
     })
   } catch {
+    if (activeRegistration !== registration) return
     dispatch({ type: "board-failed", message: "Reading the board failed: the service is unreachable." })
   }
 }
@@ -326,6 +327,7 @@ function boardCard(card: BoardCard): HTMLElement {
   if (card.warning !== undefined) article.append(warningBadge(card.warning))
   if (card.lastWord !== undefined) article.append(text(card.lastWord))
   if (card.prUrl !== undefined) article.append(prLink(card))
+  article.append(cardActions(card))
   return article
 }
 
@@ -351,6 +353,148 @@ function prLink(card: BoardCard): HTMLElement {
   // The sandboxed iframe cannot open links itself; the host opens it.
   button.addEventListener("click", () => {
     if (card.prOpenable === true && card.prUrl !== undefined) void host.openUrl(card.prUrl)
+  })
+  return button
+}
+
+// Card actions: Watch opens the worker session in the host; Steer and
+// Relaunch relay through the service (the coordinator owns the backlog and
+// the relaunch itself); End archives the card in extension state — the
+// session and worktree are left exactly as they are. Feedback stays local to
+// the card; the board refetch after the request settles carries any state
+// change.
+type ActionFeedback = (message: string) => void
+
+function actionFeedback(): { element: HTMLElement; say: ActionFeedback } {
+  const element = document.createElement("span")
+  return { element, say: (message) => { element.textContent = message } }
+}
+
+async function runCardAction(pathname: string, body: Record<string, string>, say: ActionFeedback, successMessage: string): Promise<void> {
+  const registration = activeRegistration
+  if (registration === null) return
+  try {
+    const result = await host.serviceRequest({
+      method: "POST",
+      path: pathname,
+      body: JSON.stringify({ slug: registration.slug, ...body }),
+    })
+    let parsed: { error?: string; warning?: string } = {}
+    try {
+      parsed = JSON.parse(result.body) as { error?: string; warning?: string }
+    } catch {
+      // A non-JSON body only matters through the generic message below.
+    }
+    if (result.status !== 200) {
+      say(parsed.error ?? `The action failed (status ${result.status}).`)
+      return
+    }
+    // A 200 with a warning still succeeded (e.g. the steer reached the worker
+    // but the coordinator could not be told); the captain sees the caveat.
+    say(parsed.warning ?? successMessage)
+  } catch {
+    say("The service is unreachable.")
+  } finally {
+    void fetchBoard()
+  }
+}
+
+function cardActions(card: BoardCard): HTMLElement {
+  const row = document.createElement("div")
+  const { element, say } = actionFeedback()
+  row.append(watchButton(card), steerControl(card, say), relaunchControl(card, say), endButton(card, say), element)
+  return row
+}
+
+function watchButton(card: BoardCard): HTMLElement {
+  const button = document.createElement("button")
+  button.textContent = "Watch"
+  button.disabled = card.sessionId === undefined
+  // The sandboxed iframe cannot open the session itself; the host does it.
+  button.addEventListener("click", () => {
+    if (card.sessionId !== undefined) void host.openSession(card.sessionId)
+  })
+  return button
+}
+
+function steerControl(card: BoardCard, say: ActionFeedback): HTMLElement {
+  const input = document.createElement("input")
+  input.type = "text"
+  input.placeholder = "Steer the worker…"
+  const send = document.createElement("button")
+  send.textContent = "Steer"
+  // A Done worker is off the board's working set; steering it makes no sense.
+  // Send stays disabled until the captain has typed something.
+  const updateSend = (): void => {
+    send.disabled = input.value.trim() === "" || card.sessionId === undefined || card.state === "Done"
+  }
+  updateSend()
+  input.addEventListener("input", updateSend)
+  send.addEventListener("click", () => {
+    const steerText = input.value.trim()
+    if (card.sessionId === undefined || steerText === "") return
+    input.disabled = true
+    send.disabled = true
+    void runCardAction("/steer", { sessionId: card.sessionId, text: steerText }, say, "Steered.").finally(() => {
+      input.disabled = false
+      updateSend()
+    })
+  })
+  const control = document.createElement("span")
+  control.append(input, send)
+  return control
+}
+
+function relaunchControl(card: BoardCard, say: ActionFeedback): HTMLElement {
+  const input = document.createElement("input")
+  input.type = "text"
+  input.placeholder = "Note for the relaunch…"
+  const send = document.createElement("button")
+  send.textContent = "Relaunch"
+  // The coordinator relaunches into the recorded worktree; without one the
+  // service could not name where the fresh worker goes. The session id
+  // identifies the backlog entry to supersede. Send stays disabled until the
+  // captain has typed a note.
+  const updateSend = (): void => {
+    send.disabled = input.value.trim() === "" || card.sessionId === undefined || card.worktree === undefined
+  }
+  updateSend()
+  input.addEventListener("input", updateSend)
+  send.addEventListener("click", () => {
+    const note = input.value.trim()
+    if (card.sessionId === undefined || card.worktree === undefined || note === "") return
+    input.disabled = true
+    send.disabled = true
+    void runCardAction("/relaunch", { sessionId: card.sessionId, note }, say, "Relaunch requested.").finally(() => {
+      input.disabled = false
+      updateSend()
+    })
+  })
+  const control = document.createElement("span")
+  control.append(input, send)
+  return control
+}
+
+function endButton(card: BoardCard, say: ActionFeedback): HTMLElement {
+  const button = document.createElement("button")
+  button.textContent = "End"
+  button.disabled = card.sessionId === undefined
+  // Two-click confirm instead of window.confirm: a sandboxed iframe without
+  // allow-modals swallows dialogs silently.
+  let armed = false
+  button.addEventListener("click", () => {
+    if (card.sessionId === undefined) return
+    if (!armed) {
+      armed = true
+      button.textContent = "Really end?"
+      return
+    }
+    armed = false
+    button.textContent = "End"
+    button.disabled = true
+    void runCardAction("/end", { sessionId: card.sessionId }, say, "Archived.").finally(() => {
+      button.disabled = card.sessionId === undefined
+    })
   })
   return button
 }

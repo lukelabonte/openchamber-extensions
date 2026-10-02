@@ -1,15 +1,18 @@
 import { loadBacklog, type BacklogTask } from "./backlog"
+import { loadArchivedSessionIds } from "./archive"
 import { buildBoardWorker, type BoardWorker, type WorkerObservation } from "./board"
 import { sessionMessagesLastAssistant, sessionStatus, type ExecRunner } from "./control-client"
 import type { FileSystemPort } from "./file-system"
 import { loadRegistry, type Registration } from "./registry"
 
-export type WorkerEventKind = "finished" | "failed" | "waiting-question" | "waiting-permission"
+export type WorkerEventKind = "finished" | "failed" | "waiting-question" | "waiting-permission" | "steered-answer"
 
 export interface WorkerEvent {
   taskTitle: string
   sessionId: string
   kind: WorkerEventKind
+  /** The worker's new last word, for kind "steered-answer". */
+  answer?: string
 }
 
 export interface ProjectNotification {
@@ -37,6 +40,8 @@ export interface SupervisionPoller {
   getDeliveryError(slug: string): string | undefined
   recordDeliveryError(slug: string, message: string): void
   clearDeliveryError(slug: string): void
+  /** Arms answer-forwarding for a freshly steered worker; a second steer re-arms. */
+  markSteered(slug: string, sessionId: string): void
 }
 
 export function createSupervisionPoller(input: {
@@ -48,6 +53,13 @@ export function createSupervisionPoller(input: {
   const observations = new Map<string, WorkerObservation>()
   const pollErrors = new Map<string, string>()
   const deliveryErrors = new Map<string, string>()
+  // Workers steered from the board, awaiting their answer: the baseline is the
+  // last word known at steer time; the next poll whose last word differs
+  // forwards the answer to the coordinator once and clears the mark. A second
+  // steer re-arms with the fresh baseline. In-memory like every poll state —
+  // a restart drops pending marks, and the steer's answer is simply not
+  // forwarded.
+  const steeredBaselines = new Map<string, string | undefined>()
 
   const observationKey = (slug: string, sessionId: string): string => `${slug}\n${sessionId}`
 
@@ -78,8 +90,20 @@ export function createSupervisionPoller(input: {
     } catch {
       return events
     }
+    // An archived worker is off the board and off supervision; its session
+    // and worktree are left exactly as they are. An unreadable archive fails
+    // closed like an unreadable backlog: without it the poller cannot tell an
+    // ended worker from a live one, so the project skips the round rather
+    // than silently resuming supervision.
+    let archivedSessionIds: Set<string>
+    try {
+      archivedSessionIds = await loadArchivedSessionIds(filesystem, homeRoot, registration.slug)
+    } catch {
+      return events
+    }
     for (const task of backlog.tasks) {
       if (task.sessionId === undefined) continue
+      if (archivedSessionIds.has(task.sessionId)) continue
       const key = observationKey(registration.slug, task.sessionId)
       const previous = observations.get(key)
       try {
@@ -90,6 +114,15 @@ export function createSupervisionPoller(input: {
         observations.set(key, current)
         pollErrors.delete(key)
         events.push(...detectEvents(task, previous, current))
+        if (steeredBaselines.has(key) && current.lastWord !== undefined && current.lastWord !== steeredBaselines.get(key)) {
+          steeredBaselines.delete(key)
+          events.push({
+            taskTitle: task.title,
+            sessionId: task.sessionId,
+            kind: "steered-answer",
+            answer: current.lastWord,
+          })
+        }
       } catch (error) {
         // Keep the previous observation: a failed poll must not fake a
         // transition on the next successful one.
@@ -134,7 +167,12 @@ export function createSupervisionPoller(input: {
     deliveryErrors.delete(slug)
   }
 
-  return { poll, getBoardWorkers, getDeliveryError, recordDeliveryError, clearDeliveryError }
+  function markSteered(slug: string, sessionId: string): void {
+    const key = observationKey(slug, sessionId)
+    steeredBaselines.set(key, observations.get(key)?.lastWord)
+  }
+
+  return { poll, getBoardWorkers, getDeliveryError, recordDeliveryError, clearDeliveryError, markSteered }
 }
 
 function composeNotification(registration: Registration, events: WorkerEvent[]): ProjectNotification {
@@ -157,5 +195,7 @@ function describeEvent(event: WorkerEvent): string {
       return "is waiting on a question. Open the session to read and answer it."
     case "waiting-permission":
       return "is waiting on a permission. Open the session to approve or deny it."
+    case "steered-answer":
+      return `answered the captain's steer: ${event.answer ?? ""}`
   }
 }

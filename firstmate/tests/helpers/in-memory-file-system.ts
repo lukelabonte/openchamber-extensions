@@ -17,6 +17,11 @@ export class InMemoryFileSystem {
     writeFile: async (filePath, contents) => {
       this.entries.set(filePath, { kind: "file", contents })
     },
+    appendFile: async (filePath, contents) => {
+      const node = this.entries.get(filePath)
+      const current = node !== undefined && node.kind === "file" ? node.contents : ""
+      this.entries.set(filePath, { kind: "file", contents: current + contents })
+    },
     createDirectory: async (directoryPath) => {
       this.entries.set(directoryPath, { kind: "directory" })
     },

@@ -47,6 +47,23 @@ describe("card mapping", () => {
     expect(upper.prOpenable).toBe(true)
   })
 
+  test("keeps the session id and worktree for the card actions", () => {
+    const card = toBoardCard({
+      title: "Ship login",
+      state: "Working",
+      sessionId: "ses_11bb",
+      worktree: "/repos/sunrise/.worktrees/fm/login-fix",
+    })
+    expect(card.sessionId).toBe("ses_11bb")
+    expect(card.worktree).toBe("/repos/sunrise/.worktrees/fm/login-fix")
+  })
+
+  test("a card without a session id or worktree omits them", () => {
+    const card = toBoardCard({ title: "t", state: "Queued" })
+    expect(card.sessionId).toBeUndefined()
+    expect(card.worktree).toBeUndefined()
+  })
+
   test("keeps a non-openable pull-request link on the card without marking it openable", () => {
     const card = toBoardCard({ title: "t", state: "Queued", prUrl: "javascript:alert(1)" })
     expect(card.prUrl).toBe("javascript:alert(1)")

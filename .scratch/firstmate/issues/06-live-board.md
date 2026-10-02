@@ -4,7 +4,7 @@
 
 **Blocked by:** 05 (Supervision relay)
 
-**Status:** ready-for-agent
+**Status:** resolved
 
 - [ ] Columns Queued, Working, Blocked, Parked, Done, Failed, Idle; empty columns hidden
 - [ ] Cards show task title, state, last word, PR link (opens externally)

@@ -1,9 +1,11 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http"
 import { spawn } from "node:child_process"
-import { mkdir, readFile, readdir, rename, stat, writeFile } from "node:fs/promises"
+import { mkdir, readFile, readdir, rename, stat, writeFile, appendFile } from "node:fs/promises"
 import { homedir } from "node:os"
 import path from "node:path"
-import { loadBacklog } from "./backlog"
+import { requestRelaunch, steerWorker } from "./actions"
+import { archiveSession, loadArchivedSessionIds } from "./archive"
+import { loadBacklog, type BacklogTask } from "./backlog"
 import { composeInstructions } from "./compose"
 import { createNodeClock } from "./clock"
 import { MissingCliError, type ExecRunner } from "./control-client"
@@ -12,7 +14,7 @@ import { deliverNotification } from "./forwarder"
 import { launchFirstMate } from "./launch"
 import { createSupervisionPoller } from "./poller"
 import { provisionProject } from "./provision"
-import { findRegistration, loadRegistry } from "./registry"
+import { findRegistration, loadRegistry, type Registration } from "./registry"
 
 const rawServicePort = process.env.OPENCHAMBER_SERVICE_PORT
 const serviceToken = process.env.OPENCHAMBER_SERVICE_TOKEN
@@ -39,6 +41,7 @@ const nodeFileSystem: FileSystemPort = {
   },
   readFile: (filePath) => readFile(filePath, "utf8"),
   writeFile: (filePath, contents) => writeFile(filePath, contents, "utf8"),
+  appendFile: (filePath, contents) => appendFile(filePath, contents, "utf8"),
   createDirectory: (directoryPath) => mkdir(directoryPath, { recursive: true }),
   rename: (fromPath, toPath) => rename(fromPath, toPath),
   listDirectories: async (directoryPath) => {
@@ -144,6 +147,20 @@ function readJsonBody(request: IncomingMessage): Promise<unknown> {
   })
 }
 
+async function readJsonRecord(request: IncomingMessage): Promise<Record<string, unknown> | undefined> {
+  try {
+    const payload = await readJsonBody(request)
+    return isRecord(payload) ? payload : undefined
+  } catch {
+    return undefined
+  }
+}
+
+function recordString(record: Record<string, unknown> | undefined, key: string): string | undefined {
+  const value = record?.[key]
+  return typeof value === "string" && value.trim() !== "" ? value : undefined
+}
+
 async function readProjectDirectory(request: IncomingMessage): Promise<string | undefined> {
   let payload: unknown
   try {
@@ -244,7 +261,9 @@ async function handleBoard(url: URL, response: ServerResponse): Promise<void> {
       return
     }
     const backlog = await loadBacklog(nodeFileSystem, `${homeRoot}/projects/${slug}/backlog.md`)
-    const workers = supervisionPoller.getBoardWorkers(slug, backlog.tasks)
+    const archivedSessionIds = await loadArchivedSessionIds(nodeFileSystem, homeRoot, slug)
+    const tasks = backlog.tasks.filter((task) => task.sessionId === undefined || !archivedSessionIds.has(task.sessionId))
+    const workers = supervisionPoller.getBoardWorkers(slug, tasks)
     const deliveryError = supervisionPoller.getDeliveryError(slug)
     respondJson(response, 200, deliveryError === undefined ? { workers } : { workers, deliveryError })
   } catch (error) {
@@ -268,6 +287,153 @@ async function handleBacklog(url: URL, response: ServerResponse): Promise<void> 
     respondJson(response, 200, backlog)
   } catch (error) {
     respondJson(response, 500, { error: error instanceof Error ? error.message : "backlog read failed" })
+  }
+}
+
+// Card actions resolve a worker by its session id inside a registered slug's
+// backlog; unknown slugs and unknown sessions both answer 404.
+type WorkerContext =
+  | { kind: "unknown-slug" }
+  | { kind: "unknown-task" }
+  | { kind: "found"; registration: Registration; task: BacklogTask }
+
+async function findProjectWorker(slug: string, sessionId: string): Promise<WorkerContext> {
+  const registrations = await loadRegistry(nodeFileSystem, homeRoot)
+  if (!Object.hasOwn(registrations, slug)) return { kind: "unknown-slug" }
+  const registration = registrations[slug]
+  const backlog = await loadBacklog(nodeFileSystem, `${homeRoot}/projects/${slug}/backlog.md`)
+  const task = backlog.tasks.find((candidate) => candidate.sessionId === sessionId)
+  return task === undefined ? { kind: "unknown-task" } : { kind: "found", registration, task }
+}
+
+function respondWorkerContextMissing(response: ServerResponse, context: WorkerContext, slug: string, sessionId: string): void {
+  if (context.kind === "unknown-slug") {
+    respondJson(response, 404, { error: `no first mate registered for slug ${slug}` })
+    return
+  }
+  respondJson(response, 404, { error: `no worker with session id ${sessionId} on ${slug}'s backlog` })
+}
+
+// A failed relay answers with the error; a missing CLI answers 503 like
+// /launch does.
+function respondActionError(response: ServerResponse, error: unknown, fallback: string): void {
+  if (error instanceof MissingCliError) {
+    respondJson(response, 503, { error: error.message, code: "cli-missing" })
+    return
+  }
+  respondJson(response, 500, { error: error instanceof Error ? error.message : fallback })
+}
+
+async function handleSteer(request: IncomingMessage, response: ServerResponse): Promise<void> {
+  const payload = await readJsonRecord(request)
+  const slug = recordString(payload, "slug")
+  const sessionId = recordString(payload, "sessionId")
+  const text = recordString(payload, "text")
+  if (slug === undefined || sessionId === undefined || text === undefined) {
+    respondJson(response, 400, { error: "slug, sessionId, and text must be non-empty strings" })
+    return
+  }
+  try {
+    const context = await findProjectWorker(slug, sessionId)
+    if (context.kind !== "found") {
+      respondWorkerContextMissing(response, context, slug, sessionId)
+      return
+    }
+    // An archived worker has left the board; steering blind is refused.
+    const archivedSessionIds = await loadArchivedSessionIds(nodeFileSystem, homeRoot, slug)
+    if (archivedSessionIds.has(sessionId)) {
+      respondJson(response, 409, { error: `the worker with session id ${sessionId} is archived` })
+      return
+    }
+    const outcome = await steerWorker({
+      exec: nodeExec,
+      worker: { sessionId, title: context.task.title },
+      workerDirectory: context.registration.projectDirectory,
+      coordinator: { sessionId: context.registration.coordinatorSessionId, directory: context.registration.homeDirectory },
+      text,
+    })
+    // The steer reached the worker; the poller forwards its answer once.
+    supervisionPoller.markSteered(slug, sessionId)
+    if (outcome.coordinatorNotified) {
+      respondJson(response, 200, { sent: true })
+      return
+    }
+    respondJson(response, 200, {
+      sent: true,
+      warning: `steered the worker, but could not tell the coordinator: ${outcome.coordinatorError}`,
+    })
+  } catch (error) {
+    respondActionError(response, error, "steer failed")
+  }
+}
+
+async function handleRelaunch(request: IncomingMessage, response: ServerResponse): Promise<void> {
+  const payload = await readJsonRecord(request)
+  const slug = recordString(payload, "slug")
+  const sessionId = recordString(payload, "sessionId")
+  const note = recordString(payload, "note")
+  if (slug === undefined || sessionId === undefined || note === undefined) {
+    respondJson(response, 400, { error: "slug, sessionId, and note must be non-empty strings" })
+    return
+  }
+  try {
+    const context = await findProjectWorker(slug, sessionId)
+    if (context.kind !== "found") {
+      respondWorkerContextMissing(response, context, slug, sessionId)
+      return
+    }
+    // An archived worker has left the board; the coordinator relaunches from
+    // its own record, not from a hidden card.
+    const archivedSessionIds = await loadArchivedSessionIds(nodeFileSystem, homeRoot, slug)
+    if (archivedSessionIds.has(sessionId)) {
+      respondJson(response, 409, { error: `the worker with session id ${sessionId} is archived` })
+      return
+    }
+    if (context.task.worktreeDirectory === undefined) {
+      respondJson(response, 400, { error: `the worker "${context.task.title}" has no worktree directory recorded in the backlog` })
+      return
+    }
+    await requestRelaunch({
+      exec: nodeExec,
+      worker: { sessionId, title: context.task.title },
+      worktreeDirectory: context.task.worktreeDirectory,
+      coordinator: { sessionId: context.registration.coordinatorSessionId, directory: context.registration.homeDirectory },
+      note,
+    })
+    respondJson(response, 200, { requested: true })
+  } catch (error) {
+    respondActionError(response, error, "relaunch failed")
+  }
+}
+
+async function handleEnd(request: IncomingMessage, response: ServerResponse): Promise<void> {
+  const payload = await readJsonRecord(request)
+  const slug = recordString(payload, "slug")
+  const sessionId = recordString(payload, "sessionId")
+  if (slug === undefined || sessionId === undefined) {
+    respondJson(response, 400, { error: "slug and sessionId must be non-empty strings" })
+    return
+  }
+  try {
+    const context = await findProjectWorker(slug, sessionId)
+    if (context.kind !== "found") {
+      respondWorkerContextMissing(response, context, slug, sessionId)
+      return
+    }
+    // Extension-owned archive: the card leaves the board and supervision, and
+    // the session and worktree are left exactly as they are. Archiving an
+    // already-archived worker is a no-op, not a duplicate entry.
+    const archivedSessionIds = await loadArchivedSessionIds(nodeFileSystem, homeRoot, slug)
+    if (!archivedSessionIds.has(sessionId)) {
+      await archiveSession(nodeFileSystem, homeRoot, slug, {
+        sessionId,
+        title: context.task.title,
+        archivedAt: new Date(clock.nowMs()).toISOString(),
+      })
+    }
+    respondJson(response, 200, { archived: true })
+  } catch (error) {
+    respondJson(response, 500, { error: error instanceof Error ? error.message : "archive failed" })
   }
 }
 
@@ -311,6 +477,18 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse)
   }
   if (request.method === "GET" && pathname === "/board") {
     await handleBoard(url, response)
+    return
+  }
+  if (request.method === "POST" && pathname === "/steer") {
+    await handleSteer(request, response)
+    return
+  }
+  if (request.method === "POST" && pathname === "/relaunch") {
+    await handleRelaunch(request, response)
+    return
+  }
+  if (request.method === "POST" && pathname === "/end") {
+    await handleEnd(request, response)
     return
   }
   response.statusCode = 404

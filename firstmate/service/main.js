@@ -1,9 +1,172 @@
 // service/main.ts
 import { createServer } from "node:http";
 import { spawn } from "node:child_process";
-import { mkdir, readFile, readdir, rename, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, rename, stat, writeFile, appendFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import path2 from "node:path";
+
+// service/control-client.ts
+class MissingCliError extends Error {
+  constructor() {
+    super("the openchamber CLI is required. Install it with: npm i -g @openchamber/web");
+    this.name = "MissingCliError";
+  }
+}
+
+class SessionBusyError extends Error {
+  constructor() {
+    super("the session is busy and cannot accept a message right now");
+    this.name = "SessionBusyError";
+  }
+}
+async function createSession(exec, input) {
+  const output = await runControlCommand(exec, ["session", "create", "--dir", input.directory, "--title", input.title, "--json"]);
+  const parsed = parseJsonOutput(output);
+  const sessionId = extractSessionId(parsed);
+  if (sessionId === undefined) {
+    throw new Error("openchamber session create output did not include a session id");
+  }
+  return sessionId;
+}
+async function sessionStatus(exec, input) {
+  const output = await runControlCommand(exec, ["session", "status", "--session", input.sessionId, "--dir", input.directory, "--json"]);
+  const parsed = parseJsonOutput(output);
+  return { activity: extractActivity(parsed), outcome: extractOutcome(parsed) };
+}
+async function sessionMessagesLastAssistant(exec, input) {
+  const output = await runControlCommand(exec, ["session", "messages", "--session", input.sessionId, "--dir", input.directory, "--last-assistant", "--json"]);
+  const parsed = parseJsonOutput(output);
+  return extractAssistantText(parsed);
+}
+async function sessionSend(exec, input) {
+  try {
+    await runControlCommand(exec, ["session", "send", "--session", input.sessionId, "--dir", input.directory, "--prompt", input.prompt, "--json"]);
+  } catch (error) {
+    if (error instanceof Error && /busy/i.test(error.message)) {
+      throw new SessionBusyError;
+    }
+    throw error;
+  }
+}
+async function runControlCommand(exec, args) {
+  try {
+    return await exec("openchamber", args);
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      throw new MissingCliError;
+    }
+    throw error;
+  }
+}
+function parseJsonOutput(output) {
+  try {
+    return JSON.parse(output);
+  } catch {
+    throw new Error("openchamber command did not return valid JSON");
+  }
+}
+function extractSessionId(parsed) {
+  if (!isRecord(parsed))
+    return;
+  for (const key of ["sessionID", "sessionId", "id"]) {
+    const value = parsed[key];
+    if (typeof value === "string" && value !== "")
+      return value;
+  }
+  return;
+}
+var knownActivities = ["unknown", "idle", "running", "retrying", "waiting-permission", "waiting-question"];
+function extractActivity(parsed) {
+  if (!isRecord(parsed))
+    return "unknown";
+  for (const key of ["type", "activity", "status"]) {
+    const value = parsed[key];
+    if (typeof value === "string" && knownActivities.includes(value)) {
+      return value;
+    }
+  }
+  return "unknown";
+}
+function extractOutcome(parsed) {
+  if (!isRecord(parsed))
+    return null;
+  const value = parsed.outcome;
+  if (value === "completed" || value === "failed")
+    return value;
+  return null;
+}
+function extractAssistantText(parsed) {
+  if (typeof parsed === "string")
+    return parsed === "" ? undefined : parsed;
+  if (!isRecord(parsed))
+    return;
+  for (const key of ["text", "content", "message"]) {
+    const value = parsed[key];
+    if (typeof value === "string" && value !== "")
+      return value;
+  }
+  return;
+}
+function isRecord(value) {
+  return typeof value === "object" && value !== null;
+}
+
+// service/actions.ts
+async function steerWorker(input) {
+  await sessionSend(input.exec, {
+    sessionId: input.worker.sessionId,
+    directory: input.workerDirectory,
+    prompt: input.text
+  });
+  try {
+    await sessionSend(input.exec, {
+      sessionId: input.coordinator.sessionId,
+      directory: input.coordinator.directory,
+      prompt: `The captain steered worker "${input.worker.title}": ${input.text}`
+    });
+    return { coordinatorNotified: true };
+  } catch (error) {
+    return { coordinatorNotified: false, coordinatorError: error instanceof Error ? error.message : String(error) };
+  }
+}
+async function requestRelaunch(input) {
+  await sessionSend(input.exec, {
+    sessionId: input.coordinator.sessionId,
+    directory: input.coordinator.directory,
+    prompt: `The captain requested a relaunch of worker "${input.worker.title}" (session ${input.worker.sessionId}): ` + `launch a fresh worker in the existing worktree ${input.worktreeDirectory}; ` + `the conversation does not carry over. Update the backlog to supersede the old entry. ` + `The captain's note: ${input.note}`
+  });
+}
+
+// service/archive.ts
+function archivePath(homeRoot, slug) {
+  return `${homeRoot}/projects/${slug}/reports/archive.jsonl`;
+}
+async function loadArchivedSessionIds(filesystem, homeRoot, slug) {
+  const filePath = archivePath(homeRoot, slug);
+  if (!await filesystem.exists(filePath))
+    return new Set;
+  const ids = new Set;
+  for (const line of (await filesystem.readFile(filePath)).split(`
+`)) {
+    const trimmed = line.trim();
+    if (trimmed === "")
+      continue;
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (isArchiveEntry(parsed))
+        ids.add(parsed.sessionId);
+    } catch {}
+  }
+  return ids;
+}
+async function archiveSession(filesystem, homeRoot, slug, entry) {
+  await filesystem.createDirectory(`${homeRoot}/projects/${slug}/reports`);
+  await filesystem.appendFile(archivePath(homeRoot, slug), `${JSON.stringify(entry)}
+`);
+}
+function isArchiveEntry(value) {
+  return typeof value === "object" && value !== null && typeof value.sessionId === "string" && typeof value.title === "string" && typeof value.archivedAt === "string";
+}
 
 // service/backlog.ts
 var backlogStates = [
@@ -177,112 +340,6 @@ function createNodeClock() {
       return { cancel: () => clearInterval(timer) };
     }
   };
-}
-
-// service/control-client.ts
-class MissingCliError extends Error {
-  constructor() {
-    super("the openchamber CLI is required. Install it with: npm i -g @openchamber/web");
-    this.name = "MissingCliError";
-  }
-}
-
-class SessionBusyError extends Error {
-  constructor() {
-    super("the session is busy and cannot accept a message right now");
-    this.name = "SessionBusyError";
-  }
-}
-async function createSession(exec, input) {
-  const output = await runControlCommand(exec, ["session", "create", "--dir", input.directory, "--title", input.title, "--json"]);
-  const parsed = parseJsonOutput(output);
-  const sessionId = extractSessionId(parsed);
-  if (sessionId === undefined) {
-    throw new Error("openchamber session create output did not include a session id");
-  }
-  return sessionId;
-}
-async function sessionStatus(exec, input) {
-  const output = await runControlCommand(exec, ["session", "status", "--session", input.sessionId, "--dir", input.directory, "--json"]);
-  const parsed = parseJsonOutput(output);
-  return { activity: extractActivity(parsed), outcome: extractOutcome(parsed) };
-}
-async function sessionMessagesLastAssistant(exec, input) {
-  const output = await runControlCommand(exec, ["session", "messages", "--session", input.sessionId, "--dir", input.directory, "--last-assistant", "--json"]);
-  const parsed = parseJsonOutput(output);
-  return extractAssistantText(parsed);
-}
-async function sessionSend(exec, input) {
-  try {
-    await runControlCommand(exec, ["session", "send", "--session", input.sessionId, "--dir", input.directory, "--prompt", input.prompt, "--json"]);
-  } catch (error) {
-    if (error instanceof Error && /busy/i.test(error.message)) {
-      throw new SessionBusyError;
-    }
-    throw error;
-  }
-}
-async function runControlCommand(exec, args) {
-  try {
-    return await exec("openchamber", args);
-  } catch (error) {
-    if (error?.code === "ENOENT") {
-      throw new MissingCliError;
-    }
-    throw error;
-  }
-}
-function parseJsonOutput(output) {
-  try {
-    return JSON.parse(output);
-  } catch {
-    throw new Error("openchamber command did not return valid JSON");
-  }
-}
-function extractSessionId(parsed) {
-  if (!isRecord(parsed))
-    return;
-  for (const key of ["sessionID", "sessionId", "id"]) {
-    const value = parsed[key];
-    if (typeof value === "string" && value !== "")
-      return value;
-  }
-  return;
-}
-var knownActivities = ["unknown", "idle", "running", "retrying", "waiting-permission", "waiting-question"];
-function extractActivity(parsed) {
-  if (!isRecord(parsed))
-    return "unknown";
-  for (const key of ["type", "activity", "status"]) {
-    const value = parsed[key];
-    if (typeof value === "string" && knownActivities.includes(value)) {
-      return value;
-    }
-  }
-  return "unknown";
-}
-function extractOutcome(parsed) {
-  if (!isRecord(parsed))
-    return null;
-  const value = parsed.outcome;
-  if (value === "completed" || value === "failed")
-    return value;
-  return null;
-}
-function extractAssistantText(parsed) {
-  if (typeof parsed === "string")
-    return parsed === "" ? undefined : parsed;
-  if (!isRecord(parsed))
-    return;
-  for (const key of ["text", "content", "message"]) {
-    const value = parsed[key];
-    if (typeof value === "string" && value !== "")
-      return value;
-  }
-  return;
-}
-function isRecord(value) {
-  return typeof value === "object" && value !== null;
 }
 
 // service/forwarder.ts
@@ -615,6 +672,7 @@ function createSupervisionPoller(input) {
   const observations = new Map;
   const pollErrors = new Map;
   const deliveryErrors = new Map;
+  const steeredBaselines = new Map;
   const observationKey = (slug, sessionId) => `${slug}
 ${sessionId}`;
   async function poll() {
@@ -641,8 +699,16 @@ ${sessionId}`;
     } catch {
       return events;
     }
+    let archivedSessionIds;
+    try {
+      archivedSessionIds = await loadArchivedSessionIds(filesystem, homeRoot, registration.slug);
+    } catch {
+      return events;
+    }
     for (const task of backlog.tasks) {
       if (task.sessionId === undefined)
+        continue;
+      if (archivedSessionIds.has(task.sessionId))
         continue;
       const key = observationKey(registration.slug, task.sessionId);
       const previous = observations.get(key);
@@ -654,6 +720,15 @@ ${sessionId}`;
         observations.set(key, current);
         pollErrors.delete(key);
         events.push(...detectEvents(task, previous, current));
+        if (steeredBaselines.has(key) && current.lastWord !== undefined && current.lastWord !== steeredBaselines.get(key)) {
+          steeredBaselines.delete(key);
+          events.push({
+            taskTitle: task.title,
+            sessionId: task.sessionId,
+            kind: "steered-answer",
+            answer: current.lastWord
+          });
+        }
       } catch (error) {
         pollErrors.set(key, error instanceof Error ? error.message : String(error));
       }
@@ -692,7 +767,11 @@ ${sessionId}`;
   function clearDeliveryError(slug) {
     deliveryErrors.delete(slug);
   }
-  return { poll, getBoardWorkers, getDeliveryError, recordDeliveryError, clearDeliveryError };
+  function markSteered(slug, sessionId) {
+    const key = observationKey(slug, sessionId);
+    steeredBaselines.set(key, observations.get(key)?.lastWord);
+  }
+  return { poll, getBoardWorkers, getDeliveryError, recordDeliveryError, clearDeliveryError, markSteered };
 }
 function composeNotification(registration, events) {
   const lines = events.map((event) => `- "${event.taskTitle}" (${event.sessionId}): ${describeEvent(event)}`);
@@ -714,6 +793,8 @@ function describeEvent(event) {
       return "is waiting on a question. Open the session to read and answer it.";
     case "waiting-permission":
       return "is waiting on a permission. Open the session to approve or deny it.";
+    case "steered-answer":
+      return `answered the captain's steer: ${event.answer ?? ""}`;
   }
 }
 
@@ -740,6 +821,7 @@ var nodeFileSystem = {
   },
   readFile: (filePath) => readFile(filePath, "utf8"),
   writeFile: (filePath, contents) => writeFile(filePath, contents, "utf8"),
+  appendFile: (filePath, contents) => appendFile(filePath, contents, "utf8"),
   createDirectory: (directoryPath) => mkdir(directoryPath, { recursive: true }),
   rename: (fromPath, toPath) => rename(fromPath, toPath),
   listDirectories: async (directoryPath) => {
@@ -825,6 +907,18 @@ function readJsonBody(request) {
     });
     request.on("error", reject);
   });
+}
+async function readJsonRecord(request) {
+  try {
+    const payload = await readJsonBody(request);
+    return isRecord3(payload) ? payload : undefined;
+  } catch {
+    return;
+  }
+}
+function recordString(record, key) {
+  const value = record?.[key];
+  return typeof value === "string" && value.trim() !== "" ? value : undefined;
 }
 async function readProjectDirectory(request) {
   let payload;
@@ -920,7 +1014,9 @@ async function handleBoard(url, response) {
       return;
     }
     const backlog = await loadBacklog(nodeFileSystem, `${homeRoot}/projects/${slug}/backlog.md`);
-    const workers = supervisionPoller.getBoardWorkers(slug, backlog.tasks);
+    const archivedSessionIds = await loadArchivedSessionIds(nodeFileSystem, homeRoot, slug);
+    const tasks = backlog.tasks.filter((task) => task.sessionId === undefined || !archivedSessionIds.has(task.sessionId));
+    const workers = supervisionPoller.getBoardWorkers(slug, tasks);
     const deliveryError = supervisionPoller.getDeliveryError(slug);
     respondJson(response, 200, deliveryError === undefined ? { workers } : { workers, deliveryError });
   } catch (error) {
@@ -943,6 +1039,132 @@ async function handleBacklog(url, response) {
     respondJson(response, 200, backlog);
   } catch (error) {
     respondJson(response, 500, { error: error instanceof Error ? error.message : "backlog read failed" });
+  }
+}
+async function findProjectWorker(slug, sessionId) {
+  const registrations = await loadRegistry(nodeFileSystem, homeRoot);
+  if (!Object.hasOwn(registrations, slug))
+    return { kind: "unknown-slug" };
+  const registration = registrations[slug];
+  const backlog = await loadBacklog(nodeFileSystem, `${homeRoot}/projects/${slug}/backlog.md`);
+  const task = backlog.tasks.find((candidate) => candidate.sessionId === sessionId);
+  return task === undefined ? { kind: "unknown-task" } : { kind: "found", registration, task };
+}
+function respondWorkerContextMissing(response, context, slug, sessionId) {
+  if (context.kind === "unknown-slug") {
+    respondJson(response, 404, { error: `no first mate registered for slug ${slug}` });
+    return;
+  }
+  respondJson(response, 404, { error: `no worker with session id ${sessionId} on ${slug}'s backlog` });
+}
+function respondActionError(response, error, fallback) {
+  if (error instanceof MissingCliError) {
+    respondJson(response, 503, { error: error.message, code: "cli-missing" });
+    return;
+  }
+  respondJson(response, 500, { error: error instanceof Error ? error.message : fallback });
+}
+async function handleSteer(request, response) {
+  const payload = await readJsonRecord(request);
+  const slug = recordString(payload, "slug");
+  const sessionId = recordString(payload, "sessionId");
+  const text = recordString(payload, "text");
+  if (slug === undefined || sessionId === undefined || text === undefined) {
+    respondJson(response, 400, { error: "slug, sessionId, and text must be non-empty strings" });
+    return;
+  }
+  try {
+    const context = await findProjectWorker(slug, sessionId);
+    if (context.kind !== "found") {
+      respondWorkerContextMissing(response, context, slug, sessionId);
+      return;
+    }
+    const archivedSessionIds = await loadArchivedSessionIds(nodeFileSystem, homeRoot, slug);
+    if (archivedSessionIds.has(sessionId)) {
+      respondJson(response, 409, { error: `the worker with session id ${sessionId} is archived` });
+      return;
+    }
+    const outcome = await steerWorker({
+      exec: nodeExec,
+      worker: { sessionId, title: context.task.title },
+      workerDirectory: context.registration.projectDirectory,
+      coordinator: { sessionId: context.registration.coordinatorSessionId, directory: context.registration.homeDirectory },
+      text
+    });
+    supervisionPoller.markSteered(slug, sessionId);
+    if (outcome.coordinatorNotified) {
+      respondJson(response, 200, { sent: true });
+      return;
+    }
+    respondJson(response, 200, {
+      sent: true,
+      warning: `steered the worker, but could not tell the coordinator: ${outcome.coordinatorError}`
+    });
+  } catch (error) {
+    respondActionError(response, error, "steer failed");
+  }
+}
+async function handleRelaunch(request, response) {
+  const payload = await readJsonRecord(request);
+  const slug = recordString(payload, "slug");
+  const sessionId = recordString(payload, "sessionId");
+  const note = recordString(payload, "note");
+  if (slug === undefined || sessionId === undefined || note === undefined) {
+    respondJson(response, 400, { error: "slug, sessionId, and note must be non-empty strings" });
+    return;
+  }
+  try {
+    const context = await findProjectWorker(slug, sessionId);
+    if (context.kind !== "found") {
+      respondWorkerContextMissing(response, context, slug, sessionId);
+      return;
+    }
+    const archivedSessionIds = await loadArchivedSessionIds(nodeFileSystem, homeRoot, slug);
+    if (archivedSessionIds.has(sessionId)) {
+      respondJson(response, 409, { error: `the worker with session id ${sessionId} is archived` });
+      return;
+    }
+    if (context.task.worktreeDirectory === undefined) {
+      respondJson(response, 400, { error: `the worker "${context.task.title}" has no worktree directory recorded in the backlog` });
+      return;
+    }
+    await requestRelaunch({
+      exec: nodeExec,
+      worker: { sessionId, title: context.task.title },
+      worktreeDirectory: context.task.worktreeDirectory,
+      coordinator: { sessionId: context.registration.coordinatorSessionId, directory: context.registration.homeDirectory },
+      note
+    });
+    respondJson(response, 200, { requested: true });
+  } catch (error) {
+    respondActionError(response, error, "relaunch failed");
+  }
+}
+async function handleEnd(request, response) {
+  const payload = await readJsonRecord(request);
+  const slug = recordString(payload, "slug");
+  const sessionId = recordString(payload, "sessionId");
+  if (slug === undefined || sessionId === undefined) {
+    respondJson(response, 400, { error: "slug and sessionId must be non-empty strings" });
+    return;
+  }
+  try {
+    const context = await findProjectWorker(slug, sessionId);
+    if (context.kind !== "found") {
+      respondWorkerContextMissing(response, context, slug, sessionId);
+      return;
+    }
+    const archivedSessionIds = await loadArchivedSessionIds(nodeFileSystem, homeRoot, slug);
+    if (!archivedSessionIds.has(sessionId)) {
+      await archiveSession(nodeFileSystem, homeRoot, slug, {
+        sessionId,
+        title: context.task.title,
+        archivedAt: new Date(clock.nowMs()).toISOString()
+      });
+    }
+    respondJson(response, 200, { archived: true });
+  } catch (error) {
+    respondJson(response, 500, { error: error instanceof Error ? error.message : "archive failed" });
   }
 }
 async function handleRequest(request, response) {
@@ -985,6 +1207,18 @@ async function handleRequest(request, response) {
   }
   if (request.method === "GET" && pathname === "/board") {
     await handleBoard(url, response);
+    return;
+  }
+  if (request.method === "POST" && pathname === "/steer") {
+    await handleSteer(request, response);
+    return;
+  }
+  if (request.method === "POST" && pathname === "/relaunch") {
+    await handleRelaunch(request, response);
+    return;
+  }
+  if (request.method === "POST" && pathname === "/end") {
+    await handleEnd(request, response);
     return;
   }
   response.statusCode = 404;

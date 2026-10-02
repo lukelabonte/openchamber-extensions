@@ -1,6 +1,8 @@
 import { describe, expect, test } from "bun:test"
 import { parseBacklog } from "../service/backlog"
+import { archivePath, archiveSession } from "../service/archive"
 import type { ExecRunner } from "../service/control-client"
+import type { FileSystemPort } from "../service/file-system"
 import { createSupervisionPoller } from "../service/poller"
 import { InMemoryFileSystem } from "./helpers/in-memory-file-system"
 
@@ -226,5 +228,132 @@ describe("createSupervisionPoller", () => {
     const round = await poller.poll()
 
     expect(round.notifications).toEqual([])
+  })
+
+  test("an archived worker is neither polled nor reported", async () => {
+    const filesystem = new InMemoryFileSystem()
+    seedRegistry(filesystem)
+    seedBacklog(
+      filesystem,
+      [
+        "- Fix flaky login test",
+        "  state: Working",
+        "  session: ses_11bb",
+        "",
+        "- Still on duty",
+        "  state: Working",
+        "  session: ses_22cc",
+      ].join("\n"),
+    )
+    await archiveSession(filesystem.port, homeRoot, "sunrise", {
+      sessionId: "ses_11bb",
+      title: "Fix flaky login test",
+      archivedAt: "2026-10-01T09:00:00.000Z",
+    })
+    const { exec, calls } = statusExec("waiting-question")
+
+    const poller = createSupervisionPoller({ filesystem: filesystem.port, exec, homeRoot })
+    const round = await poller.poll()
+
+    const statusCalls = calls.filter((args) => subcommand(args) === "status")
+    expect(statusCalls.map((args) => sessionArg(args))).toEqual(["ses_22cc"])
+    expect(round.notifications).toHaveLength(1)
+    expect(round.notifications[0].message).not.toContain("Fix flaky login test")
+  })
+
+  test("an unreadable archive skips the project's round instead of resuming supervision", async () => {
+    const filesystem = new InMemoryFileSystem()
+    seedRegistry(filesystem)
+    seedBacklog(filesystem, ["- Fix flaky login test", "  state: Working", "  session: ses_11bb"].join("\n"))
+    await archiveSession(filesystem.port, homeRoot, "sunrise", {
+      sessionId: "ses_11bb",
+      title: "Fix flaky login test",
+      archivedAt: "2026-10-01T09:00:00.000Z",
+    })
+    // exists() still answers true, so the read itself is what fails.
+    const brokenPort: FileSystemPort = {
+      ...filesystem.port,
+      readFile: async (filePath) => {
+        if (filePath === archivePath(homeRoot, "sunrise")) throw new Error("disk gone")
+        return filesystem.port.readFile(filePath)
+      },
+    }
+    const { exec, calls } = statusExec("waiting-question")
+
+    const poller = createSupervisionPoller({ filesystem: brokenPort, exec, homeRoot })
+    const round = await poller.poll()
+
+    expect(calls.filter((args) => subcommand(args) === "status")).toEqual([])
+    expect(round.notifications).toEqual([])
+  })
+
+  test("a steered worker's new last word is forwarded to the coordinator once", async () => {
+    const filesystem = new InMemoryFileSystem()
+    seedRegistry(filesystem)
+    seedBacklog(filesystem, ["- Fix flaky login test", "  state: Working", "  session: ses_11bb"].join("\n"))
+    let lastWord = "stuck on the flake"
+    const { exec } = scriptExec((args) =>
+      subcommand(args) === "status" ? '{"type":"idle"}' : `{"text":"${lastWord}"}`,
+    )
+    const poller = createSupervisionPoller({ filesystem: filesystem.port, exec, homeRoot })
+
+    await poller.poll() // baseline: the last word the captain steered against
+    poller.markSteered("sunrise", "ses_11bb")
+
+    const unchanged = await poller.poll()
+    expect(unchanged.notifications).toEqual([])
+
+    lastWord = "flake fixed, tests green"
+    const answered = await poller.poll()
+    expect(answered.notifications).toHaveLength(1)
+    expect(answered.notifications[0].message).toContain("answered the captain's steer")
+    expect(answered.notifications[0].message).toContain("flake fixed, tests green")
+
+    // One forward per steer: the mark is cleared.
+    const afterAnswer = await poller.poll()
+    expect(afterAnswer.notifications).toEqual([])
+  })
+
+  test("a steer with no new assistant message forwards nothing", async () => {
+    const filesystem = new InMemoryFileSystem()
+    seedRegistry(filesystem)
+    seedBacklog(filesystem, ["- Fix flaky login test", "  state: Working", "  session: ses_11bb"].join("\n"))
+    const { exec } = scriptExec((args) =>
+      subcommand(args) === "status" ? '{"type":"idle"}' : '{"text":"stuck on the flake"}',
+    )
+    const poller = createSupervisionPoller({ filesystem: filesystem.port, exec, homeRoot })
+
+    await poller.poll()
+    poller.markSteered("sunrise", "ses_11bb")
+
+    const first = await poller.poll()
+    const second = await poller.poll()
+    expect(first.notifications).toEqual([])
+    expect(second.notifications).toEqual([])
+  })
+
+  test("a second steer re-arms answer-forwarding", async () => {
+    const filesystem = new InMemoryFileSystem()
+    seedRegistry(filesystem)
+    seedBacklog(filesystem, ["- Fix flaky login test", "  state: Working", "  session: ses_11bb"].join("\n"))
+    let lastWord = "stuck on the flake"
+    const { exec } = scriptExec((args) =>
+      subcommand(args) === "status" ? '{"type":"idle"}' : `{"text":"${lastWord}"}`,
+    )
+    const poller = createSupervisionPoller({ filesystem: filesystem.port, exec, homeRoot })
+
+    await poller.poll()
+    poller.markSteered("sunrise", "ses_11bb")
+    lastWord = "first answer"
+    await poller.poll() // forwards once, mark cleared
+
+    poller.markSteered("sunrise", "ses_11bb") // re-arms against "first answer"
+    const unchanged = await poller.poll()
+    expect(unchanged.notifications).toEqual([])
+
+    lastWord = "second answer"
+    const reAnswered = await poller.poll()
+    expect(reAnswered.notifications).toHaveLength(1)
+    expect(reAnswered.notifications[0].message).toContain("second answer")
   })
 })

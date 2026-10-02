@@ -25,6 +25,10 @@ export interface BoardCard {
   /** True when the PR link is an http(s) URL the host can open. */
   prOpenable?: boolean
   warning?: string
+  /** Present on dispatched workers; Watch and the action calls need it. */
+  sessionId?: string
+  /** The worker's worktree directory from the backlog record; Relaunch needs it. */
+  worktree?: string
 }
 
 export interface BoardColumn {
@@ -112,6 +116,8 @@ export function toBoardCard(worker: BoardWorker): BoardCard {
   }
   const warning = optionalText(worker.lastPollError)
   if (warning !== undefined) card.warning = warning
+  if (worker.sessionId !== undefined) card.sessionId = worker.sessionId
+  if (worker.worktree !== undefined) card.worktree = worker.worktree
   return card
 }
 

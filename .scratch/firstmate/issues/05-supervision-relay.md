@@ -4,7 +4,7 @@
 
 **Blocked by:** 04 (Worker spawning tracer)
 
-**Status:** ready-for-agent
+**Status:** resolved
 
 - [ ] Poller maps worker session activity/outcome to board states (Queued, Working, Blocked, Parked, Done, Failed, Idle); mapping unit-tested at the service-core seam
 - [ ] Finish/failure/waiting events reach the coordinator as a single message each; runtime-verify send-to-busy behavior (queue vs error) and handle whichever is true

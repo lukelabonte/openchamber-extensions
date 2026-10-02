@@ -363,6 +363,59 @@ async function deliverNotification(input) {
   }
 }
 
+// service/interrupt.ts
+async function discoverSupport(input) {
+  let raw;
+  try {
+    raw = await input.filesystem.readFile(input.settingsPath);
+  } catch {
+    return { kind: "unsupported", reason: `the OpenChamber settings file could not be read (${input.settingsPath})` };
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return { kind: "unsupported", reason: "the OpenChamber settings file is not valid JSON" };
+  }
+  if (typeof parsed !== "object" || parsed === null) {
+    return { kind: "unsupported", reason: "the OpenChamber settings file is not a JSON object" };
+  }
+  const record = parsed;
+  const port = record.desktopLocalPort;
+  const token = record.desktopLocalClientToken;
+  if (typeof port !== "number" || !Number.isInteger(port) || port <= 0) {
+    return { kind: "unsupported", reason: "the OpenChamber settings file has no usable desktopLocalPort" };
+  }
+  const usableToken = typeof token === "string" && token !== "" ? token : undefined;
+  if (token !== undefined && usableToken === undefined) {
+    return { kind: "unsupported", reason: "the OpenChamber settings file has a non-string desktopLocalClientToken" };
+  }
+  return { kind: "supported", port, ...usableToken !== undefined ? { token: usableToken } : {} };
+}
+async function interruptWorker(input) {
+  if (input.support.kind === "unsupported") {
+    return { kind: "unsupported", reason: input.support.reason };
+  }
+  const url = `http://127.0.0.1:${input.support.port}/api/session/${input.sessionId}/abort?directory=${encodeURIComponent(input.directory)}`;
+  const headers = {};
+  if (input.support.token !== undefined)
+    headers.authorization = `Bearer ${input.support.token}`;
+  try {
+    const result = await input.fetcher(url, { method: "POST", headers });
+    if (result.status >= 200 && result.status < 300)
+      return { kind: "ok" };
+    if (result.status === 401 || result.status === 403) {
+      return {
+        kind: "unsupported",
+        reason: `the abort call was rejected with status ${result.status}: this host requires credentials that were not offered`
+      };
+    }
+    return { kind: "failed", message: `the abort call answered with status ${result.status}` };
+  } catch (error) {
+    return { kind: "failed", message: error instanceof Error ? error.message : String(error) };
+  }
+}
+
 // service/slug.ts
 import path from "node:path";
 var HASH_HEX_LENGTH = 8;
@@ -802,6 +855,7 @@ function describeEvent(event) {
 var rawServicePort = process.env.OPENCHAMBER_SERVICE_PORT;
 var serviceToken = process.env.OPENCHAMBER_SERVICE_TOKEN;
 var homeRoot = process.env.FIRSTMATE_HOME ?? path2.join(homedir(), ".config", "firstmate");
+var openchamberSettingsPath = process.env.FIRSTMATE_OPENCHAMBER_SETTINGS ?? path2.join(homedir(), ".config", "openchamber", "settings.json");
 var templatesDirectory = path2.resolve(path2.dirname(process.argv[1] ?? "."), "..", "templates");
 var servicePort = Number(rawServicePort);
 if (!rawServicePort || !Number.isInteger(servicePort) || servicePort < 0) {
@@ -849,6 +903,7 @@ var nodeExec = (command, args) => new Promise((resolve, reject) => {
     reject(new Error(`${command} exited with code ${code}${stderr === "" ? "" : `: ${stderr}`}`));
   });
 });
+var nodeFetcher = (url, init) => fetch(url, init);
 var templateReader = (templateName) => readFile(path2.join(templatesDirectory, templateName), "utf8");
 var defaultPollIntervalMs = 15000;
 function readPollIntervalMs() {
@@ -1140,6 +1195,45 @@ async function handleRelaunch(request, response) {
     respondActionError(response, error, "relaunch failed");
   }
 }
+async function handleInterrupt(request, response) {
+  const payload = await readJsonRecord(request);
+  const slug = recordString(payload, "slug");
+  const sessionId = recordString(payload, "sessionId");
+  if (slug === undefined || sessionId === undefined) {
+    respondJson(response, 400, { error: "slug and sessionId must be non-empty strings" });
+    return;
+  }
+  try {
+    const context = await findProjectWorker(slug, sessionId);
+    if (context.kind !== "found") {
+      respondWorkerContextMissing(response, context, slug, sessionId);
+      return;
+    }
+    const archivedSessionIds = await loadArchivedSessionIds(nodeFileSystem, homeRoot, slug);
+    if (archivedSessionIds.has(sessionId)) {
+      respondJson(response, 409, { error: `the worker with session id ${sessionId} is archived` });
+      return;
+    }
+    const support = await discoverSupport({ filesystem: nodeFileSystem, settingsPath: openchamberSettingsPath });
+    const outcome = await interruptWorker({
+      fetcher: nodeFetcher,
+      support,
+      sessionId,
+      directory: context.registration.projectDirectory
+    });
+    if (outcome.kind === "ok") {
+      respondJson(response, 200, { interrupted: true });
+      return;
+    }
+    if (outcome.kind === "unsupported") {
+      respondJson(response, 501, { error: "interrupt is not supported on this host", detail: outcome.reason });
+      return;
+    }
+    respondJson(response, 502, { error: "the abort call failed", detail: outcome.message });
+  } catch (error) {
+    respondJson(response, 500, { error: error instanceof Error ? error.message : "interrupt failed" });
+  }
+}
 async function handleEnd(request, response) {
   const payload = await readJsonRecord(request);
   const slug = recordString(payload, "slug");
@@ -1215,6 +1309,10 @@ async function handleRequest(request, response) {
   }
   if (request.method === "POST" && pathname === "/relaunch") {
     await handleRelaunch(request, response);
+    return;
+  }
+  if (request.method === "POST" && pathname === "/interrupt") {
+    await handleInterrupt(request, response);
     return;
   }
   if (request.method === "POST" && pathname === "/end") {

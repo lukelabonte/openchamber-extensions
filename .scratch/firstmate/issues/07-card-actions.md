@@ -4,7 +4,7 @@
 
 **Blocked by:** 06 (Live board panel)
 
-**Status:** ready-for-agent
+**Status:** resolved
 
 - [ ] Watch calls `openSession` on the worker's session
 - [ ] Steer delivers a message to the worker session and forwards the exchange to the coordinator

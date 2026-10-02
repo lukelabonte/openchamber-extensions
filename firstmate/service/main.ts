@@ -11,6 +11,7 @@ import { createNodeClock } from "./clock"
 import { MissingCliError, type ExecRunner } from "./control-client"
 import type { FileSystemPort } from "./file-system"
 import { deliverNotification } from "./forwarder"
+import { discoverSupport, interruptWorker, type HttpFetcher } from "./interrupt"
 import { launchFirstMate } from "./launch"
 import { createSupervisionPoller } from "./poller"
 import { provisionProject } from "./provision"
@@ -19,6 +20,11 @@ import { findRegistration, loadRegistry, type Registration } from "./registry"
 const rawServicePort = process.env.OPENCHAMBER_SERVICE_PORT
 const serviceToken = process.env.OPENCHAMBER_SERVICE_TOKEN
 const homeRoot = process.env.FIRSTMATE_HOME ?? path.join(homedir(), ".config", "firstmate")
+// Interrupt's fallback path discovers the managed opencode server from the
+// OpenChamber CLI's own settings (private surface, see interrupt.ts); the
+// env override exists so tests can point discovery at a fixture file.
+const openchamberSettingsPath =
+  process.env.FIRSTMATE_OPENCHAMBER_SETTINGS ?? path.join(homedir(), ".config", "openchamber", "settings.json")
 // Templates ship beside the service; argv[1] is the entry path under both bun and node.
 const templatesDirectory = path.resolve(path.dirname(process.argv[1] ?? "."), "..", "templates")
 
@@ -71,6 +77,8 @@ const nodeExec: ExecRunner = (command, args) =>
       reject(new Error(`${command} exited with code ${code}${stderr === "" ? "" : `: ${stderr}`}`))
     })
   })
+
+const nodeFetcher: HttpFetcher = (url, init) => fetch(url, init)
 
 const templateReader = (templateName: string): Promise<string> =>
   readFile(path.join(templatesDirectory, templateName), "utf8")
@@ -406,6 +414,51 @@ async function handleRelaunch(request: IncomingMessage, response: ServerResponse
   }
 }
 
+// Interrupt is the gated workaround from ticket 08: no contract surface
+// exposes stop/abort, so the service tries the managed opencode server's own
+// session.abort discovered from the OpenChamber CLI's local settings. A host
+// without that private path answers 501 — reported, never silently absorbed.
+async function handleInterrupt(request: IncomingMessage, response: ServerResponse): Promise<void> {
+  const payload = await readJsonRecord(request)
+  const slug = recordString(payload, "slug")
+  const sessionId = recordString(payload, "sessionId")
+  if (slug === undefined || sessionId === undefined) {
+    respondJson(response, 400, { error: "slug and sessionId must be non-empty strings" })
+    return
+  }
+  try {
+    const context = await findProjectWorker(slug, sessionId)
+    if (context.kind !== "found") {
+      respondWorkerContextMissing(response, context, slug, sessionId)
+      return
+    }
+    // An archived worker has left the board; there is no turn left to stop.
+    const archivedSessionIds = await loadArchivedSessionIds(nodeFileSystem, homeRoot, slug)
+    if (archivedSessionIds.has(sessionId)) {
+      respondJson(response, 409, { error: `the worker with session id ${sessionId} is archived` })
+      return
+    }
+    const support = await discoverSupport({ filesystem: nodeFileSystem, settingsPath: openchamberSettingsPath })
+    const outcome = await interruptWorker({
+      fetcher: nodeFetcher,
+      support,
+      sessionId,
+      directory: context.registration.projectDirectory,
+    })
+    if (outcome.kind === "ok") {
+      respondJson(response, 200, { interrupted: true })
+      return
+    }
+    if (outcome.kind === "unsupported") {
+      respondJson(response, 501, { error: "interrupt is not supported on this host", detail: outcome.reason })
+      return
+    }
+    respondJson(response, 502, { error: "the abort call failed", detail: outcome.message })
+  } catch (error) {
+    respondJson(response, 500, { error: error instanceof Error ? error.message : "interrupt failed" })
+  }
+}
+
 async function handleEnd(request: IncomingMessage, response: ServerResponse): Promise<void> {
   const payload = await readJsonRecord(request)
   const slug = recordString(payload, "slug")
@@ -485,6 +538,10 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse)
   }
   if (request.method === "POST" && pathname === "/relaunch") {
     await handleRelaunch(request, response)
+    return
+  }
+  if (request.method === "POST" && pathname === "/interrupt") {
+    await handleInterrupt(request, response)
     return
   }
   if (request.method === "POST" && pathname === "/end") {

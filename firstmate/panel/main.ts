@@ -359,10 +359,10 @@ function prLink(card: BoardCard): HTMLElement {
 
 // Card actions: Watch opens the worker session in the host; Steer and
 // Relaunch relay through the service (the coordinator owns the backlog and
-// the relaunch itself); End archives the card in extension state — the
-// session and worktree are left exactly as they are. Feedback stays local to
-// the card; the board refetch after the request settles carries any state
-// change.
+// the relaunch itself); Interrupt asks the service to stop the worker's
+// current turn; End archives the card in extension state — the session and
+// worktree are left exactly as they are. Feedback stays local to the card;
+// the board refetch after the request settles carries any state change.
 type ActionFeedback = (message: string) => void
 
 function actionFeedback(): { element: HTMLElement; say: ActionFeedback } {
@@ -370,9 +370,9 @@ function actionFeedback(): { element: HTMLElement; say: ActionFeedback } {
   return { element, say: (message) => { element.textContent = message } }
 }
 
-async function runCardAction(pathname: string, body: Record<string, string>, say: ActionFeedback, successMessage: string): Promise<void> {
+async function runCardAction(pathname: string, body: Record<string, string>, say: ActionFeedback, successMessage: string): Promise<{ status: number }> {
   const registration = activeRegistration
-  if (registration === null) return
+  if (registration === null) return { status: 0 }
   try {
     const result = await host.serviceRequest({
       method: "POST",
@@ -387,13 +387,15 @@ async function runCardAction(pathname: string, body: Record<string, string>, say
     }
     if (result.status !== 200) {
       say(parsed.error ?? `The action failed (status ${result.status}).`)
-      return
+      return { status: result.status }
     }
     // A 200 with a warning still succeeded (e.g. the steer reached the worker
     // but the coordinator could not be told); the captain sees the caveat.
     say(parsed.warning ?? successMessage)
+    return { status: result.status }
   } catch {
     say("The service is unreachable.")
+    return { status: 0 }
   } finally {
     void fetchBoard()
   }
@@ -402,8 +404,38 @@ async function runCardAction(pathname: string, body: Record<string, string>, say
 function cardActions(card: BoardCard): HTMLElement {
   const row = document.createElement("div")
   const { element, say } = actionFeedback()
-  row.append(watchButton(card), steerControl(card, say), relaunchControl(card, say), endButton(card, say), element)
+  row.append(watchButton(card), interruptButton(card, say), steerControl(card, say), relaunchControl(card, say), endButton(card, say), element)
   return row
+}
+
+// Interrupt rides a private-surface workaround (the managed opencode
+// server's own abort call); hosts that do not offer it answer 501. Those
+// session ids are remembered here so Interrupt stays disabled for the rest
+// of the panel session — local DOM state on purpose: host capability is not
+// board state, and the reducer does not model it.
+const interruptUnsupportedSessions = new Set<string>()
+
+function interruptButton(card: BoardCard, say: ActionFeedback): HTMLElement {
+  const button = document.createElement("button")
+  button.textContent = "Interrupt"
+  button.disabled = card.sessionId === undefined || interruptUnsupportedSessions.has(card.sessionId)
+  button.addEventListener("click", () => {
+    const sessionId = card.sessionId
+    if (sessionId === undefined) return
+    button.disabled = true
+    void runCardAction("/interrupt", { sessionId }, say, "Interrupt sent.").then((result) => {
+      if (result.status === 501) {
+        // Plain copy, no weaker substitute dressed up as equivalent: the
+        // extension contract does not expose interrupt and this host
+        // offered no fallback path.
+        interruptUnsupportedSessions.add(sessionId)
+        say("Interrupt is not exposed by OpenChamber's extension contract, and this host did not offer the fallback path.")
+        return
+      }
+      button.disabled = false
+    })
+  })
+  return button
 }
 
 function watchButton(card: BoardCard): HTMLElement {

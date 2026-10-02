@@ -108,13 +108,22 @@ function extractSessionId(parsed: unknown): string | undefined {
   return undefined
 }
 
-// The `session status --json` shape is not yet runtime-verified either; the
-// verified fact is that the status carries a type. Accept the common activity
-// keys and default to `unknown` for anything unrecognized.
+// Runtime-verified shapes (openchamber CLI, captured 2026-10-02):
+// - `session status --json` → {"status":"ok","sessionId":"…","directory":"…","sessionStatus":{"type":"busy"}} — type is ONLY "busy" or "idle" (the control service maps active→busy, idle→idle; no other values ever appear).
+// - `session messages --last-assistant --json` → the same envelope plus "messages":[{"id":"…","role":"assistant","createdAt":…,"completedAt":…,"model":"…","text":"…"}].
+// Read the nested sessionStatus record first; the top-level key scan stays as
+// fallback for other host classes. A top-level "status":"ok" is ignored
+// because it is not a known activity.
 const knownActivities: readonly SessionActivity[] = ["unknown", "idle", "running", "retrying", "waiting-permission", "waiting-question"]
 
 function extractActivity(parsed: unknown): SessionActivity {
   if (!isRecord(parsed)) return "unknown"
+  const nested = parsed.sessionStatus
+  if (isRecord(nested) && typeof nested.type === "string") {
+    if (nested.type === "busy") return "running"
+    if (nested.type === "idle") return "idle"
+    if ((knownActivities as readonly string[]).includes(nested.type)) return nested.type as SessionActivity
+  }
   for (const key of ["type", "activity", "status"]) {
     const value = parsed[key]
     if (typeof value === "string" && (knownActivities as readonly string[]).includes(value)) {
@@ -131,11 +140,17 @@ function extractOutcome(parsed: unknown): SessionOutcome {
   return null
 }
 
-// The `session messages --last-assistant --json` shape is not yet
-// runtime-verified; accept the common text keys until it is.
+// Runtime-verified shape (openchamber CLI, captured 2026-10-02):
+// `session messages --last-assistant --json` → {"status":"ok","sessionId":"…","directory":"…","role":"assistant","sessionStatus":{"type":"idle"},"messages":[{"id":"…","role":"assistant","createdAt":…,"completedAt":…,"model":"…","text":"…"}]}
+// — assistant text is messages[0].text. The older top-level text keys stay as
+// fallback for other host classes.
 function extractAssistantText(parsed: unknown): string | undefined {
   if (typeof parsed === "string") return parsed === "" ? undefined : parsed
   if (!isRecord(parsed)) return undefined
+  if (Array.isArray(parsed.messages)) {
+    const first = parsed.messages[0]
+    if (isRecord(first) && typeof first.text === "string" && first.text !== "") return first.text
+  }
   for (const key of ["text", "content", "message"]) {
     const value = parsed[key]
     if (typeof value === "string" && value !== "") return value

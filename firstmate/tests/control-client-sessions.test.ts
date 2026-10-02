@@ -45,6 +45,20 @@ describe("sessionStatus", () => {
     ])
   })
 
+  test("parses the runtime-verified shape: nested sessionStatus busy/idle", async () => {
+    const busy = fakeExec('{"status":"ok","sessionId":"ses_11bb","directory":"/repos/sunrise","sessionStatus":{"type":"busy"}}')
+    expect(await sessionStatus(busy.exec, { sessionId: "ses_11bb", directory: "/repos/sunrise" })).toEqual({
+      activity: "running",
+      outcome: null,
+    })
+
+    const idle = fakeExec('{"status":"ok","sessionId":"s","directory":"/d","sessionStatus":{"type":"idle"}}')
+    expect(await sessionStatus(idle.exec, { sessionId: "s", directory: "/d" })).toEqual({
+      activity: "idle",
+      outcome: null,
+    })
+  })
+
   test("parses the known activity values and a failed outcome", async () => {
     for (const activity of ["unknown", "idle", "running", "retrying", "waiting-permission", "waiting-question"] as const) {
       const { exec } = fakeExec(JSON.stringify({ type: activity, outcome: activity === "idle" ? "failed" : null }))
@@ -88,6 +102,13 @@ describe("sessionMessagesLastAssistant", () => {
     expect(calls).toEqual([
       { command: "openchamber", args: ["session", "messages", "--session", "ses_11bb", "--dir", "/repos/sunrise", "--last-assistant", "--json"] },
     ])
+  })
+
+  test("extracts messages[0].text from the runtime-verified shape", async () => {
+    const { exec } = fakeExec(
+      '{"status":"ok","sessionId":"s","directory":"/d","role":"assistant","sessionStatus":{"type":"idle"},"messages":[{"id":"msg_1","role":"assistant","createdAt":1,"completedAt":2,"model":"test-model","text":"acknowledged"}]}',
+    )
+    expect(await sessionMessagesLastAssistant(exec, { sessionId: "s", directory: "/d" })).toBe("acknowledged")
   })
 
   test("answers undefined when the output carries no assistant text", async () => {

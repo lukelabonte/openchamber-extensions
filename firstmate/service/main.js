@@ -79,6 +79,15 @@ var knownActivities = ["unknown", "idle", "running", "retrying", "waiting-permis
 function extractActivity(parsed) {
   if (!isRecord(parsed))
     return "unknown";
+  const nested = parsed.sessionStatus;
+  if (isRecord(nested) && typeof nested.type === "string") {
+    if (nested.type === "busy")
+      return "running";
+    if (nested.type === "idle")
+      return "idle";
+    if (knownActivities.includes(nested.type))
+      return nested.type;
+  }
   for (const key of ["type", "activity", "status"]) {
     const value = parsed[key];
     if (typeof value === "string" && knownActivities.includes(value)) {
@@ -100,6 +109,11 @@ function extractAssistantText(parsed) {
     return parsed === "" ? undefined : parsed;
   if (!isRecord(parsed))
     return;
+  if (Array.isArray(parsed.messages)) {
+    const first = parsed.messages[0];
+    if (isRecord(first) && typeof first.text === "string" && first.text !== "")
+      return first.text;
+  }
   for (const key of ["text", "content", "message"]) {
     const value = parsed[key];
     if (typeof value === "string" && value !== "")
@@ -855,7 +869,9 @@ ${sessionId}`;
       events.push(emit("waiting-question"));
     if (activity === "waiting-permission" && previous?.status.activity !== "waiting-permission")
       events.push(emit("waiting-permission"));
-    if (outcome === "completed" && previous?.status.outcome !== "completed")
+    const outcomeFinished = outcome === "completed" && previous?.status.outcome !== "completed";
+    const idleFinished = activity === "idle" && previous?.status.activity === "running";
+    if (outcomeFinished || idleFinished)
       events.push(emit("finished"));
     return events;
   }
@@ -895,7 +911,7 @@ function composeNotification(registration, events) {
 function describeEvent(event) {
   switch (event.kind) {
     case "finished":
-      return "finished its turn (outcome: completed). Review the work and mark the task Done when satisfied — completed never means Done.";
+      return "finished its turn and is idle now. Review the work and mark the task Done when satisfied — a finished turn never means Done.";
     case "failed":
       return "failed (outcome: failed).";
     case "waiting-question":

@@ -163,7 +163,15 @@ export function createSupervisionPoller(input: {
     if (outcome === "failed" && previous?.status.outcome !== "failed") events.push(emit("failed"))
     if (activity === "waiting-question" && previous?.status.activity !== "waiting-question") events.push(emit("waiting-question"))
     if (activity === "waiting-permission" && previous?.status.activity !== "waiting-permission") events.push(emit("waiting-permission"))
-    if (outcome === "completed" && previous?.status.outcome !== "completed") events.push(emit("finished"))
+    // The verified host class reports only busy/idle (mapped to running/idle
+    // here) and exposes no outcome field, so "finished" must also fire on the
+    // running→idle transition; waiting-* and outcome-based "failed" can only
+    // fire on host classes that report richer statuses. The two detections
+    // share one emit so a transition alongside a completed outcome reports
+    // exactly once.
+    const outcomeFinished = outcome === "completed" && previous?.status.outcome !== "completed"
+    const idleFinished = activity === "idle" && previous?.status.activity === "running"
+    if (outcomeFinished || idleFinished) events.push(emit("finished"))
     return events
   }
 
@@ -210,7 +218,7 @@ function composeNotification(registration: Registration, events: WorkerEvent[]):
 function describeEvent(event: WorkerEvent): string {
   switch (event.kind) {
     case "finished":
-      return "finished its turn (outcome: completed). Review the work and mark the task Done when satisfied — completed never means Done."
+      return "finished its turn and is idle now. Review the work and mark the task Done when satisfied — a finished turn never means Done."
     case "failed":
       return "failed (outcome: failed)."
     case "waiting-question":

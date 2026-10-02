@@ -149,6 +149,80 @@ describe("createSupervisionPoller", () => {
     expect(round.notifications[0].message).toContain("Done")
   })
 
+  test("a running→idle transition emits exactly one finished event", async () => {
+    const filesystem = new InMemoryFileSystem()
+    seedRegistry(filesystem)
+    seedBacklog(filesystem, ["- Fix flaky login test", "  state: Working", "  session: ses_11bb"].join("\n"))
+    let type = "busy"
+    const { exec } = scriptExec((args) =>
+      subcommand(args) === "status" ? JSON.stringify({ status: "ok", sessionStatus: { type } }) : '{"text":"the last word"}',
+    )
+
+    const poller = makePoller({ filesystem: filesystem.port, exec })
+    const runningRound = await poller.poll()
+    expect(runningRound.notifications).toEqual([])
+
+    type = "idle"
+    const idleRound = await poller.poll()
+
+    expect(idleRound.notifications).toHaveLength(1)
+    const message = idleRound.notifications[0].message
+    expect(message).toContain("finished its turn")
+    expect(message.split("finished its turn")).toHaveLength(2)
+  })
+
+  test("an idle→idle poll emits no finished event", async () => {
+    const filesystem = new InMemoryFileSystem()
+    seedRegistry(filesystem)
+    seedBacklog(filesystem, ["- Fix flaky login test", "  state: Working", "  session: ses_11bb"].join("\n"))
+    const { exec } = statusExec("idle")
+
+    const poller = makePoller({ filesystem: filesystem.port, exec })
+    const firstRound = await poller.poll()
+    const secondRound = await poller.poll()
+
+    expect(firstRound.notifications).toEqual([])
+    expect(secondRound.notifications).toEqual([])
+  })
+
+  test("a first-sight running observation stays quiet until the idle transition", async () => {
+    const filesystem = new InMemoryFileSystem()
+    seedRegistry(filesystem)
+    seedBacklog(filesystem, ["- Fix flaky login test", "  state: Working", "  session: ses_11bb"].join("\n"))
+    let type = "running"
+    const { exec } = scriptExec((args) =>
+      subcommand(args) === "status" ? JSON.stringify({ type }) : '{"text":"the last word"}',
+    )
+
+    const poller = makePoller({ filesystem: filesystem.port, exec })
+    const runningRound = await poller.poll()
+    expect(runningRound.notifications).toEqual([])
+
+    type = "idle"
+    const idleRound = await poller.poll()
+    expect(idleRound.notifications).toHaveLength(1)
+    expect(idleRound.notifications[0].message).toContain("finished its turn")
+  })
+
+  test("a running→idle transition alongside a completed outcome does not double-emit", async () => {
+    const filesystem = new InMemoryFileSystem()
+    seedRegistry(filesystem)
+    seedBacklog(filesystem, ["- Fix flaky login test", "  state: Working", "  session: ses_11bb"].join("\n"))
+    let poll = 0
+    const { exec } = scriptExec((args) =>
+      subcommand(args) === "status" ? (poll++ === 0 ? '{"type":"running"}' : '{"type":"idle","outcome":"completed"}') : '{"text":"the last word"}',
+    )
+
+    const poller = makePoller({ filesystem: filesystem.port, exec })
+    await poller.poll()
+
+    const round = await poller.poll()
+    expect(round.notifications).toHaveLength(1)
+    const message = round.notifications[0].message
+    expect(message).toContain("finished its turn")
+    expect(message.split("finished its turn")).toHaveLength(2)
+  })
+
   test("detects a failed worker", async () => {
     const filesystem = new InMemoryFileSystem()
     seedRegistry(filesystem)

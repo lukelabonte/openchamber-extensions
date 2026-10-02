@@ -37,6 +37,7 @@ beforeAll(async () => {
       "  send)",
       '    case "$*" in',
       "      *FAILCOORD*) echo 'no such session' >&2; exit 1 ;;",
+      "      *SLOWSEND*) sleep 1; echo '{\"ok\":true}' ;;",
       "      *) echo '{\"ok\":true}' ;;",
       "    esac ;;",
       "  *) echo '{\"ok\":true}' ;;",
@@ -229,6 +230,25 @@ describe("POST /suggestion/send", () => {
     expect(readFileSync(suggestionsPath, "utf8")).toContain(failingLabel)
   })
 
+  test("a duplicated label is rejected with 409 before anything is sent or removed", async () => {
+    writeFileSync(
+      suggestionsPath,
+      ["- Twice :: first copy", "- Twice :: second copy", "- Keep me :: still wanted", ""].join("\n"),
+    )
+
+    const response = await post("/suggestion/send", { slug: "sunrise", label: "Twice" })
+
+    // An ambiguous label must never resolve to "whichever entry came first":
+    // nothing reaches the coordinator and neither line leaves the file.
+    expect(response.status).toBe(409)
+    expect(shimSendsContaining("first copy")).toEqual([])
+    expect(shimSendsContaining("second copy")).toEqual([])
+    const onDisk = readFileSync(suggestionsPath, "utf8")
+    expect(onDisk).toContain("- Twice :: first copy")
+    expect(onDisk).toContain("- Twice :: second copy")
+    expect(onDisk).toContain("- Keep me :: still wanted")
+  })
+
   test("answers 404 for an unknown slug and an unknown label, 400 on missing fields", async () => {
     const unknownSlug = await post("/suggestion/send", { slug: "elsewhere", label: "any" })
     expect(unknownSlug.status).toBe(404)
@@ -262,6 +282,21 @@ describe("POST /suggestion/dismiss", () => {
     expect(onDisk).not.toContain("Old idea")
     // Nothing was sent to the coordinator between the dismissal and before.
     expect(shimLogLines().length).toBe(sendsBefore)
+  })
+
+  test("a duplicated label is rejected with 409 and removes nothing", async () => {
+    writeFileSync(
+      suggestionsPath,
+      ["- Twice :: first copy", "- Twice :: second copy", "- Keep me :: still wanted", ""].join("\n"),
+    )
+
+    const response = await post("/suggestion/dismiss", { slug: "sunrise", label: "Twice" })
+
+    expect(response.status).toBe(409)
+    const onDisk = readFileSync(suggestionsPath, "utf8")
+    expect(onDisk).toContain("- Twice :: first copy")
+    expect(onDisk).toContain("- Twice :: second copy")
+    expect(onDisk).toContain("- Keep me :: still wanted")
   })
 
   test("answers 404 for an unknown slug and an unknown label, 400 on missing fields", async () => {
@@ -302,5 +337,51 @@ describe("POST /command", () => {
     expect(unknownSlug.status).toBe(404)
     const noToken = await post("/command", { slug: "sunrise", command: "bearings" }, { "content-type": "application/json" })
     expect(noToken.status).toBe(401)
+  })
+})
+
+// Concurrency: a suggestion action holds the project for its whole flight —
+// the shim stalls the coordinator send for one bounded second (after logging
+// the call), so a second action fired while the first is still pending must
+// be refused with 409 instead of double-sending or double-removing. Each
+// test counts its own unique full marker: the shim log persists for the
+// whole file, so the shared "SLOWSEND" prefix would leak between tests.
+async function waitForPendingSend(uniqueMarker: string): Promise<void> {
+  const deadline = Date.now() + 500
+  while (Date.now() < deadline) {
+    if (shimSendsContaining(uniqueMarker).length > 0) return
+    await new Promise((resolve) => setTimeout(resolve, 10))
+  }
+  throw new Error(`the shim never started the send containing "${uniqueMarker}" within 500ms`)
+}
+
+describe("concurrent suggestion actions", () => {
+  test("a second concurrent send for the same label is refused with 409 instead of sending twice", async () => {
+    writeFileSync(suggestionsPath, "- Take a breath :: SLOWSEND one copy only\n")
+
+    const [first, second] = await Promise.all([
+      post("/suggestion/send", { slug: "sunrise", label: "Take a breath" }),
+      post("/suggestion/send", { slug: "sunrise", label: "Take a breath" }),
+    ])
+
+    expect([first.status, second.status].sort()).toEqual([200, 409])
+    expect(shimSendsContaining("SLOWSEND one copy only")).toHaveLength(1)
+    expect(readFileSync(suggestionsPath, "utf8")).not.toContain("Take a breath")
+  })
+
+  test("a dismiss fired while a send is pending is refused with 409", async () => {
+    writeFileSync(suggestionsPath, "- One at a time :: SLOWSEND single flight\n")
+
+    // Start the send first and wait until the shim has logged it — the log
+    // line lands before the shim's bounded 1s delay, so the exec call is
+    // provably in flight and the dismiss posted next is unambiguously second.
+    const send = post("/suggestion/send", { slug: "sunrise", label: "One at a time" })
+    await waitForPendingSend("SLOWSEND single flight")
+    const dismiss = await post("/suggestion/dismiss", { slug: "sunrise", label: "One at a time" })
+    const sendResponse = await send
+
+    expect(sendResponse.status).toBe(200)
+    expect(dismiss.status).toBe(409)
+    expect(shimSendsContaining("SLOWSEND single flight")).toHaveLength(1)
   })
 })

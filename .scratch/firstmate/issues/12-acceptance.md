@@ -16,3 +16,7 @@
 - [ ] Proof the coordinator performed no repository write at any point; all its writes confined to its home
 - [ ] Runtime-verify: the poller's `session status --dir <projectDirectory>` resolves worker sessions that live in worktrees of the project; if the control service scopes by exact directory only, switch the poller to the worker's worktree directory
 - [ ] If ticket 08 found no supported interrupt path: the report names the capability, the evidence, and the workaround state instead
+
+### Recovery checkpoint, 2026-10-01
+
+Status is still **blocked** overall: runtime diagnosis found write/edit effects lagging 2m51s to 5m8s inside the bundled opencode v2.0.21 server, with the internal cause unresolved. Validation observed so far is green: the focused 90-pass / 0-fail run, the full suite (`bun test --timeout 60000 tests/`: 308 pass, 0 fail, 776 expects, 35 files, 79.72s), and the build (`sh scripts/build`) all exited 0. Code fixes for landing warnings, duplicate-label 409s, per-project busy guards, send-success-with-warning, and panel action feedback are uncommitted edits in the tree. The full report is at [`recovery-report.html`](../recovery-report.html). The checkboxes above stay unchecked and this ticket stays `ready-for-agent`; nothing in this recovery counts as acceptance evidence.

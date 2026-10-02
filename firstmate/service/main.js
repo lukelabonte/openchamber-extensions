@@ -1024,6 +1024,15 @@ async function removeSuggestion(filesystem, filePath, label) {
   await filesystem.writeFile(filePath, kept.join(`
 `));
 }
+async function sendSuggestion(filesystem, filePath, suggestion, send) {
+  await send(suggestion.text);
+  try {
+    await removeSuggestion(filesystem, filePath, suggestion.label);
+  } catch {
+    return { sent: true, warning: `the suggestion was sent to the coordinator, but its line could not be removed from ${filePath}` };
+  }
+  return { sent: true };
+}
 
 // service/watch-schedule.ts
 class ScheduleParseError extends Error {
@@ -1954,7 +1963,8 @@ async function handleShipping(url, response) {
     respondJson(response, 200, {
       mode: shipping.mode,
       yolo: shipping.yolo,
-      landings: landings.records.slice(-20)
+      landings: landings.records.slice(-20),
+      landingErrors: landings.errors.map((error) => `line ${error.line}: ${error.message}`)
     });
   } catch (error) {
     respondJson(response, 500, { error: error instanceof Error ? error.message : "shipping read failed" });
@@ -1965,7 +1975,12 @@ async function resolveSuggestion(slug, label) {
   if (!Object.hasOwn(registrations, slug))
     return { kind: "unknown-slug" };
   const suggestions = await loadSuggestions(nodeFileSystem, suggestionsPath(homeRoot, slug));
-  const suggestion = suggestions.find((candidate) => candidate.label === label);
+  const matches = suggestions.filter((candidate) => candidate.label === label);
+  if (matches.length === 0)
+    return { kind: "unknown-label" };
+  if (matches.length > 1)
+    return { kind: "duplicate-label" };
+  const suggestion = matches[0];
   return suggestion === undefined ? { kind: "unknown-label" } : { kind: "found", registration: registrations[slug], suggestion };
 }
 async function handleSuggestions(url, response) {
@@ -1986,12 +2001,23 @@ async function handleSuggestions(url, response) {
     respondJson(response, 500, { error: error instanceof Error ? error.message : "suggestions read failed" });
   }
 }
+var busySuggestionProjects = new Set;
+function acquireSuggestionProject(slug) {
+  if (busySuggestionProjects.has(slug))
+    return false;
+  busySuggestionProjects.add(slug);
+  return true;
+}
 async function handleSuggestionSend(request, response) {
   const payload = await readJsonRecord(request);
   const slug = recordString(payload, "slug");
   const label = recordString(payload, "label");
   if (slug === undefined || label === undefined) {
     respondJson(response, 400, { error: "slug and label must be non-empty strings" });
+    return;
+  }
+  if (!acquireSuggestionProject(slug)) {
+    respondJson(response, 409, { error: `another suggestion action for ${slug} is still in flight` });
     return;
   }
   try {
@@ -2004,18 +2030,23 @@ async function handleSuggestionSend(request, response) {
       respondJson(response, 404, { error: `no suggestion labeled "${label}" on ${slug}'s suggestions.md` });
       return;
     }
-    await sendCoordinatorMessage({
+    if (context.kind === "duplicate-label") {
+      respondJson(response, 409, { error: `the label "${label}" appears more than once in ${slug}'s suggestions.md` });
+      return;
+    }
+    const outcome = await sendSuggestion(nodeFileSystem, suggestionsPath(homeRoot, slug), context.suggestion, (text) => sendCoordinatorMessage({
       exec: nodeExec,
       coordinator: {
         sessionId: context.registration.coordinatorSessionId,
         directory: context.registration.homeDirectory
       },
-      text: context.suggestion.text
-    });
-    await removeSuggestion(nodeFileSystem, suggestionsPath(homeRoot, slug), label);
-    respondJson(response, 200, { sent: true });
+      text
+    }));
+    respondJson(response, 200, outcome);
   } catch (error) {
     respondActionError(response, error, "suggestion send failed");
+  } finally {
+    busySuggestionProjects.delete(slug);
   }
 }
 async function handleSuggestionDismiss(request, response) {
@@ -2026,6 +2057,10 @@ async function handleSuggestionDismiss(request, response) {
     respondJson(response, 400, { error: "slug and label must be non-empty strings" });
     return;
   }
+  if (!acquireSuggestionProject(slug)) {
+    respondJson(response, 409, { error: `another suggestion action for ${slug} is still in flight` });
+    return;
+  }
   try {
     const context = await resolveSuggestion(slug, label);
     if (context.kind === "unknown-slug") {
@@ -2036,10 +2071,16 @@ async function handleSuggestionDismiss(request, response) {
       respondJson(response, 404, { error: `no suggestion labeled "${label}" on ${slug}'s suggestions.md` });
       return;
     }
+    if (context.kind === "duplicate-label") {
+      respondJson(response, 409, { error: `the label "${label}" appears more than once in ${slug}'s suggestions.md` });
+      return;
+    }
     await removeSuggestion(nodeFileSystem, suggestionsPath(homeRoot, slug), label);
     respondJson(response, 200, { dismissed: true });
   } catch (error) {
     respondJson(response, 500, { error: error instanceof Error ? error.message : "suggestion dismiss failed" });
+  } finally {
+    busySuggestionProjects.delete(slug);
   }
 }
 var commandPrompts = {

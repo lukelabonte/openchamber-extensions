@@ -41,3 +41,29 @@ export async function removeSuggestion(filesystem: FileSystemPort, filePath: str
   })
   await filesystem.writeFile(filePath, kept.join("\n"))
 }
+
+export interface SuggestionSendOutcome {
+  sent: true
+  warning?: string
+}
+
+// The send-then-remove composition behind POST /suggestion/send, with the
+// filesystem and the send injected so tests can fail either side. A rejected
+// send propagates unchanged — the line stays on disk, ready to press again —
+// while a failed removal after a successful send is downgraded to a warning:
+// the coordinator already has the message, so the captain must not be told to
+// press it a second time.
+export async function sendSuggestion(
+  filesystem: FileSystemPort,
+  filePath: string,
+  suggestion: Suggestion,
+  send: (text: string) => Promise<void>,
+): Promise<SuggestionSendOutcome> {
+  await send(suggestion.text)
+  try {
+    await removeSuggestion(filesystem, filePath, suggestion.label)
+  } catch {
+    return { sent: true, warning: `the suggestion was sent to the coordinator, but its line could not be removed from ${filePath}` }
+  }
+  return { sent: true }
+}

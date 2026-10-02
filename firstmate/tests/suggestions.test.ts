@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import { InMemoryFileSystem } from "./helpers/in-memory-file-system"
-import { loadSuggestions, parseSuggestions, removeSuggestion, suggestionsPath } from "../service/suggestions"
+import { loadSuggestions, parseSuggestions, removeSuggestion, sendSuggestion, suggestionsPath } from "../service/suggestions"
+import type { FileSystemPort } from "../service/file-system"
 
 const onDisk = [
   "# Suggestions",
@@ -34,6 +35,16 @@ describe("parseSuggestions", () => {
     // Strict markdown form: only `- ` bullets carry the `::` separator; a
     // dash without the space is prose, not a suggestion line.
     expect(parsed).toEqual([])
+  })
+
+  test("surfaces duplicate labels as separate entries for the service layer to reject", () => {
+    // The parse stays raw: both lines with the same label come through, so
+    // the service can see the ambiguity and refuse the action with 409
+    // instead of silently resolving to whichever entry came first.
+    expect(parseSuggestions(["- Twice :: first copy", "- Twice :: second copy"].join("\n"))).toEqual([
+      { label: "Twice", text: "first copy" },
+      { label: "Twice", text: "second copy" },
+    ])
   })
 })
 
@@ -92,6 +103,74 @@ describe("removeSuggestion", () => {
     const filesystem = new InMemoryFileSystem()
     await removeSuggestion(filesystem.port, "/home/projects/sunrise/suggestions.md", "any")
     expect(await loadSuggestions(filesystem.port, "/home/projects/sunrise/suggestions.md")).toEqual([])
+  })
+})
+
+describe("sendSuggestion", () => {
+  const target = { label: "Bump the CI timeout", text: "bump the CI timeout to 20 minutes" }
+
+  test("sends exactly once and removes only the target line, keeping the rest byte-for-byte", async () => {
+    const filesystem = new InMemoryFileSystem()
+    const filePath = "/home/projects/sunrise/suggestions.md"
+    filesystem.seedFile(filePath, onDisk)
+    const sentTexts: string[] = []
+
+    const outcome = await sendSuggestion(filesystem.port, filePath, target, async (text) => {
+      sentTexts.push(text)
+    })
+
+    expect(outcome).toEqual({ sent: true })
+    expect(sentTexts).toEqual(["bump the CI timeout to 20 minutes"])
+    expect(parseSuggestions(filesystem.fileContents(filePath))).toEqual([
+      { label: "Update the PR description", text: "please refresh the pull-request description with the final summary" },
+    ])
+    expect(filesystem.fileContents(filePath)).toContain("Prose the coordinator keeps around.")
+  })
+
+  test("a rejected send propagates and leaves the file untouched", async () => {
+    const filesystem = new InMemoryFileSystem()
+    const filePath = "/home/projects/sunrise/suggestions.md"
+    filesystem.seedFile(filePath, onDisk)
+
+    await expect(
+      sendSuggestion(filesystem.port, filePath, target, async () => {
+        throw new Error("no such session")
+      }),
+    ).rejects.toThrow("no such session")
+
+    // Nothing was removed: the suggestion is ready to press again.
+    expect(parseSuggestions(filesystem.fileContents(filePath))).toEqual([
+      { label: "Update the PR description", text: "please refresh the pull-request description with the final summary" },
+      { label: "Bump the CI timeout", text: "bump the CI timeout to 20 minutes" },
+    ])
+  })
+
+  test("a failed removal after a successful send answers sent with a warning, never a retry claim", async () => {
+    const filesystem = new InMemoryFileSystem()
+    const filePath = "/home/projects/sunrise/suggestions.md"
+    filesystem.seedFile(filePath, onDisk)
+    // The shared in-memory port with only the write overridden: the remove's
+    // readFile succeeds, its writeFile is what fails — no real-disk tricks.
+    const rejectingWrite: FileSystemPort = {
+      ...filesystem.port,
+      writeFile: async () => {
+        throw new Error("EACCES: permission denied")
+      },
+    }
+    let sendCount = 0
+
+    const outcome = await sendSuggestion(rejectingWrite, filePath, target, async () => {
+      sendCount += 1
+    })
+
+    // The coordinator already has the message, so the answer must not throw
+    // and must not deny the send — it reports the leftover line as a warning.
+    expect(outcome.sent).toBe(true)
+    expect(typeof outcome.warning).toBe("string")
+    expect(outcome.warning?.includes(filePath)).toBe(true)
+    expect(sendCount).toBe(1)
+    // The line could not leave the file.
+    expect(filesystem.fileContents(filePath)).toContain("Bump the CI timeout")
   })
 })
 

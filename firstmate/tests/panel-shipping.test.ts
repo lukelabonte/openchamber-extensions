@@ -22,12 +22,67 @@ function registeredState() {
   )
 }
 
+const landing = {
+  task: "Ship login",
+  commit: "1a2b3c4d",
+  ci: "green",
+  mode: "reviewed-PR+yolo",
+  authorization: "+yolo",
+  landedAt: "2026-10-01T10:00:00.000Z",
+}
+
 describe("parseShipping", () => {
-  test("parses a well-formed payload, landings included", () => {
+  test("parses a well-formed payload, landings and landing errors included", () => {
     expect(
-      parseShipping({ mode: "reviewed-PR", yolo: true, landings: [{ task: "Ship login" }] }),
-    ).toEqual({ mode: "reviewed-PR", yolo: true })
-    expect(parseShipping({ mode: null, yolo: false })).toEqual({ mode: null, yolo: false })
+      parseShipping({
+        mode: "reviewed-PR",
+        yolo: true,
+        landings: [landing],
+        landingErrors: ["line 9: the entry \"Broken entry\" has no ci line"],
+      }),
+    ).toEqual({
+      mode: "reviewed-PR",
+      yolo: true,
+      landings: [landing],
+      landingErrors: ["line 9: the entry \"Broken entry\" has no ci line"],
+    })
+  })
+
+  test("a payload without the landing fields keeps the badge and defaults the lists to empty", () => {
+    expect(parseShipping({ mode: "reviewed-PR", yolo: true })).toEqual({
+      mode: "reviewed-PR",
+      yolo: true,
+      landings: [],
+      landingErrors: [],
+    })
+    expect(parseShipping({ mode: null, yolo: false })).toEqual({ mode: null, yolo: false, landings: [], landingErrors: [] })
+  })
+
+  test("carries an optional pr url through when the service row already has one", () => {
+    const row = { ...landing, pr: "https://example.com/pull/7" }
+    const parsed = parseShipping({ mode: "direct-PR", yolo: false, landings: [row] })
+    expect(parsed?.landings).toEqual([row])
+  })
+
+  test("drops malformed landing rows and non-string errors without misleading data", () => {
+    const parsed = parseShipping({
+      mode: "direct-PR",
+      yolo: false,
+      landings: [
+        "not an object",
+        null,
+        { task: "no fields" },
+        { ...landing, commit: 7 },
+        landing,
+      ],
+      landingErrors: ["line 9: the entry \"Broken entry\" has no ci line", 7, null, { line: 2, message: "not a string" }],
+    })
+    expect(parsed).toEqual({
+      mode: "direct-PR",
+      yolo: false,
+      landings: [landing],
+      landingErrors: ["line 9: the entry \"Broken entry\" has no ci line"],
+    })
   })
 
   test("a malformed payload yields no badge", () => {
@@ -57,6 +112,27 @@ describe("panel shipping state", () => {
       shipping: { mode: "local-only", yolo: false },
     })
     expect(state).toMatchObject({ kind: "registered", shipping: { mode: "local-only", yolo: false } })
+  })
+
+  test("a loaded shipping payload keeps its landing rows and parse errors", () => {
+    const state = reduceAll(registeredState(), {
+      type: "shipping-loaded",
+      shipping: {
+        mode: "direct-PR",
+        yolo: false,
+        landings: [landing],
+        landingErrors: ["line 9: the entry \"Broken entry\" has no ci line"],
+      },
+    })
+    expect(state).toMatchObject({
+      kind: "registered",
+      shipping: {
+        mode: "direct-PR",
+        yolo: false,
+        landings: [landing],
+        landingErrors: ["line 9: the entry \"Broken entry\" has no ci line"],
+      },
+    })
   })
 
   test("shipping events are ignored while the project is not registered", () => {

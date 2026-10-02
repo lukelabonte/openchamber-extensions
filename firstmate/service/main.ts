@@ -18,7 +18,7 @@ import { provisionProject } from "./provision"
 import { findRegistration, loadRegistry, type Registration } from "./registry"
 import { loadLandingRecords } from "./landing-record"
 import { parseShippingMode } from "./shipping-mode"
-import { loadSuggestions, removeSuggestion, suggestionsPath, type Suggestion } from "./suggestions"
+import { loadSuggestions, removeSuggestion, sendSuggestion, suggestionsPath, type Suggestion } from "./suggestions"
 import { createWatchRunner, type WatchExecPort } from "./watches"
 
 const rawServicePort = process.env.OPENCHAMBER_SERVICE_PORT
@@ -687,6 +687,7 @@ async function handleShipping(url: URL, response: ServerResponse): Promise<void>
       mode: shipping.mode,
       yolo: shipping.yolo,
       landings: landings.records.slice(-20),
+      landingErrors: landings.errors.map((error) => `line ${error.line}: ${error.message}`),
     })
   } catch (error) {
     respondJson(response, 500, { error: error instanceof Error ? error.message : "shipping read failed" })
@@ -704,12 +705,18 @@ async function resolveSuggestion(
 ): Promise<
   | { kind: "unknown-slug" }
   | { kind: "unknown-label" }
+  | { kind: "duplicate-label" }
   | { kind: "found"; registration: Registration; suggestion: Suggestion }
 > {
   const registrations = await loadRegistry(nodeFileSystem, homeRoot)
   if (!Object.hasOwn(registrations, slug)) return { kind: "unknown-slug" }
   const suggestions = await loadSuggestions(nodeFileSystem, suggestionsPath(homeRoot, slug))
-  const suggestion = suggestions.find((candidate) => candidate.label === label)
+  const matches = suggestions.filter((candidate) => candidate.label === label)
+  if (matches.length === 0) return { kind: "unknown-label" }
+  // An ambiguous label must never resolve to "whichever entry came first";
+  // both lines stay and the action is refused.
+  if (matches.length > 1) return { kind: "duplicate-label" }
+  const suggestion = matches[0]
   return suggestion === undefined
     ? { kind: "unknown-label" }
     : { kind: "found", registration: registrations[slug], suggestion }
@@ -734,12 +741,31 @@ async function handleSuggestions(url: URL, response: ServerResponse): Promise<vo
   }
 }
 
+// One suggestion action per project at a time, shared by send and dismiss and
+// taken before the async resolve: a second action while one is in flight is
+// refused with 409 instead of double-sending or racing the file rewrite.
+// Projects are independent, the map entry lives only for the action's flight,
+// and the guard only serializes this service's own actions — an external
+// writer (the coordinator) can still rewrite suggestions.md between the
+// service's read and its write, and no internal lock removes that race.
+const busySuggestionProjects = new Set<string>()
+
+function acquireSuggestionProject(slug: string): boolean {
+  if (busySuggestionProjects.has(slug)) return false
+  busySuggestionProjects.add(slug)
+  return true
+}
+
 async function handleSuggestionSend(request: IncomingMessage, response: ServerResponse): Promise<void> {
   const payload = await readJsonRecord(request)
   const slug = recordString(payload, "slug")
   const label = recordString(payload, "label")
   if (slug === undefined || label === undefined) {
     respondJson(response, 400, { error: "slug and label must be non-empty strings" })
+    return
+  }
+  if (!acquireSuggestionProject(slug)) {
+    respondJson(response, 409, { error: `another suggestion action for ${slug} is still in flight` })
     return
   }
   try {
@@ -752,20 +778,29 @@ async function handleSuggestionSend(request: IncomingMessage, response: ServerRe
       respondJson(response, 404, { error: `no suggestion labeled "${label}" on ${slug}'s suggestions.md` })
       return
     }
-    await sendCoordinatorMessage({
-      exec: nodeExec,
-      coordinator: {
-        sessionId: context.registration.coordinatorSessionId,
-        directory: context.registration.homeDirectory,
-      },
-      text: context.suggestion.text,
-    })
-    // The send reached the coordinator; only then does the line leave the
-    // file, so a failed send leaves the suggestion ready to press again.
-    await removeSuggestion(nodeFileSystem, suggestionsPath(homeRoot, slug), label)
-    respondJson(response, 200, { sent: true })
+    if (context.kind === "duplicate-label") {
+      respondJson(response, 409, { error: `the label "${label}" appears more than once in ${slug}'s suggestions.md` })
+      return
+    }
+    // The send-then-remove composition lives in suggestions.ts: a failed send
+    // throws unchanged (the line stays ready to press again), while a failed
+    // removal after a successful send is answered as a warning, not an error
+    // — the coordinator already has the message.
+    const outcome = await sendSuggestion(nodeFileSystem, suggestionsPath(homeRoot, slug), context.suggestion, (text) =>
+      sendCoordinatorMessage({
+        exec: nodeExec,
+        coordinator: {
+          sessionId: context.registration.coordinatorSessionId,
+          directory: context.registration.homeDirectory,
+        },
+        text,
+      }),
+    )
+    respondJson(response, 200, outcome)
   } catch (error) {
     respondActionError(response, error, "suggestion send failed")
+  } finally {
+    busySuggestionProjects.delete(slug)
   }
 }
 
@@ -777,6 +812,10 @@ async function handleSuggestionDismiss(request: IncomingMessage, response: Serve
     respondJson(response, 400, { error: "slug and label must be non-empty strings" })
     return
   }
+  if (!acquireSuggestionProject(slug)) {
+    respondJson(response, 409, { error: `another suggestion action for ${slug} is still in flight` })
+    return
+  }
   try {
     const context = await resolveSuggestion(slug, label)
     if (context.kind === "unknown-slug") {
@@ -787,10 +826,16 @@ async function handleSuggestionDismiss(request: IncomingMessage, response: Serve
       respondJson(response, 404, { error: `no suggestion labeled "${label}" on ${slug}'s suggestions.md` })
       return
     }
+    if (context.kind === "duplicate-label") {
+      respondJson(response, 409, { error: `the label "${label}" appears more than once in ${slug}'s suggestions.md` })
+      return
+    }
     await removeSuggestion(nodeFileSystem, suggestionsPath(homeRoot, slug), label)
     respondJson(response, 200, { dismissed: true })
   } catch (error) {
     respondJson(response, 500, { error: error instanceof Error ? error.message : "suggestion dismiss failed" })
+  } finally {
+    busySuggestionProjects.delete(slug)
   }
 }
 

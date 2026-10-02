@@ -37,6 +37,10 @@ export type PanelState =
       /** The project's suggestion rows, once fetched from GET /suggestions. */
       suggestions?: SuggestionRow[]
       suggestionsError?: string
+      /** A suggestion send/dismiss is in flight; buttons stay disabled while it is. */
+      suggestionActionPending?: boolean
+      /** Persistent feedback from the last suggestion action; a refetch does not erase it. */
+      suggestionActionFeedback?: string
     }
   | { kind: "cli-missing" }
   | { kind: "service-error"; message: string }
@@ -55,6 +59,8 @@ export type PanelEvent =
   | { type: "shipping-loaded"; shipping: ShippingInfo }
   | { type: "suggestions-loaded"; suggestions: SuggestionRow[] }
   | { type: "suggestions-failed"; message: string }
+  | { type: "suggestion-action-started" }
+  | { type: "suggestion-action-settled"; feedback?: string }
   | { type: "sessions-changed"; coordinatorTitle?: string }
 
 export function initialPanelState(): PanelState {
@@ -126,6 +132,19 @@ export function reducePanelState(state: PanelState, event: PanelEvent): PanelSta
     case "suggestions-failed":
       if (state.kind !== "registered") return state
       return { ...state, suggestionsError: event.message }
+    // The action's feedback lives in its own slot on purpose: suggestions-loaded
+    // clears suggestionsError on the refetch that follows every action, and the
+    // captain must still be able to read why the line stayed on the file.
+    case "suggestion-action-started":
+      if (state.kind !== "registered") return state
+      return { ...state, suggestionActionPending: true, suggestionActionFeedback: undefined }
+    case "suggestion-action-settled":
+      if (state.kind !== "registered") return state
+      return {
+        ...state,
+        suggestionActionPending: false,
+        ...(event.feedback === undefined ? {} : { suggestionActionFeedback: event.feedback }),
+      }
     case "sessions-changed":
       if (state.kind !== "registered") return state
       return {

@@ -20,8 +20,10 @@ beforeAll(async () => {
   tempHome = path.join(tempRoot, "home")
   const sunriseHome = path.join(tempHome, "projects", "sunrise")
   const drifterHome = path.join(tempHome, "projects", "drifter")
+  const corruptHome = path.join(tempHome, "projects", "corrupt")
   mkdirSync(path.join(sunriseHome, "reports"), { recursive: true })
   mkdirSync(drifterHome, { recursive: true })
+  mkdirSync(path.join(corruptHome, "reports"), { recursive: true })
   writeFileSync(
     path.join(tempHome, "registry.json"),
     JSON.stringify({
@@ -37,6 +39,13 @@ beforeAll(async () => {
         projectDirectory: "/repos/drifter",
         homeDirectory: drifterHome,
         coordinatorSessionId: "ses_coord_2",
+        createdAt: "2026-10-01T08:00:00Z",
+      },
+      corrupt: {
+        slug: "corrupt",
+        projectDirectory: "/repos/corrupt",
+        homeDirectory: corruptHome,
+        coordinatorSessionId: "ses_coord_3",
         createdAt: "2026-10-01T08:00:00Z",
       },
     }),
@@ -60,6 +69,26 @@ beforeAll(async () => {
   }
   writeFileSync(path.join(sunriseHome, "reports", "landings.md"), `${landings.join("\n")}\n`)
   writeFileSync(path.join(drifterHome, "projects.md"), "mode: unset — ask the captain\n")
+  writeFileSync(path.join(corruptHome, "projects.md"), "mode: direct-PR\n")
+  // One canonical entry followed by a malformed one: "Broken entry" has no
+  // ci line, so the parser must report it while keeping "Task A".
+  writeFileSync(
+    path.join(corruptHome, "reports", "landings.md"),
+    [
+      "# Landings",
+      "",
+      "- Task A",
+      "  commit: 1a2b3c4d",
+      "  ci: green",
+      "  mode: direct-PR",
+      "  authorization: captain's word",
+      "  landed: 2026-10-01T10:00:00.000Z",
+      "",
+      "- Broken entry",
+      "  commit: deadbeef",
+      "",
+    ].join("\n"),
+  )
 
   servicePort = await getFreePort()
   serviceProcess = spawn(process.execPath, [path.join(import.meta.dir, "..", "service", "main.ts")], {
@@ -160,6 +189,39 @@ describe("GET /shipping", () => {
     expect(body.mode).toBeNull()
     expect(body.yolo).toBe(false)
     expect(body.landings).toEqual([])
+  })
+
+  test("reports parse errors beside the valid records of a partly corrupt log", async () => {
+    const response = await fetchShipping("?slug=corrupt")
+    expect(response.status).toBe(200)
+    const body = (await response.json()) as {
+      landings: Array<{ task: string; commit: string; ci: string; mode: string; authorization: string; landedAt: string }>
+      landingErrors: unknown
+    }
+    // The corrupt entry is dropped, but the well-formed one still answers —
+    // a partly corrupt log must not read as an empty one.
+    expect(body.landings).toEqual([
+      {
+        task: "Task A",
+        commit: "1a2b3c4d",
+        ci: "green",
+        mode: "direct-PR",
+        authorization: "captain's word",
+        landedAt: "2026-10-01T10:00:00.000Z",
+      },
+    ])
+    expect(Array.isArray(body.landingErrors)).toBe(true)
+    const errors = body.landingErrors as string[]
+    expect(errors).toHaveLength(1)
+    expect(typeof errors[0]).toBe("string")
+    expect(errors[0]).toContain("Broken entry")
+  })
+
+  test("answers an empty landingErrors list for a canonical log and a missing log", async () => {
+    const canonical = (await (await fetchShipping("?slug=sunrise")).json()) as { landingErrors: unknown }
+    expect(canonical.landingErrors).toEqual([])
+    const missing = (await (await fetchShipping("?slug=drifter")).json()) as { landingErrors: unknown }
+    expect(missing.landingErrors).toEqual([])
   })
 
   test("answers 404 for an unknown slug", async () => {

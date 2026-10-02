@@ -79,6 +79,15 @@ var knownActivities = ["unknown", "idle", "running", "retrying", "waiting-permis
 function extractActivity(parsed) {
   if (!isRecord(parsed))
     return "unknown";
+  const nested = parsed.sessionStatus;
+  if (isRecord(nested) && typeof nested.type === "string") {
+    if (nested.type === "busy")
+      return "running";
+    if (nested.type === "idle")
+      return "idle";
+    if (knownActivities.includes(nested.type))
+      return nested.type;
+  }
   for (const key of ["type", "activity", "status"]) {
     const value = parsed[key];
     if (typeof value === "string" && knownActivities.includes(value)) {
@@ -100,6 +109,11 @@ function extractAssistantText(parsed) {
     return parsed === "" ? undefined : parsed;
   if (!isRecord(parsed))
     return;
+  if (Array.isArray(parsed.messages)) {
+    const first = parsed.messages[0];
+    if (isRecord(first) && typeof first.text === "string" && first.text !== "")
+      return first.text;
+  }
   for (const key of ["text", "content", "message"]) {
     const value = parsed[key];
     if (typeof value === "string" && value !== "")
@@ -370,6 +384,33 @@ async function deliverNotification(input) {
   }
 }
 
+// service/desktop-proxy.ts
+async function callDesktopProxy(input) {
+  if (input.support.kind === "unsupported") {
+    return { kind: "unsupported", reason: input.support.reason };
+  }
+  const url = `http://127.0.0.1:${input.support.port}${input.path}`;
+  const headers = {};
+  if (input.body !== undefined)
+    headers["content-type"] = "application/json";
+  if (input.support.token !== undefined)
+    headers.authorization = `Bearer ${input.support.token}`;
+  try {
+    const result = await input.fetcher(url, { method: input.method, headers, ...input.body !== undefined ? { body: input.body } : {} });
+    if (result.status >= 200 && result.status < 300)
+      return { kind: "ok" };
+    if (result.status === 401 || result.status === 403) {
+      return {
+        kind: "unsupported",
+        reason: `the ${input.label} call was rejected with status ${result.status}: this host requires credentials that were not offered`
+      };
+    }
+    return { kind: "failed", message: `the ${input.label} call answered with status ${result.status}` };
+  } catch (error) {
+    return { kind: "failed", message: error instanceof Error ? error.message : String(error) };
+  }
+}
+
 // service/interrupt.ts
 async function discoverSupport(input) {
   let raw;
@@ -400,27 +441,25 @@ async function discoverSupport(input) {
   return { kind: "supported", port, ...usableToken !== undefined ? { token: usableToken } : {} };
 }
 async function interruptWorker(input) {
-  if (input.support.kind === "unsupported") {
-    return { kind: "unsupported", reason: input.support.reason };
-  }
-  const url = `http://127.0.0.1:${input.support.port}/api/session/${input.sessionId}/abort?directory=${encodeURIComponent(input.directory)}`;
-  const headers = {};
-  if (input.support.token !== undefined)
-    headers.authorization = `Bearer ${input.support.token}`;
-  try {
-    const result = await input.fetcher(url, { method: "POST", headers });
-    if (result.status >= 200 && result.status < 300)
-      return { kind: "ok" };
-    if (result.status === 401 || result.status === 403) {
-      return {
-        kind: "unsupported",
-        reason: `the abort call was rejected with status ${result.status}: this host requires credentials that were not offered`
-      };
-    }
-    return { kind: "failed", message: `the abort call answered with status ${result.status}` };
-  } catch (error) {
-    return { kind: "failed", message: error instanceof Error ? error.message : String(error) };
-  }
+  return callDesktopProxy({
+    fetcher: input.fetcher,
+    support: input.support,
+    method: "POST",
+    path: `/api/session/${input.sessionId}/interrupt?directory=${encodeURIComponent(input.directory)}`,
+    label: "abort"
+  });
+}
+
+// service/permissions.ts
+async function setSessionPermissionAuto(input) {
+  return callDesktopProxy({
+    fetcher: input.fetcher,
+    support: input.support,
+    method: "PUT",
+    path: `/api/permission-auto-accept/sessions/${input.sessionId}`,
+    body: JSON.stringify({ mode: "auto", directory: input.directory }),
+    label: "auto-accept"
+  });
 }
 
 // service/slug.ts
@@ -617,6 +656,7 @@ async function launchOnce(input) {
   const registrations = await loadRegistry(filesystem, homeRoot);
   const existing = findRegistration(registrations, normalizedDirectory);
   if (existing !== undefined) {
+    await autoAcceptCoordinator(input, existing.coordinatorSessionId, existing.homeDirectory);
     return { registration: existing, adopted: true };
   }
   const { slug, projectHomeDirectory } = await provisionProject({
@@ -637,6 +677,7 @@ async function launchOnce(input) {
       createdAt: new Date().toISOString()
     };
     await saveRegistry(filesystem, homeRoot, { ...registrations, [slug]: registration });
+    await autoAcceptCoordinator(input, priorSessionId, projectHomeDirectory);
     return { registration, adopted: true };
   }
   let coordinatorSessionId;
@@ -651,6 +692,7 @@ async function launchOnce(input) {
     throw new Error(`could not create the coordinator session: ${error instanceof Error ? error.message : String(error)}`);
   }
   await recordCoordinatorSessionId(filesystem, settingsPath, coordinatorSessionId);
+  await autoAcceptCoordinator(input, coordinatorSessionId, projectHomeDirectory);
   const registration = {
     slug,
     projectDirectory: normalizedDirectory,
@@ -660,6 +702,9 @@ async function launchOnce(input) {
   };
   await saveRegistry(filesystem, homeRoot, { ...registrations, [slug]: registration });
   return { registration, adopted: false };
+}
+async function autoAcceptCoordinator(input, sessionId, directory) {
+  await setSessionPermissionAuto({ fetcher: input.fetcher, support: input.support, sessionId, directory });
 }
 async function readCoordinatorSessionId(filesystem, settingsPath) {
   let parsed;
@@ -732,11 +777,12 @@ function truncateLastWord(text) {
 
 // service/poller.ts
 function createSupervisionPoller(input) {
-  const { filesystem, exec, homeRoot } = input;
+  const { filesystem, exec, homeRoot, fetcher, resolveSupport } = input;
   const observations = new Map;
   const pollErrors = new Map;
   const deliveryErrors = new Map;
   const steeredBaselines = new Map;
+  const autoAcceptedSessions = new Set;
   const observationKey = (slug, sessionId) => `${slug}
 ${sessionId}`;
   async function poll() {
@@ -778,6 +824,17 @@ ${sessionId}`;
       const previous = observations.get(key);
       try {
         const directory = registration.projectDirectory;
+        if (!autoAcceptedSessions.has(task.sessionId)) {
+          const outcome = await setSessionPermissionAuto({
+            fetcher,
+            support: await resolveSupport(),
+            sessionId: task.sessionId,
+            directory
+          });
+          if (outcome.kind === "ok" || outcome.kind === "unsupported") {
+            autoAcceptedSessions.add(task.sessionId);
+          }
+        }
         const status = await sessionStatus(exec, { sessionId: task.sessionId, directory });
         const lastWord = await sessionMessagesLastAssistant(exec, { sessionId: task.sessionId, directory });
         const current = { status, ...lastWord !== undefined ? { lastWord } : {} };
@@ -810,7 +867,9 @@ ${sessionId}`;
       events.push(emit("waiting-question"));
     if (activity === "waiting-permission" && previous?.status.activity !== "waiting-permission")
       events.push(emit("waiting-permission"));
-    if (outcome === "completed" && previous?.status.outcome !== "completed")
+    const outcomeFinished = outcome === "completed" && previous?.status.outcome !== "completed";
+    const idleFinished = activity === "idle" && (previous === undefined ? task.state === "Working" : previous.status.activity === "running");
+    if (outcomeFinished || idleFinished)
       events.push(emit("finished"));
     return events;
   }
@@ -850,13 +909,13 @@ function composeNotification(registration, events) {
 function describeEvent(event) {
   switch (event.kind) {
     case "finished":
-      return "finished its turn (outcome: completed). Review the work and mark the task Done when satisfied — completed never means Done.";
+      return "finished its turn and is idle now. Review the work and mark the task Done when satisfied — a finished turn never means Done.";
     case "failed":
       return "failed (outcome: failed).";
     case "waiting-question":
       return "is waiting on a question. Open the session to read and answer it.";
     case "waiting-permission":
-      return "is waiting on a permission. Open the session to approve or deny it.";
+      return "was waiting on a permission; the service auto-approves worker permissions, so this should clear itself. If it persists, tell the captain.";
     case "steered-answer":
       return `answered the captain's steer: ${event.answer ?? ""}`;
   }
@@ -1023,6 +1082,15 @@ async function removeSuggestion(filesystem, filePath, label) {
   });
   await filesystem.writeFile(filePath, kept.join(`
 `));
+}
+async function sendSuggestion(filesystem, filePath, suggestion, send) {
+  await send(suggestion.text);
+  try {
+    await removeSuggestion(filesystem, filePath, suggestion.label);
+  } catch {
+    return { sent: true, warning: `the suggestion was sent to the coordinator, but its line could not be removed from ${filePath}` };
+  }
+  return { sent: true };
 }
 
 // service/watch-schedule.ts
@@ -1522,7 +1590,13 @@ function readWatchIntervalMs() {
 var pollIntervalMs = readPollIntervalMs();
 var watchIntervalMs = readWatchIntervalMs();
 var clock = createNodeClock();
-var supervisionPoller = createSupervisionPoller({ filesystem: nodeFileSystem, exec: nodeExec, homeRoot });
+var supervisionPoller = createSupervisionPoller({
+  filesystem: nodeFileSystem,
+  exec: nodeExec,
+  homeRoot,
+  fetcher: nodeFetcher,
+  resolveSupport: () => discoverSupport({ filesystem: nodeFileSystem, settingsPath: openchamberSettingsPath })
+});
 var watchRunner = createWatchRunner({ filesystem: nodeFileSystem, exec: nodeWatchExec, clock, homeRoot });
 var roundInFlight = false;
 async function runSupervisionRound() {
@@ -1635,12 +1709,15 @@ async function handleLaunch(request, response) {
     return;
   }
   try {
+    const support = await discoverSupport({ filesystem: nodeFileSystem, settingsPath: openchamberSettingsPath });
     const { registration } = await launchFirstMate({
       filesystem: nodeFileSystem,
       exec: nodeExec,
       templateReader,
       homeRoot,
-      projectDirectory
+      projectDirectory,
+      fetcher: nodeFetcher,
+      support
     });
     respondJson(response, 200, registration);
   } catch (error) {
@@ -1954,7 +2031,8 @@ async function handleShipping(url, response) {
     respondJson(response, 200, {
       mode: shipping.mode,
       yolo: shipping.yolo,
-      landings: landings.records.slice(-20)
+      landings: landings.records.slice(-20),
+      landingErrors: landings.errors.map((error) => `line ${error.line}: ${error.message}`)
     });
   } catch (error) {
     respondJson(response, 500, { error: error instanceof Error ? error.message : "shipping read failed" });
@@ -1965,7 +2043,12 @@ async function resolveSuggestion(slug, label) {
   if (!Object.hasOwn(registrations, slug))
     return { kind: "unknown-slug" };
   const suggestions = await loadSuggestions(nodeFileSystem, suggestionsPath(homeRoot, slug));
-  const suggestion = suggestions.find((candidate) => candidate.label === label);
+  const matches = suggestions.filter((candidate) => candidate.label === label);
+  if (matches.length === 0)
+    return { kind: "unknown-label" };
+  if (matches.length > 1)
+    return { kind: "duplicate-label" };
+  const suggestion = matches[0];
   return suggestion === undefined ? { kind: "unknown-label" } : { kind: "found", registration: registrations[slug], suggestion };
 }
 async function handleSuggestions(url, response) {
@@ -1986,44 +2069,23 @@ async function handleSuggestions(url, response) {
     respondJson(response, 500, { error: error instanceof Error ? error.message : "suggestions read failed" });
   }
 }
-async function handleSuggestionSend(request, response) {
-  const payload = await readJsonRecord(request);
-  const slug = recordString(payload, "slug");
-  const label = recordString(payload, "label");
-  if (slug === undefined || label === undefined) {
-    respondJson(response, 400, { error: "slug and label must be non-empty strings" });
-    return;
-  }
-  try {
-    const context = await resolveSuggestion(slug, label);
-    if (context.kind === "unknown-slug") {
-      respondJson(response, 404, { error: `no first mate registered for slug ${slug}` });
-      return;
-    }
-    if (context.kind === "unknown-label") {
-      respondJson(response, 404, { error: `no suggestion labeled "${label}" on ${slug}'s suggestions.md` });
-      return;
-    }
-    await sendCoordinatorMessage({
-      exec: nodeExec,
-      coordinator: {
-        sessionId: context.registration.coordinatorSessionId,
-        directory: context.registration.homeDirectory
-      },
-      text: context.suggestion.text
-    });
-    await removeSuggestion(nodeFileSystem, suggestionsPath(homeRoot, slug), label);
-    respondJson(response, 200, { sent: true });
-  } catch (error) {
-    respondActionError(response, error, "suggestion send failed");
-  }
+var busySuggestionProjects = new Set;
+function acquireSuggestionProject(slug) {
+  if (busySuggestionProjects.has(slug))
+    return false;
+  busySuggestionProjects.add(slug);
+  return true;
 }
-async function handleSuggestionDismiss(request, response) {
+async function handleSuggestionAction(request, response, action) {
   const payload = await readJsonRecord(request);
   const slug = recordString(payload, "slug");
   const label = recordString(payload, "label");
   if (slug === undefined || label === undefined) {
     respondJson(response, 400, { error: "slug and label must be non-empty strings" });
+    return;
+  }
+  if (!acquireSuggestionProject(slug)) {
+    respondJson(response, 409, { error: `another suggestion action for ${slug} is still in flight` });
     return;
   }
   try {
@@ -2034,13 +2096,41 @@ async function handleSuggestionDismiss(request, response) {
     }
     if (context.kind === "unknown-label") {
       respondJson(response, 404, { error: `no suggestion labeled "${label}" on ${slug}'s suggestions.md` });
+      return;
+    }
+    if (context.kind === "duplicate-label") {
+      respondJson(response, 409, { error: `the label "${label}" appears more than once in ${slug}'s suggestions.md` });
+      return;
+    }
+    if (action === "send") {
+      const outcome = await sendSuggestion(nodeFileSystem, suggestionsPath(homeRoot, slug), context.suggestion, (text) => sendCoordinatorMessage({
+        exec: nodeExec,
+        coordinator: {
+          sessionId: context.registration.coordinatorSessionId,
+          directory: context.registration.homeDirectory
+        },
+        text
+      }));
+      respondJson(response, 200, outcome);
       return;
     }
     await removeSuggestion(nodeFileSystem, suggestionsPath(homeRoot, slug), label);
     respondJson(response, 200, { dismissed: true });
   } catch (error) {
+    if (action === "send") {
+      respondActionError(response, error, "suggestion send failed");
+      return;
+    }
     respondJson(response, 500, { error: error instanceof Error ? error.message : "suggestion dismiss failed" });
+  } finally {
+    busySuggestionProjects.delete(slug);
   }
+}
+async function handleSuggestionSend(request, response) {
+  await handleSuggestionAction(request, response, "send");
+}
+async function handleSuggestionDismiss(request, response) {
+  await handleSuggestionAction(request, response, "dismiss");
 }
 var commandPrompts = {
   bearings: "/bearings",

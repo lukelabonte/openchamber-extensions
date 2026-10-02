@@ -219,3 +219,108 @@ describe("panel board state", () => {
     expect(state).toEqual({ kind: "unregistered" })
   })
 })
+
+describe("suggestion action state", () => {
+  const otherRegistration: RegistrationInfo = {
+    slug: "drifter",
+    projectDirectory: "/repos/drifter",
+    homeDirectory: "/home/firstmate/projects/drifter",
+    coordinatorSessionId: "ses_coord_2",
+    createdAt: "2026-01-01T00:00:00.000Z",
+  }
+
+  test("a started action raises the pending flag the suggestion buttons disable on", () => {
+    const state = reduceAll(registeredState(), { type: "suggestion-action-started" })
+    expect(state).toMatchObject({ kind: "registered", suggestionActionPending: true })
+  })
+
+  test("a started action clears the previous action's feedback", () => {
+    const state = reduceAll(
+      registeredState(),
+      { type: "suggestion-action-settled", feedback: "an earlier warning" },
+      { type: "suggestion-action-started" },
+    )
+    expect(state).toMatchObject({
+      kind: "registered",
+      suggestionActionPending: true,
+      suggestionActionFeedback: undefined,
+    })
+  })
+
+  test("a settled action ends the pending state and stores nothing on a clean success", () => {
+    const state = reduceAll(
+      registeredState(),
+      { type: "suggestion-action-started" },
+      { type: "suggestion-action-settled" },
+    )
+    expect(state).toMatchObject({
+      kind: "registered",
+      suggestionActionPending: false,
+      suggestionActionFeedback: undefined,
+    })
+  })
+
+  test("a settled action ends the pending state and stores the cleanup warning", () => {
+    const state = reduceAll(
+      registeredState(),
+      { type: "suggestion-action-started" },
+      {
+        type: "suggestion-action-settled",
+        feedback: "the suggestion was sent to the coordinator, but its line could not be removed",
+      },
+    )
+    expect(state).toMatchObject({
+      kind: "registered",
+      suggestionActionPending: false,
+      suggestionActionFeedback: "the suggestion was sent to the coordinator, but its line could not be removed",
+    })
+  })
+
+  test("the suggestions refetch after a settled action keeps the action feedback", () => {
+    const state = reduceAll(
+      registeredState(),
+      { type: "suggestion-action-started" },
+      { type: "suggestion-action-settled", feedback: "the line stayed on disk" },
+      { type: "suggestions-loaded", suggestions: [{ label: "keep", text: "me" }] },
+    )
+    expect(state).toMatchObject({
+      kind: "registered",
+      suggestionActionPending: false,
+      suggestionActionFeedback: "the line stayed on disk",
+      suggestions: [{ label: "keep", text: "me" }],
+    })
+  })
+
+  test("a fresh registration for a switched project starts with no pending action and no feedback", () => {
+    const previous = reduceAll(
+      registeredState(),
+      { type: "suggestion-action-started" },
+      { type: "suggestion-action-settled", feedback: "the old project's warning" },
+    )
+    expect(previous).toMatchObject({ suggestionActionPending: false, suggestionActionFeedback: "the old project's warning" })
+
+    // A directory switch rebuilds from initialPanelState() (the panel's
+    // resetTo), so the fresh registration must not inherit the previous
+    // project's action state.
+    const switched = reduceAll(
+      initialPanelState(),
+      { type: "directory-context", directory: "/repos/drifter" },
+      { type: "lookup-succeeded", registration: otherRegistration },
+    )
+    expect(switched).toMatchObject({ kind: "registered", registration: otherRegistration })
+    if (switched.kind !== "registered") throw new Error("expected the switched state to be registered")
+    // The fresh state intentionally omits the optional action fields rather
+    // than carrying them as explicit undefined values.
+    expect(switched.suggestionActionPending).toBeUndefined()
+    expect(switched.suggestionActionFeedback).toBeUndefined()
+  })
+
+  test("suggestion action events are ignored while the project is not registered", () => {
+    const state = reduceAll(
+      initialPanelState(),
+      { type: "suggestion-action-started" },
+      { type: "suggestion-action-settled", feedback: "orphan feedback" },
+    )
+    expect(state).toEqual({ kind: "loading" })
+  })
+})

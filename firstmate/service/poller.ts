@@ -3,6 +3,8 @@ import { loadArchivedSessionIds } from "./archive"
 import { buildBoardWorker, type BoardWorker, type WorkerObservation } from "./board"
 import { sessionMessagesLastAssistant, sessionStatus, type ExecRunner } from "./control-client"
 import type { FileSystemPort } from "./file-system"
+import type { HttpFetcher, InterruptSupport } from "./interrupt"
+import { setSessionPermissionAuto } from "./permissions"
 import { loadRegistry, type Registration } from "./registry"
 
 export type WorkerEventKind = "finished" | "failed" | "waiting-question" | "waiting-permission" | "steered-answer"
@@ -33,7 +35,9 @@ export interface PollRound {
 // when the previous observation differs, so one message per worker per
 // transition — and all of one project's events in a round arrive together as
 // one message for the coordinator. Poll state is in-memory: after a service
-// restart the first poll re-reports what it sees.
+// restart the first poll re-reports what it sees — a worker already idle at
+// first sight is re-reported finished (the backlog state says whether work
+// was in flight), so a restart never swallows a finished turn.
 export interface SupervisionPoller {
   poll(): Promise<PollRound>
   getBoardWorkers(slug: string, tasks: BacklogTask[]): BoardWorker[]
@@ -48,8 +52,13 @@ export function createSupervisionPoller(input: {
   filesystem: FileSystemPort
   exec: ExecRunner
   homeRoot: string
+  fetcher: HttpFetcher
+  // Support is resolved lazily at first sight, not once at construction: a
+  // host that gains or loses the desktop proxy between service start and a
+  // later poll must not be frozen out by a boot-time answer.
+  resolveSupport: () => Promise<InterruptSupport>
 }): SupervisionPoller {
-  const { filesystem, exec, homeRoot } = input
+  const { filesystem, exec, homeRoot, fetcher, resolveSupport } = input
   const observations = new Map<string, WorkerObservation>()
   const pollErrors = new Map<string, string>()
   const deliveryErrors = new Map<string, string>()
@@ -60,6 +69,15 @@ export function createSupervisionPoller(input: {
   // a restart drops pending marks, and the steer's answer is simply not
   // forwarded.
   const steeredBaselines = new Map<string, string | undefined>()
+  // Worker sessions already set to auto-approve permissions this service's
+  // lifetime. Rounds never overlap, so first sight is exactly one attempt
+  // while it succeeds or answers unsupported; a failed attempt leaves the
+  // session unmarked so the next round retries — one transient failure must
+  // not block auto-approve for the session's lifetime. Unsupported is
+  // terminal: the host offers no auto-approve path, so a retry would only
+  // fail again. A waiting-permission notification is where a persisting
+  // prompt would surface from.
+  const autoAcceptedSessions = new Set<string>()
 
   const observationKey = (slug: string, sessionId: string): string => `${slug}\n${sessionId}`
 
@@ -108,6 +126,17 @@ export function createSupervisionPoller(input: {
       const previous = observations.get(key)
       try {
         const directory = registration.projectDirectory
+        if (!autoAcceptedSessions.has(task.sessionId)) {
+          const outcome = await setSessionPermissionAuto({
+            fetcher,
+            support: await resolveSupport(),
+            sessionId: task.sessionId,
+            directory,
+          })
+          if (outcome.kind === "ok" || outcome.kind === "unsupported") {
+            autoAcceptedSessions.add(task.sessionId)
+          }
+        }
         const status = await sessionStatus(exec, { sessionId: task.sessionId, directory })
         const lastWord = await sessionMessagesLastAssistant(exec, { sessionId: task.sessionId, directory })
         const current: WorkerObservation = { status, ...(lastWord !== undefined ? { lastWord } : {}) }
@@ -141,7 +170,19 @@ export function createSupervisionPoller(input: {
     if (outcome === "failed" && previous?.status.outcome !== "failed") events.push(emit("failed"))
     if (activity === "waiting-question" && previous?.status.activity !== "waiting-question") events.push(emit("waiting-question"))
     if (activity === "waiting-permission" && previous?.status.activity !== "waiting-permission") events.push(emit("waiting-permission"))
-    if (outcome === "completed" && previous?.status.outcome !== "completed") events.push(emit("finished"))
+    // The verified host class reports only busy/idle (mapped to running/idle
+    // here) and exposes no outcome field, so "finished" must also fire on the
+    // running→idle transition; waiting-* and outcome-based "failed" can only
+    // fire on host classes that report richer statuses. First sight counts as
+    // well — poll state is in-memory, so a worker already idle when the first
+    // poll sees it (after a restart, or before supervision began) is
+    // re-reported finished, but only when the backlog state says the work was
+    // in flight. The detections share one emit so a transition alongside a
+    // completed outcome reports exactly once.
+    const outcomeFinished = outcome === "completed" && previous?.status.outcome !== "completed"
+    const idleFinished =
+      activity === "idle" && (previous === undefined ? task.state === "Working" : previous.status.activity === "running")
+    if (outcomeFinished || idleFinished) events.push(emit("finished"))
     return events
   }
 
@@ -188,13 +229,13 @@ function composeNotification(registration: Registration, events: WorkerEvent[]):
 function describeEvent(event: WorkerEvent): string {
   switch (event.kind) {
     case "finished":
-      return "finished its turn (outcome: completed). Review the work and mark the task Done when satisfied — completed never means Done."
+      return "finished its turn and is idle now. Review the work and mark the task Done when satisfied — a finished turn never means Done."
     case "failed":
       return "failed (outcome: failed)."
     case "waiting-question":
       return "is waiting on a question. Open the session to read and answer it."
     case "waiting-permission":
-      return "is waiting on a permission. Open the session to approve or deny it."
+      return "was waiting on a permission; the service auto-approves worker permissions, so this should clear itself. If it persists, tell the captain."
     case "steered-answer":
       return `answered the captain's steer: ${event.answer ?? ""}`
   }

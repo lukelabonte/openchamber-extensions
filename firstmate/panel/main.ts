@@ -1,7 +1,7 @@
 import { connectHost } from "@openchamber/sdk"
 import { applyHostReady, mountBadge, type Tone } from "@openchamber/sdk/ui"
 import { parseBoardWorkers, type BoardCard, type BoardColumn } from "./board"
-import { parseShipping, shippingBadgeLabel, type ShippingInfo } from "./shipping"
+import { parseShipping, shippingBadgeLabel, type LandingRow, type ShippingInfo } from "./shipping"
 import { parseSuggestions, type SuggestionRow } from "./suggestions"
 import { initialPanelState, reducePanelState, type Board, type PanelEvent, type PanelState, type RegistrationInfo } from "./state"
 import { formatLastRun, parseWatches, watchOutcomeLabel, type WatchRow } from "./watches"
@@ -305,6 +305,7 @@ function render(state: PanelState): void {
       break
     case "registered":
       root.append(coordinatorRow(state.registration, state.coordinatorTitle, state.shipping))
+      if (state.shipping !== undefined) root.append(landingsSection(state.shipping))
       root.append(suggestionsSection(state))
       root.append(boardView(state.board))
       root.append(watchesCard(state))
@@ -415,6 +416,30 @@ function openChatButton(sessionId: string): HTMLElement {
     void host.openSession(sessionId)
   })
   return button
+}
+
+// Recent landings: the records the service parsed out of reports/landings.md,
+// with a prominent warning for every entry it had to drop — a partly corrupt
+// log must never read as a clean, empty one. The payload fields are untrusted
+// file contents, so they reach the DOM only through textContent.
+function landingsSection(shipping: ShippingInfo): HTMLElement {
+  const section = document.createElement("section")
+  const heading = document.createElement("h2")
+  heading.textContent = "Recent landings"
+  section.append(heading)
+  for (const error of shipping.landingErrors) section.append(warningBadge(error))
+  if (shipping.landings.length === 0) {
+    if (shipping.landingErrors.length === 0) section.append(text("No landings."))
+    return section
+  }
+  for (const landing of shipping.landings) section.append(landingRow(landing))
+  return section
+}
+
+function landingRow(landing: LandingRow): HTMLElement {
+  const row = document.createElement("p")
+  row.textContent = `${landing.task} — commit ${landing.commit} — CI ${landing.ci} — mode ${landing.mode} — ${landing.authorization} — landed ${landing.landedAt}`
+  return row
 }
 
 function boardView(board: Board): HTMLElement {
@@ -674,12 +699,14 @@ function endButton(card: BoardCard, say: ActionFeedback): HTMLElement {
 // one button per suggestion — pressed to send the suggestion's text to the
 // coordinator — with a trash button that dismisses it unsent. The refetch
 // after each call carries the file's new state; the line the service removed
-// stops rendering.
+// stops rendering. Action feedback lives in its own persistent slot so the
+// refetch that follows every action cannot erase why the line stayed.
 function suggestionsSection(state: PanelState & { kind: "registered" }): HTMLElement {
   const section = document.createElement("section")
   const heading = document.createElement("h2")
   heading.textContent = "Suggestions"
   section.append(heading)
+  if (state.suggestionActionFeedback !== undefined) section.append(warningBadge(state.suggestionActionFeedback))
   if (state.suggestionsError !== undefined) {
     if (state.suggestions !== undefined) {
       section.append(text(`${state.suggestionsError} — showing the last read suggestions.`))
@@ -696,38 +723,54 @@ function suggestionsSection(state: PanelState & { kind: "registered" }): HTMLEle
     section.append(text("No suggestions."))
     return section
   }
-  for (const suggestion of state.suggestions) section.append(suggestionRow(suggestion))
+  for (const suggestion of state.suggestions) {
+    section.append(suggestionRow(suggestion, state.suggestionActionPending === true))
+  }
   return section
 }
 
-function suggestionRow(suggestion: SuggestionRow): HTMLElement {
+function suggestionRow(suggestion: SuggestionRow, actionPending: boolean): HTMLElement {
   const row = document.createElement("div")
   const send = document.createElement("button")
   send.textContent = suggestion.label
   send.title = suggestion.text
+  send.disabled = actionPending
+  // The in-flight flag is checked in the handler as well as via the disabled
+  // attribute: a re-render between the click and the answer rebuilds the row
+  // with fresh buttons, and only the flag can stop a repeat press.
   send.addEventListener("click", () => {
+    if (suggestionActionInFlight) return
     void runSuggestionAction("/suggestion/send", suggestion.label)
   })
   const dismiss = document.createElement("button")
   dismiss.textContent = "Dismiss"
   dismiss.title = `Dismiss "${suggestion.label}" without sending`
   dismiss.setAttribute("aria-label", `Dismiss ${suggestion.label}`)
+  dismiss.disabled = actionPending
   dismiss.addEventListener("click", () => {
+    if (suggestionActionInFlight) return
     void runSuggestionAction("/suggestion/dismiss", suggestion.label)
   })
   row.append(send, dismiss)
   return row
 }
 
+let suggestionActionInFlight = false
+
 async function runSuggestionAction(pathname: string, label: string): Promise<void> {
   const registration = activeRegistration
-  if (registration === null) return
+  if (registration === null || suggestionActionInFlight) return
+  suggestionActionInFlight = true
+  dispatch({ type: "suggestion-action-started" })
   try {
     const result = await host.serviceRequest({
       method: "POST",
       path: pathname,
       body: JSON.stringify({ slug: registration.slug, label }),
     })
+    // The captain may have switched projects while the action was in flight;
+    // a stale answer must not land as feedback on the new project.
+    if (activeRegistration !== registration) return
     if (result.status !== 200) {
       let message = `The action failed (status ${result.status}).`
       try {
@@ -736,11 +779,21 @@ async function runSuggestionAction(pathname: string, label: string): Promise<voi
       } catch {
         // A non-JSON body only matters through the generic message above.
       }
-      dispatch({ type: "suggestions-failed", message })
+      dispatch({ type: "suggestion-action-settled", feedback: message })
+      return
     }
+    let parsed: { warning?: string } = {}
+    try {
+      parsed = JSON.parse(result.body) as { warning?: string }
+    } catch {
+      // A plain 200 without a body is a clean success.
+    }
+    dispatch({ type: "suggestion-action-settled", feedback: parsed.warning })
   } catch {
-    dispatch({ type: "suggestions-failed", message: "The action failed: the service is unreachable." })
+    if (activeRegistration !== registration) return
+    dispatch({ type: "suggestion-action-settled", feedback: "The action failed: the service is unreachable." })
   } finally {
+    suggestionActionInFlight = false
     void fetchSuggestions()
   }
 }

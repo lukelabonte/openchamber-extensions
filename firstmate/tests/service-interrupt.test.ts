@@ -8,7 +8,7 @@ import path from "node:path"
 
 // The /interrupt endpoint end to end: the service discovers the managed
 // opencode server from the OpenChamber settings file (a private-surface
-// workaround — no contract surface exposes abort) and calls session.abort
+// workaround — no contract surface exposes interrupt) and calls session.interrupt
 // through a stub HTTP server standing in for that server.
 
 const serviceToken = "test-token"
@@ -157,11 +157,11 @@ describe("POST /interrupt", () => {
     expect(await response.json()).toEqual({ interrupted: true })
     expect(abortCalls).toHaveLength(1)
     expect(abortCalls[0].method).toBe("POST")
-    expect(abortCalls[0].url).toBe(`/api/session/ses_11bb/abort?directory=${encodeURIComponent("/repos/sunrise")}`)
+    expect(abortCalls[0].url).toBe(`/api/session/ses_11bb/interrupt?directory=${encodeURIComponent("/repos/sunrise")}`)
     expect(abortCalls[0].authorization).toBe("Bearer tok_local")
   })
 
-  test("answers 502 when the abort call fails", async () => {
+  test("answers 502 when the interrupt call fails", async () => {
     abortStatus = 500
 
     const response = await post("/interrupt", { slug: "sunrise", sessionId: "ses_11bb" })

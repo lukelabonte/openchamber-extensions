@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FirstMate recovery report, 2026-10-01</title>
+<style>
+:root { color-scheme: light dark; }
+body { font: 16px/1.6 -apple-system, "Segoe UI", sans-serif; max-width: 60rem; margin: 0 auto; padding: 1.5rem; }
+h1 { font-size: 1.4rem; margin-bottom: 0.25rem; }
+h2 { font-size: 1.1rem; margin-top: 2rem; border-bottom: 1px solid #ccc5; padding-bottom: 0.25rem; }
+.meta { color: #777; font-size: 0.85rem; }
+.filters { margin: 1rem 0; display: flex; gap: 0.5rem; flex-wrap: wrap; }
+.filters button { cursor: pointer; border: 1px solid #8885; border-radius: 6px; padding: 0.25rem 0.75rem; background: none; font: inherit; }
+.filters button[aria-pressed="true"] { background: #8882; }
+.item { border-left: 3px solid #999; padding: 0.35rem 0 0.35rem 0.75rem; margin: 0.5rem 0; }
+.item.verified { border-color: #2a8; }
+.item.unresolved { border-color: #d84; }
+.item.blocked { border-color: #d44; }
+.tag { font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.04em; }
+.tag.verified { color: #2a8; }
+.tag.unresolved { color: #d84; }
+.tag.blocked { color: #d44; }
+table { border-collapse: collapse; width: 100%; font-size: 0.88rem; margin: 0.75rem 0; }
+th, td { text-align: left; padding: 0.3rem 0.6rem; border-bottom: 1px solid #ccc4; vertical-align: top; }
+td.p { white-space: nowrap; font-family: ui-monospace, Menlo, monospace; font-size: 0.8rem; }
+code { font-family: ui-monospace, Menlo, monospace; font-size: 0.85em; }
+a { color: inherit; }
+.hidden { display: none; }
+</style>
+</head>
+<body>
+
+<h1>Recovery report: stalled write/edit parts, code fixes, merge inventory</h1>
+<p class="meta">2026-10-01 &middot; worktree HEAD <code>43ead37</code> &middot; main squash <code>94b349e</code> (cached remote, refreshed remote not verified)</p>
+
+<div class="filters" role="group" aria-label="Filter findings by status">
+  <button data-filter="all" aria-pressed="true">All</button>
+  <button data-filter="verified" aria-pressed="false">Verified</button>
+  <button data-filter="unresolved" aria-pressed="false">Unresolved</button>
+  <button data-filter="blocked" aria-pressed="false">Blocked</button>
+</div>
+
+<h2>1. Observed diagnosis, and its limit</h2>
+
+<div class="item verified" data-status="verified">
+  <span class="tag verified">Verified</span>
+  <p>Runtime diagnosis pinned complete tool arguments and running state within seconds of dispatch. Filesystem effects landed minutes later: writes and edits lagged by 2m51s to 5m8s, and completion lagged filesystem effects by 1m48s to 4m. All five slow write/edit parts ended with the exact error <code>{"type":"aborted","message":"Tool execution interrupted"}</code>, with complete tool arguments, so provider argument-generation failure is ruled out. The origin of each stop is not pinned. The observed aborts are consistent with user and runtime stops, not model stalls. The 471-byte brief landed at 03:47:33Z, before the slow write aborted at 03:49:21Z. The backlog edit took effect at 03:58:38Z against a 03:55:47Z dispatch and a 04:02:38Z completion.</p>
+</div>
+
+<div class="item verified" data-status="verified">
+  <span class="tag verified">Verified</span>
+  <p>Ownership corrected: the host proxy (port 57123) and the executor (port 49156) are one server plus an application-layer proxy, not two owners. The earlier two-executor diagnosis and the model-stall explanation are retracted. The proxy accepts <code>/interrupt</code>, but that does not establish prompt in-flight cancellation.</p>
+</div>
+
+<div class="item unresolved" data-status="unresolved">
+  <span class="tag unresolved">Unresolved</span>
+  <p>The internal cause is still unknown. The executor is the bundled opencode v2.0.21 server, and the lag sits inside that minified bundle, as observed in one build only; nothing here claims bundle determinism. There is no source or owner evidence to assert a global engine bug, and no basis to blame the model, permissions, or a plugin. Long primary sleeps of 90 to 240s occupied the turns being monitored, and stop actions aborted the queued tool calls. Git log did not pin exact spawn timing, so this is qualified as runtime cancellation rather than a proven hung process.</p>
+</div>
+
+<h2>2. Code fixes and observed focused validation</h2>
+
+<p>Full edit scope: <code>firstmate/service/main.ts</code>, <code>service/suggestions.ts</code>, <code>panel/shipping.ts</code>, <code>panel/state.ts</code>, <code>panel/main.ts</code>, plus charter wording and five test files. Reviewed source showed no blocking issues.</p>
+
+<div class="item verified" data-status="verified">
+  <span class="tag verified">Verified</span>
+  <p>Changes are uncommitted edits in the worktree: landing warnings surfaced as <code>landingErrors</code> strings and the last 20 landing records visible in the UI; 409 on duplicate-label and on per-project suggestion send/dismiss while busy; suggestion send returns 200 with a warning when removing the suggestion line fails after a successful send, so the captain is never told to press a line the coordinator already has; panel action pending state with persistent feedback; charter fixed to the canonical landing format with unique suggestion labels.</p>
+</div>
+
+<div class="item verified" data-status="verified">
+  <span class="tag verified">Verified</span>
+  <p>Read-only Git inventory: HEAD <code>43ead37</code>, 14 modified unstaged files plus 1 untracked file, nothing staged, no commits or pushes, and the diff check exited 0 with no whitespace issues. The 14 modified files are 5 production TypeScript files, 2 rebuilt JS bundles, 5 test files, the charter, and the issue 12 checkpoint. The untracked file is this report. The earlier focused run listed 7 files because 7 test files were run; 5 were edited.</p>
+</div>
+
+<div class="item verified" data-status="verified">
+  <span class="tag verified">Verified</span>
+  <p>Validation observed: an initial focused red run of 37 pass / 10 fail (exit 1, 2.53s), then test-defect corrections around the shared shim log and absent optional fields, then a final focused run of 90 pass / 0 fail, 196 expects, 7 files, 2.55s, exit 0. Command: <code>bun test --timeout 5000 tests/service-shipping.test.ts tests/panel-shipping.test.ts tests/suggestions.test.ts tests/service-suggestions.test.ts tests/panel-state.test.ts tests/interrupt.test.ts tests/service-interrupt.test.ts</code> run in <code>firstmate/</code>.</p>
+</div>
+
+<div class="item verified" data-status="verified">
+  <span class="tag verified">Verified</span>
+  <p>Full validation observed: <code>bun test --timeout 60000 tests/</code> exited 0 with 308 pass, 0 fail, 776 expects across 35 files in 79.72s (83s wall, within the 180s limit). The build <code>sh scripts/build</code> exited 0; the local helper was already present, so no dependency fetch ran, and the generated <code>panel/main.js</code> and <code>service/main.js</code> changed. The earlier focused run was 90 pass / 0 fail, 196 expects, 7 files, 2.55s, exit 0.</p>
+</div>
+
+<div class="item unresolved" data-status="unresolved">
+  <span class="tag unresolved">Unresolved</span>
+  <p>The coordinator-versus-service read-modify-write race on <code>suggestions.md</code> is documented, not eliminated. The canonical-format writer helper (<code>landing-record.ts</code>) has no production caller on purpose. The coordinator is the production writer of the landing log, and canonical producer output still requires live acceptance; there is no live proof of the canonical format.</p>
+</div>
+
+<h3>File and line index</h3>
+<table>
+  <thead><tr><th>Where</th><th>What</th></tr></thead>
+  <tbody>
+    <tr><td class="p"><a href="../../firstmate/service/main.ts#L689-L690">firstmate/service/main.ts:689-690</a></td><td>Last 20 landing records and <code>landingErrors</code> strings in the shipping response</td></tr>
+    <tr><td class="p"><a href="../../firstmate/service/main.ts#L718">firstmate/service/main.ts:718</a></td><td>Duplicate-label detection returns 409</td></tr>
+    <tr><td class="p"><a href="../../firstmate/service/main.ts#L751-L838">firstmate/service/main.ts:751-838</a></td><td>Per-project busy guard around suggestion send and dismiss</td></tr>
+    <tr><td class="p"><a href="../../firstmate/service/suggestions.ts#L56-L69">firstmate/service/suggestions.ts:56-69</a> and <a href="../../firstmate/service/main.ts#L789-L799">firstmate/service/main.ts:789-799</a></td><td>Send then remove: a send returns 200 with a warning when the line removal fails after the send succeeded</td></tr>
+    <tr><td class="p"><a href="../../firstmate/service/landing-record.ts#L34-L37">firstmate/service/landing-record.ts:34-37</a></td><td>Canonical-format writer helper (no production caller by design)</td></tr>
+    <tr><td class="p"><a href="../../firstmate/panel/state.ts#L42-L146">firstmate/panel/state.ts:42-146</a></td><td>Persistent suggestion-action feedback slot, kept across refetch</td></tr>
+    <tr><td class="p"><a href="../../firstmate/panel/main.ts#L702-L794">firstmate/panel/main.ts:702-794</a></td><td>Action feedback rendering and settled-state dispatch</td></tr>
+    <tr><td class="p"><a href="../../firstmate/panel/shipping.ts#L50">firstmate/panel/shipping.ts:50</a></td><td>Row shown only with all six canonical fields as strings</td></tr>
+    <tr><td class="p"><a href="../../firstmate/templates/charter.md#L34">firstmate/templates/charter.md:34</a></td><td>Exact landing-record format the service parses</td></tr>
+    <tr><td class="p"><a href="../../firstmate/templates/charter.md#L42">firstmate/templates/charter.md:42</a></td><td>Unique suggestion labels, send removes the line</td></tr>
+  </tbody>
+</table>
+
+<h2>3. Merge inventory (content, not ancestry)</h2>
+
+<div class="item verified" data-status="verified">
+  <span class="tag verified">Verified</span>
+  <p>Last verified local HEAD is <code>43ead370d34afef6ab039aadfea6c3310e1e146a</code>. Cached origin/main is <code>94b349ed050ec05abae0f6809f68e87fea32b86c</code>; the actual refreshed remote is not verified. The main squash contains tickets 1-11 plus a README development section and a CI workflow. The worktree lacks the latter two, so do not import those deletions when integrating.</p>
+</div>
+
+<div class="item verified" data-status="verified">
+  <span class="tag verified">Verified</span>
+  <p><code>43ead37</code> carries the interrupt path fix and is absent from cached main. The charter exact-format change (line 34) was uncommitted at the start of recovery, and additional fixes plus tests are uncommitted on top. When integrating, compare file content between the two heads rather than trusting commit ancestry.</p>
+</div>
+
+<h2>4. Remaining unblock steps</h2>
+
+<div class="item blocked" data-status="blocked">
+  <span class="tag blocked">Blocked</span>
+  <p>Real permission context: the recovery setup was blocked by <code>external_directory</code> under the fleet reproducer's deny-all <code>action*</code> rules. Authorization of narrow paths does not change effective policy; the actual probe was denied and nothing executed. Keeping the current checkout was the user's explicit choice to avoid profile edits. Future main integration, runtime data repair, and live acceptance need real external access or a suitably rooted session. An isolated scratch-tool reproduction of the lag is the other open diagnostic path.</p>
+</div>
+
+<div class="item verified" data-status="verified">
+  <span class="tag verified">Verified</span>
+  <p>Full suite and build are done: both exited 0 as recorded in section 2. What remains is live acceptance work, not more suite or build runs. Do not treat these runs as acceptance evidence.</p>
+</div>
+
+<div class="item blocked" data-status="blocked">
+  <span class="tag blocked">Blocked</span>
+  <p>Preserve the log, then repair: the runtime home's landing log is still in an incompatible format and unrepaired. Capture it first; it cannot be touched safely under the current child policy.</p>
+</div>
+
+<div class="item unresolved" data-status="unresolved">
+  <span class="tag unresolved">Unresolved</span>
+  <p>Acceptance is incomplete: shipping green/red and non-yolo refusals, board GUI actions, watch plus empty results, and proof of no coordinator repo writes are still unverified live. The code fixes are also uncommitted. Existing acceptance agents remain stopped, with no prompts, restarts, log repairs, installs, commits, pushes, or merges since recovery began. CODEOWNERS worker PR status is unverified. PR #1's merge (<code>94b349e</code>) was observed historically via a landing worker, not verified live again.</p>
+</div>
+
+<div class="item blocked" data-status="blocked">
+  <span class="tag blocked">Blocked</span>
+  <p>Publication of anything from this recovery requires explicit approval. No config or permissions were modified, and no fix via blanket permissions, hardcoded port swaps, or model switching is proposed.</p>
+</div>
+
+<script>
+const buttons = document.querySelectorAll('.filters button');
+const items = document.querySelectorAll('.item');
+buttons.forEach((button) => {
+  button.addEventListener('click', () => {
+    const filter = button.dataset.filter;
+    buttons.forEach((b) => b.setAttribute('aria-pressed', String(b === button)));
+    items.forEach((item) => {
+      item.classList.toggle('hidden', filter !== 'all' && item.dataset.status !== filter);
+    });
+  });
+});
+</script>
+
+</body>
+</html>

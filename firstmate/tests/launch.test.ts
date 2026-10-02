@@ -1,9 +1,30 @@
 import { describe, expect, test } from "bun:test"
 import { launchFirstMate, type LaunchFirstMateInput } from "../service/launch"
 import { MissingCliError, type ExecRunner } from "../service/control-client"
+import type { HttpFetcher } from "../service/interrupt"
 import { InMemoryFileSystem } from "./helpers/in-memory-file-system"
 
 const projectDirectory = "/repos/sunrise"
+
+interface RecordedCall {
+  url: string
+  init: { method: string; headers: Record<string, string>; body?: string }
+}
+
+function recordingFetcher(answer: (call: RecordedCall) => { status: number } | "throw"): {
+  fetcher: HttpFetcher
+  calls: RecordedCall[]
+} {
+  const calls: RecordedCall[] = []
+  const fetcher: HttpFetcher = async (url, init) => {
+    const call: RecordedCall = { url, init }
+    calls.push(call)
+    const result = answer(call)
+    if (result === "throw") throw new Error("connection refused")
+    return { status: result.status }
+  }
+  return { fetcher, calls }
+}
 
 const templateContents: Record<string, string> = {
   "charter.md": "SHARED CHARTER",
@@ -46,6 +67,8 @@ function makeInput(overrides: Partial<LaunchFirstMateInput> = {}): LaunchFirstMa
     templateReader,
     homeRoot: "/home/firstmate",
     projectDirectory,
+    fetcher: async () => ({ status: 200 }),
+    support: { kind: "supported", port: 4096 },
     ...overrides,
   }
 }
@@ -168,5 +191,67 @@ describe("launchFirstMate", () => {
 
     await expect(launchFirstMate(input)).rejects.toBeInstanceOf(MissingCliError)
     expect(await filesystem.port.exists("/home/firstmate/registry.json")).toBe(false)
+  })
+
+  test("sets the coordinator session to auto-accept permissions on the create path", async () => {
+    const { fetcher, calls } = recordingFetcher(() => ({ status: 200 }))
+
+    await launchFirstMate(makeInput({ fetcher, support: { kind: "supported", port: 4096 } }))
+
+    expect(calls).toHaveLength(1)
+    expect(calls[0].url).toBe("http://127.0.0.1:4096/api/permission-auto-accept/sessions/ses_coord_1")
+    expect(calls[0].init.method).toBe("PUT")
+    expect(calls[0].init.body).toBe(JSON.stringify({ mode: "auto", directory: "/home/firstmate/projects/sunrise" }))
+  })
+
+  test("sets the adopted coordinator session to auto-accept on both adoption paths", async () => {
+    // Registry adoption: the registration already exists, no session is created.
+    const adopted = new InMemoryFileSystem()
+    adopted.seedFile(
+      "/home/firstmate/registry.json",
+      JSON.stringify({
+        sunrise: {
+          slug: "sunrise",
+          projectDirectory,
+          homeDirectory: "/home/firstmate/projects/sunrise",
+          coordinatorSessionId: "ses_existing",
+          createdAt: "2026-01-01T00:00:00.000Z",
+        },
+      }),
+    )
+    const { fetcher: adoptedFetcher, calls: adoptedCalls } = recordingFetcher(() => ({ status: 200 }))
+    const registryAdoption = await launchFirstMate(
+      makeInput({ filesystem: adopted.port, fetcher: adoptedFetcher, support: { kind: "supported", port: 4096 } }),
+    )
+    expect(registryAdoption.adopted).toBe(true)
+    expect(adoptedCalls).toHaveLength(1)
+    expect(adoptedCalls[0].url).toBe("http://127.0.0.1:4096/api/permission-auto-accept/sessions/ses_existing")
+    expect(adoptedCalls[0].init.body).toBe(JSON.stringify({ mode: "auto", directory: "/home/firstmate/projects/sunrise" }))
+
+    // Home-settings adoption: the registry was lost but the home remembers.
+    const remembered = new InMemoryFileSystem()
+    remembered.seedDirectory("/home/firstmate/projects/sunrise")
+    remembered.seedFile(
+      "/home/firstmate/projects/sunrise/settings.json",
+      JSON.stringify({ projectDirectory, coordinatorSessionId: "ses_prior" }),
+    )
+    const { fetcher: rememberedFetcher, calls: rememberedCalls } = recordingFetcher(() => ({ status: 200 }))
+    const settingsAdoption = await launchFirstMate(
+      makeInput({ filesystem: remembered.port, fetcher: rememberedFetcher, support: { kind: "supported", port: 4096 } }),
+    )
+    expect(settingsAdoption.adopted).toBe(true)
+    expect(rememberedCalls).toHaveLength(1)
+    expect(rememberedCalls[0].url).toBe("http://127.0.0.1:4096/api/permission-auto-accept/sessions/ses_prior")
+    expect(rememberedCalls[0].init.body).toBe(JSON.stringify({ mode: "auto", directory: "/home/firstmate/projects/sunrise" }))
+  })
+
+  test("the launch still succeeds when the auto-accept call fails", async () => {
+    const { fetcher } = recordingFetcher(() => "throw")
+
+    const result = await launchFirstMate(makeInput({ fetcher, support: { kind: "supported", port: 4096 } }))
+
+    expect(result.adopted).toBe(false)
+    expect(result.registration.coordinatorSessionId).toBe("ses_coord_1")
+    expect(() => new Date(result.registration.createdAt)).not.toThrow()
   })
 })

@@ -4,7 +4,7 @@
 
 **Blocked by:** 06 (Live board panel)
 
-**Status:** ready-for-agent
+**Status:** resolved
 
 - [ ] Suggestion buttons render from suggestions.md via the service; pressing one sends it to the coordinator; trash removes it
 - [ ] /bearings and /ahoy available as panel actions that compose and send the corresponding request

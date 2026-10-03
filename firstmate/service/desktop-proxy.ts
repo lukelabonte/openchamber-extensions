@@ -8,7 +8,7 @@ import type { HttpFetcher, InterruptSupport } from "./interrupt"
 // once; callers build their own path and body.
 
 export type DesktopProxyOutcome =
-  | { kind: "ok" }
+  | { kind: "ok"; text?: string }
   | { kind: "unsupported"; reason: string }
   | { kind: "failed"; message: string }
 
@@ -31,7 +31,17 @@ export async function callDesktopProxy(input: {
   if (input.support.token !== undefined) headers.authorization = `Bearer ${input.support.token}`
   try {
     const result = await input.fetcher(url, { method: input.method, headers, ...(input.body !== undefined ? { body: input.body } : {}) })
-    if (result.status >= 200 && result.status < 300) return { kind: "ok" }
+    if (result.status >= 200 && result.status < 300) {
+      // A 2xx status is the success signal; the body is best effort. Read it
+      // as a method on the result (a detached reader fails on real Response
+      // objects) and answer ok without text when the read fails — a failed
+      // body read must never degrade a successful call to "failed".
+      try {
+        return { kind: "ok", text: await result.text() }
+      } catch {
+        return { kind: "ok" }
+      }
+    }
     if (result.status === 401 || result.status === 403) {
       return {
         kind: "unsupported",

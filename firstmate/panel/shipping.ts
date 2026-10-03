@@ -30,7 +30,9 @@ export function parseShipping(value: unknown): ShippingInfo | undefined {
   if (mode !== null && typeof mode !== "string") return undefined
   if (typeof yolo !== "boolean") return undefined
   return {
-    mode,
+    // The guard above leaves mode as string | null; narrow it explicitly so
+    // the unknown-typed wire value cannot leak into the ShippingInfo.
+    mode: typeof mode === "string" ? mode : null,
     yolo,
     landings: parseLandingRows(record.landings),
     landingErrors: parseStringList(record.landingErrors),

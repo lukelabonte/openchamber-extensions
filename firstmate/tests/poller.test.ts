@@ -82,13 +82,17 @@ interface RecordedCall {
   init: { method: string; body?: string }
 }
 
-function recordingFetcher(answer: () => { status: number } | "throw"): { fetcher: HttpFetcher; calls: RecordedCall[] } {
+function recordingFetcher(answer: (call: RecordedCall) => { status: number; text?: string } | "throw"): {
+  fetcher: HttpFetcher
+  calls: RecordedCall[]
+} {
   const calls: RecordedCall[] = []
   const fetcher: HttpFetcher = async (url, init) => {
     calls.push({ url, init })
-    const result = answer()
+    const result = answer({ url, init })
     if (result === "throw") throw new Error("connection refused")
-    return { status: result.status }
+    const text = result.text
+    return { status: result.status, ...(text === undefined ? {} : { text: async () => text }) }
   }
   return { fetcher, calls }
 }
@@ -495,10 +499,12 @@ describe("createSupervisionPoller", () => {
     await poller.poll()
     await poller.poll()
 
-    expect(calls).toHaveLength(1)
-    expect(calls[0].url).toBe("http://127.0.0.1:4096/api/permission-auto-accept/sessions/ses_11bb")
-    expect(calls[0].init.method).toBe("PUT")
-    expect(calls[0].init.body).toBe(JSON.stringify({ mode: "auto", directory: projectDirectory }))
+    // One round-level session-status GET precedes the auto-accept calls each
+    // round; the assertions count the auto-accept PUTs only.
+    const autoAccepts = calls.filter((call) => call.init.method === "PUT")
+    expect(autoAccepts).toHaveLength(1)
+    expect(autoAccepts[0]?.url).toBe("http://127.0.0.1:4096/api/permission-auto-accept/sessions/ses_11bb")
+    expect(autoAccepts[0]?.init.body).toBe(JSON.stringify({ mode: "auto", directory: projectDirectory }))
   })
 
   test("a failed auto-accept is retried on the next poll and marked on success", async () => {
@@ -507,7 +513,8 @@ describe("createSupervisionPoller", () => {
     seedBacklog(filesystem, ["- Fix flaky login test", "  state: Working", "  session: ses_11bb"].join("\n"))
     const { exec } = statusExec("waiting-permission")
     let attempts = 0
-    const { fetcher, calls } = recordingFetcher(() => {
+    const { fetcher, calls } = recordingFetcher((call) => {
+      if (call.init.method !== "PUT") return { status: 200 }
       attempts += 1
       return attempts === 1 ? "throw" : { status: 200 }
     })
@@ -521,7 +528,7 @@ describe("createSupervisionPoller", () => {
     // and the successful retry marked it; the third round made no call. The
     // round's own transitions were reported throughout.
     expect(round.notifications).toHaveLength(1)
-    expect(calls).toHaveLength(2)
+    expect(calls.filter((call) => call.init.method === "PUT")).toHaveLength(2)
   })
 
   test("an unsupported auto-accept is not retried", async () => {
@@ -535,6 +542,119 @@ describe("createSupervisionPoller", () => {
     await poller.poll()
     await poller.poll()
 
-    expect(calls).toHaveLength(1)
+    expect(calls.filter((call) => call.init.method === "PUT")).toHaveLength(1)
+  })
+
+  test("a host pending snapshot overrides the CLI activity and emits captain notifications per transition", async () => {
+    const filesystem = new InMemoryFileSystem()
+    seedRegistry(filesystem)
+    seedBacklog(
+      filesystem,
+      [
+        "- Fix flaky login test",
+        "  state: Working",
+        "  session: ses_11bb",
+        "",
+        "- Add dark mode",
+        "  state: Working",
+        "  session: ses_22cc",
+        "",
+      ].join("\n"),
+    )
+    // The CLI reports both workers busy; the host snapshot says one is
+    // waiting on a permission and the other on a form — host data wins.
+    const { exec } = scriptExec((args) =>
+      subcommand(args) === "status" ? '{"type":"busy"}' : '{"text":"the last word"}',
+    )
+    const snapshot = JSON.stringify({
+      pending: {
+        ses_11bb: { permissions: [{ id: "perm_1" }] },
+        ses_22cc: { forms: [{ id: "form_1" }] },
+      },
+    })
+    const { fetcher, calls } = recordingFetcher((call) =>
+      call.init.method === "GET" ? { status: 200, text: snapshot } : { status: 200 },
+    )
+
+    const poller = makePoller({ filesystem: filesystem.port, exec, fetcher })
+    const round = await poller.poll()
+
+    const tasks = [
+      { title: "Fix flaky login test", state: "Working" as const, sessionId: "ses_11bb" },
+      { title: "Add dark mode", state: "Working" as const, sessionId: "ses_22cc" },
+    ]
+    const workers = poller.getBoardWorkers("sunrise", tasks)
+    expect(workers[0]).toMatchObject({ state: "Blocked", blockedReason: "permission" })
+    expect(workers[1]).toMatchObject({ state: "Blocked", blockedReason: "question" })
+    expect(round.notifications).toHaveLength(1)
+    expect(round.notifications[0].message).toContain("waiting on a permission")
+    expect(round.notifications[0].message).toContain("waiting on a question")
+
+    const emits = calls.filter((call) => call.url.endsWith("/api/notifications/emit"))
+    expect(emits).toHaveLength(2)
+    expect(emits.map((call) => JSON.parse(call.init.body ?? "{}"))).toEqual([
+      {
+        title: "FirstMate — sunrise",
+        body: '"Fix flaky login test" is waiting on a permission approval.',
+        sessionId: "ses_11bb",
+        directory: projectDirectory,
+      },
+      {
+        title: "FirstMate — sunrise",
+        body: '"Add dark mode" is waiting on an answer to a question.',
+        sessionId: "ses_22cc",
+        directory: projectDirectory,
+      },
+    ])
+
+    // Transitions only: the next round sees the same pending state, reports
+    // nothing, and emits nothing.
+    const second = await poller.poll()
+    expect(second.notifications).toEqual([])
+    expect(calls.filter((call) => call.url.endsWith("/api/notifications/emit"))).toHaveLength(2)
+  })
+
+  test("a host snapshot with no pending entries keeps the CLI activity", async () => {
+    const filesystem = new InMemoryFileSystem()
+    seedRegistry(filesystem)
+    seedBacklog(filesystem, ["- Fix flaky login test", "  state: Working", "  session: ses_11bb"].join("\n"))
+    const { exec } = statusExec("waiting-question")
+    const { fetcher, calls } = recordingFetcher((call) =>
+      call.init.method === "GET" ? { status: 200, text: JSON.stringify({ pending: {} }) } : { status: 200 },
+    )
+
+    const poller = makePoller({ filesystem: filesystem.port, exec, fetcher })
+    const round = await poller.poll()
+
+    const tasks = [{ title: "Fix flaky login test", state: "Working" as const, sessionId: "ses_11bb" }]
+    expect(poller.getBoardWorkers("sunrise", tasks)[0]).toMatchObject({ state: "Blocked", blockedReason: "question" })
+    expect(round.notifications).toHaveLength(1)
+    expect(round.notifications[0].message).toContain("waiting on a question")
+    // The CLI's Working → waiting-question transition is a legitimate captain
+    // notification regardless of the (empty) host snapshot — notifications
+    // fire on transitions whether the CLI or the host reported them. The
+    // snapshot's job here is only to not override the CLI activity.
+    expect(calls.filter((call) => call.url.endsWith("/api/notifications/emit"))).toHaveLength(1)
+  })
+
+  test("a failing host snapshot fetch falls back to the CLI-only behavior without failing the round", async () => {
+    const filesystem = new InMemoryFileSystem()
+    seedRegistry(filesystem)
+    seedBacklog(filesystem, ["- Fix flaky login test", "  state: Working", "  session: ses_11bb"].join("\n"))
+    const { exec } = statusExec("waiting-question")
+    const { fetcher, calls } = recordingFetcher((call) =>
+      call.init.method === "GET" ? "throw" : { status: 200 },
+    )
+
+    const poller = makePoller({ filesystem: filesystem.port, exec, fetcher })
+    const round = await poller.poll()
+
+    expect(round.notifications).toHaveLength(1)
+    expect(round.notifications[0].message).toContain("waiting on a question")
+    // The fallback is the CLI-only behavior, and that behavior includes the
+    // waiting-question emit — notifications fire on transitions however they
+    // were observed. The point here is that the failed fetch neither fails
+    // the round nor suppresses the legitimate emit.
+    expect(calls.filter((call) => call.url.endsWith("/api/notifications/emit"))).toHaveLength(1)
   })
 })

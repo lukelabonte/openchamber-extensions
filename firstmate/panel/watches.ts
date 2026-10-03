@@ -17,6 +17,8 @@ export interface WatchRow {
   lastRunAt?: string
   lastOutcome?: WatchOutcome
   lastOutput?: string
+  /** Epoch ms of the next scheduled run; null when disabled; absent when unreported. */
+  nextRun?: number | null
   /** Present when the schedule expression does not parse; such a watch never runs. */
   error?: string
 }
@@ -36,15 +38,21 @@ export function parseWatches(value: unknown): WatchRow[] {
 function parseWatch(value: unknown): WatchRow | undefined {
   if (typeof value !== "object" || value === null) return undefined
   const record = value as Record<string, unknown>
-  const { name, source, schedule, enabled, path, lastRunAt, lastOutcome, lastOutput, error } = record
+  const { name, source, schedule, enabled, path, lastRunAt, lastOutcome, lastOutput, nextRun, error } = record
   if (typeof name !== "string" || name === "") return undefined
   if (source !== "shared" && source !== "project") return undefined
   if (typeof schedule !== "string" || schedule === "") return undefined
   if (typeof enabled !== "boolean") return undefined
-  if (!isOptionalString(path) || !isOptionalString(lastRunAt) || !isOptionalString(lastOutput) || !isOptionalString(error)) {
+  if (
+    !isOptionalString(path) ||
+    !isOptionalString(lastRunAt) ||
+    !isOptionalString(lastOutput) ||
+    !isOptionalNumberOrNull(nextRun) ||
+    !isOptionalString(error)
+  ) {
     return undefined
   }
-  if (lastOutcome !== undefined && lastOutcome !== "ok" && lastOutcome !== "empty" && lastOutcome !== "failed") {
+  if (lastOutcome !== undefined && !isWatchOutcome(lastOutcome)) {
     return undefined
   }
   return {
@@ -54,8 +62,9 @@ function parseWatch(value: unknown): WatchRow | undefined {
     enabled,
     ...(path !== undefined ? { path } : {}),
     ...(lastRunAt !== undefined ? { lastRunAt } : {}),
-    ...(lastOutcome !== undefined ? { lastOutcome } : {}),
+    ...(isWatchOutcome(lastOutcome) ? { lastOutcome } : {}),
     ...(lastOutput !== undefined ? { lastOutput } : {}),
+    ...(nextRun !== undefined ? { nextRun } : {}),
     ...(error !== undefined ? { error } : {}),
   }
 }
@@ -64,14 +73,46 @@ function isOptionalString(value: unknown): value is string | undefined {
   return value === undefined || typeof value === "string"
 }
 
+function isWatchOutcome(value: unknown): value is WatchOutcome {
+  return value === "ok" || value === "empty" || value === "failed"
+}
+
+function isOptionalNumberOrNull(value: unknown): value is number | null | undefined {
+  return value === undefined || value === null || typeof value === "number"
+}
+
+const pad2 = (value: number): string => String(value).padStart(2, "0")
+
 // Locale-independent local-time stamp; an absent or unparseable time means
 // the watch has not run in this service's lifetime.
 export function formatLastRun(lastRunAt: string | undefined): string {
   if (lastRunAt === undefined) return "never run"
   const date = new Date(lastRunAt)
   if (Number.isNaN(date.getTime())) return "never run"
-  const pad = (value: number): string => String(value).padStart(2, "0")
-  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`
+  return `${date.getFullYear()}-${pad2(date.getMonth() + 1)}-${pad2(date.getDate())} ${pad2(date.getHours())}:${pad2(date.getMinutes())}`
+}
+
+// The next scheduled run, relative while near ("next in 4m") and a short
+// absolute time once it is further out ("next at 3:05 PM"); a disabled watch
+// or an unreported run reads "paused". `now` is epoch ms, passed in so the
+// mapping stays pure and testable — the panel re-renders every refresh
+// cycle, which keeps the label roughly current.
+export function nextRunLabel(nextRun: number | null | undefined, now: number): string {
+  if (typeof nextRun !== "number") return "paused"
+  const date = new Date(nextRun)
+  if (Number.isNaN(date.getTime())) return "paused"
+  const minutes = Math.ceil((nextRun - now) / 60_000)
+  if (minutes < 90) return minutes < 1 ? "next in <1m" : `next in ${minutes}m`
+  return `next at ${twelveHourTime(date.getHours(), String(date.getMinutes()))}`
+}
+
+// Full absolute timestamp for the hover title; undefined when there is
+// nothing to show.
+export function nextRunTitle(nextRun: number | null | undefined): string | undefined {
+  if (typeof nextRun !== "number") return undefined
+  const date = new Date(nextRun)
+  if (Number.isNaN(date.getTime())) return undefined
+  return `${date.getFullYear()}-${pad2(date.getMonth() + 1)}-${pad2(date.getDate())} ${pad2(date.getHours())}:${pad2(date.getMinutes())}`
 }
 
 export function watchOutcomeLabel(watch: WatchRow): string {

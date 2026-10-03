@@ -54,6 +54,11 @@ export async function discoverSupport(input: {
 
 export interface HttpResult {
   status: number
+  // The response body reader, present on real responses (the node fetcher
+  // returns the Response object itself); test shims that record only
+  // statuses may omit it. callDesktopProxy surfaces the body on 2xx so
+  // callers can read host payloads.
+  text?: () => Promise<string>
 }
 
 export type HttpFetcher = (url: string, init: { method: string; headers: Record<string, string>; body?: string }) => Promise<HttpResult>

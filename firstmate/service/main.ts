@@ -53,7 +53,10 @@ const nodeFileSystem: FileSystemPort = {
   readFile: (filePath) => readFile(filePath, "utf8"),
   writeFile: (filePath, contents) => writeFile(filePath, contents, "utf8"),
   appendFile: (filePath, contents) => appendFile(filePath, contents, "utf8"),
-  createDirectory: (directoryPath) => mkdir(directoryPath, { recursive: true }),
+  createDirectory: async (directoryPath) => {
+    // Recursive mkdir reports the first directory it created; the port wants void.
+    await mkdir(directoryPath, { recursive: true })
+  },
   rename: (fromPath, toPath) => rename(fromPath, toPath),
   listDirectories: async (directoryPath) => {
     try {
@@ -192,7 +195,14 @@ const supervisionPoller = createSupervisionPoller({
   fetcher: nodeFetcher,
   resolveSupport: () => discoverSupport({ filesystem: nodeFileSystem, settingsPath: openchamberSettingsPath }),
 })
-const watchRunner = createWatchRunner({ filesystem: nodeFileSystem, exec: nodeWatchExec, clock, homeRoot })
+const watchRunner = createWatchRunner({
+  filesystem: nodeFileSystem,
+  exec: nodeWatchExec,
+  clock,
+  homeRoot,
+  fetcher: nodeFetcher,
+  resolveSupport: () => discoverSupport({ filesystem: nodeFileSystem, settingsPath: openchamberSettingsPath }),
+})
 
 // One supervision round: poll every registered project's workers, then
 // deliver each project's notification to its coordinator. A failed delivery is
@@ -288,6 +298,12 @@ async function readJsonRecord(request: IncomingMessage): Promise<Record<string, 
 function recordString(record: Record<string, unknown> | undefined, key: string): string | undefined {
   const value = record?.[key]
   return typeof value === "string" && value.trim() !== "" ? value : undefined
+}
+
+// The optional watch-source discriminator on toggle/schedule requests: absent
+// means "resolve by name", anything but the two canonical values is refused.
+function isWatchSource(value: unknown): value is "shared" | "project" | undefined {
+  return value === undefined || value === "shared" || value === "project"
 }
 
 async function readProjectDirectory(request: IncomingMessage): Promise<string | undefined> {
@@ -489,14 +505,14 @@ async function handleSteer(request: IncomingMessage, response: ServerResponse): 
     })
     // The steer reached the worker; the poller forwards its answer once.
     supervisionPoller.markSteered(slug, sessionId)
-    if (outcome.coordinatorNotified) {
-      respondJson(response, 200, { sent: true })
+    if (outcome.coordinatorNotified === false) {
+      respondJson(response, 200, {
+        sent: true,
+        warning: `steered the worker, but could not tell the coordinator: ${outcome.coordinatorError}`,
+      })
       return
     }
-    respondJson(response, 200, {
-      sent: true,
-      warning: `steered the worker, but could not tell the coordinator: ${outcome.coordinatorError}`,
-    })
+    respondJson(response, 200, { sent: true })
   } catch (error) {
     respondActionError(response, error, "steer failed")
   }
@@ -618,7 +634,7 @@ async function handleWatchesToggle(request: IncomingMessage, response: ServerRes
     respondJson(response, 400, { error: "slug and name must be non-empty strings and enabled a boolean" })
     return
   }
-  if (source !== undefined && source !== "shared" && source !== "project") {
+  if (!isWatchSource(source)) {
     respondJson(response, 400, { error: `source must be "shared" or "project" when given` })
     return
   }
@@ -670,7 +686,7 @@ async function handleWatchSchedule(request: IncomingMessage, response: ServerRes
     respondJson(response, 400, { error: "slug, name, and schedule must be non-empty strings" })
     return
   }
-  if (source !== undefined && source !== "shared" && source !== "project") {
+  if (!isWatchSource(source)) {
     respondJson(response, 400, { error: `source must be "shared" or "project" when given` })
     return
   }

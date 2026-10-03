@@ -1,4 +1,6 @@
 import type { FileSystemPort } from "./file-system"
+import type { HttpFetcher, InterruptSupport } from "./interrupt"
+import { notifyCaptain } from "./notifications"
 import { loadRegistry, type Registration } from "./registry"
 import { computeNextRun, extractScheduleComment, parseCronExpression, scheduleLinePattern } from "./watch-schedule"
 
@@ -18,6 +20,8 @@ export interface WatchInfo {
   source: WatchSource
   schedule: string
   enabled: boolean
+  /** Epoch ms of the next scheduled run; null when disabled, broken, or never due. */
+  nextRun: number | null
   /** Absolute path of the script file on disk. */
   path: string
   /** Present when the schedule expression does not parse; such a watch never runs. */
@@ -105,9 +109,14 @@ export function createWatchRunner(input: {
   exec: WatchExecPort
   clock: { nowMs(): number }
   homeRoot: string
+  fetcher: HttpFetcher
+  // Support is resolved lazily at emit time, like the poller's: a host that
+  // gains or loses the desktop proxy between service start and a later run
+  // must not be frozen out by a boot-time answer.
+  resolveSupport: () => Promise<InterruptSupport>
   timeoutMs?: number
 }): WatchRunner {
-  const { filesystem, exec, clock, homeRoot } = input
+  const { filesystem, exec, clock, homeRoot, fetcher, resolveSupport } = input
   const timeoutMs = input.timeoutMs ?? watchTimeoutMs
   // Run state is in-memory like every other supervision state: a service
   // restart re-derives "next run after now" and the card loses last-run
@@ -279,20 +288,42 @@ export function createWatchRunner(input: {
       homeDirectory,
       message: `FirstMate (${slug}) watch ${watch.name}:\n${output}`,
     })
+    // The captain hears a firing watch on the desktop too, with the same
+    // output capped to the host's 500-character body limit. Best effort —
+    // like the emit route itself, a failed or rate-limited notification
+    // never fails the round.
+    try {
+      await notifyCaptain({
+        fetcher,
+        support: await resolveSupport(),
+        title: `FirstMate — ${watch.name} fired`,
+        body: output.slice(0, 500),
+      })
+    } catch {
+      // Best effort: never throws into the tick.
+    }
   }
 
   async function listWatches(slug: string): Promise<WatchInfo[]> {
     const watches = await discoverWatches(slug)
     const enabledOverrides = await loadEnabledOverrides(slug)
+    const now = new Date(clock.nowMs())
     return watches.map((watch) => {
       const runState = runStates.get(stateKey(slug, watch.source, watch.name))
+      const enabled = isEnabled(enabledOverrides, watch.source, watch.name)
       return {
         name: watch.name,
         source: watch.source,
         schedule: watch.schedule,
-        enabled: isEnabled(enabledOverrides, watch.source, watch.name),
+        enabled,
         path: watch.scriptPath,
         ...(watch.error !== undefined ? { error: watch.error } : {}),
+        // Enabled watches show their next scheduled run; disabled and
+        // broken watches show none.
+        nextRun:
+          enabled && watch.error === undefined
+            ? computeNextRun(parseCronExpression(watch.schedule), now)?.getTime() ?? null
+            : null,
         ...(runState?.lastRunAt !== undefined ? { lastRunAt: runState.lastRunAt } : {}),
         ...(runState?.lastOutcome !== undefined ? { lastOutcome: runState.lastOutcome } : {}),
         ...(runState?.lastOutput !== undefined && runState.lastOutput !== "" ? { lastOutput: runState.lastOutput } : {}),

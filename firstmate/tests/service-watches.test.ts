@@ -81,6 +81,10 @@ function startService(): Promise<void> {
           FIRSTMATE_HOME: tempHome,
           FIRSTMATE_POLL_MS: "60000",
           FIRSTMATE_WATCH_MS: "1000",
+          // Watch notifications must never reach the developer's real desktop
+          // server: point the OpenChamber settings read at a file that does
+          // not exist, so the host resolves as unsupported.
+          FIRSTMATE_OPENCHAMBER_SETTINGS: path.join(tempRoot, "absent-settings.json"),
           OPENCHAMBER_SHIM_LOG: shimLogPath,
           PATH: `${path.join(tempRoot, "bin")}:${process.env.PATH ?? ""}`,
         },

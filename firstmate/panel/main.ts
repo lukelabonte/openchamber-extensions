@@ -4,7 +4,7 @@ import { parseBoardWorkers, type BoardCard, type BoardColumn } from "./board"
 import { parseShipping, shippingBadgeLabel, type LandingRow, type ShippingInfo } from "./shipping"
 import { parseSuggestions, type SuggestionRow } from "./suggestions"
 import { initialPanelState, reducePanelState, type Board, type PanelEvent, type PanelState, type RegistrationInfo } from "./state"
-import { formatLastRun, formatSchedule, parseWatches, watchOutcomeLabel, type WatchRow } from "./watches"
+import { formatLastRun, formatSchedule, nextRunLabel, nextRunTitle, parseWatches, watchOutcomeLabel, type WatchRow } from "./watches"
 
 const host = connectHost()
 
@@ -112,10 +112,10 @@ function startBoardFlow(registration: RegistrationInfo): void {
   }
   stopBoardFlow()
   activeRegistration = registration
-  runFullRefresh()
+  void runFullRefresh(true)
   void ensureSessionsSubscription(registration)
   boardRefreshTimer = window.setInterval(() => {
-    runFullRefresh()
+    runFullRefresh(false)
     // While the live subscription is unattached (transient host failures),
     // every refresh tick is also a re-attach attempt.
     void ensureSessionsSubscription(registration)
@@ -187,11 +187,12 @@ function scheduleBoardFetch(): void {
 }
 
 // The periodic cycle runs the same four fetches as the manual refresh. Only
-// this cycle and the manual click move the freshness label; the
-// subscription-driven refetches stay invisible to the control, so a busy
-// session cannot keep the label pinned at "just now" or flicker it.
-async function runFullRefresh(): Promise<void> {
+// the initial mount and the manual click mark freshness (`markRefreshed`):
+// the periodic cycle and the subscription-driven refetches must never reset
+// the timestamp, so the label can age instead of being pinned at "just now".
+async function runFullRefresh(markRefreshed: boolean): Promise<void> {
   await Promise.all([fetchBoard(), fetchWatches(), fetchShipping(), fetchSuggestions()])
+  if (!markRefreshed) return
   lastRefreshedAt = Date.now()
   updateRefreshControl()
 }
@@ -202,7 +203,7 @@ async function manualRefresh(): Promise<void> {
   manualRefreshInFlight = true
   updateRefreshControl()
   try {
-    await runFullRefresh()
+    await runFullRefresh(true)
   } finally {
     manualRefreshInFlight = false
     updateRefreshControl()
@@ -212,6 +213,7 @@ async function manualRefresh(): Promise<void> {
 function refreshButton(): HTMLElement {
   const button = document.createElement("button")
   button.className = "fm-button fm-refresh"
+  button.title = "Data refreshes automatically in the background; this shows the last manual refresh."
   button.addEventListener("click", () => {
     if (manualRefreshInFlight || activeRegistration === null) return
     void manualRefresh()
@@ -598,6 +600,67 @@ function openChatButton(sessionId: string): HTMLElement {
   return button
 }
 
+// Collapsible sections: Landings, Suggestions, Watches, and each board
+// column. Collapse state is keyed by a stable section id at module level, so
+// the panel's full re-renders preserve it, and persists best-effort to
+// localStorage — a sandboxed iframe that denies storage loses only the
+// persistence, not the feature. Default is expanded.
+const collapsedSectionsStorageKey = "firstmate-collapsed-sections"
+
+const collapsedSections = loadCollapsedSections()
+
+function loadCollapsedSections(): Set<string> {
+  try {
+    const raw = window.localStorage.getItem(collapsedSectionsStorageKey)
+    if (raw === null) return new Set()
+    const parsed: unknown = JSON.parse(raw)
+    if (!Array.isArray(parsed)) return new Set()
+    return new Set(parsed.filter((entry): entry is string => typeof entry === "string"))
+  } catch {
+    return new Set()
+  }
+}
+
+function persistCollapsedSections(): void {
+  try {
+    window.localStorage.setItem(collapsedSectionsStorageKey, JSON.stringify([...collapsedSections]))
+  } catch {
+    // Storage denied (e.g. a sandboxed iframe); collapse state then only
+    // lives for this panel session.
+  }
+}
+
+// The heading doubles as the toggle: a button in behavior (role,
+// aria-expanded, Enter/Space) with a chevron pointing right when collapsed
+// and down when expanded. A collapsed section renders the heading only, so
+// callers skip their content (captions included) after appending it.
+function collapsibleHeading(sectionId: string, label: string): HTMLElement {
+  const collapsed = collapsedSections.has(sectionId)
+  const heading = document.createElement("h2")
+  heading.className = "fm-collapsible-heading"
+  heading.setAttribute("role", "button")
+  heading.setAttribute("aria-expanded", String(!collapsed))
+  heading.tabIndex = 0
+  const chevron = document.createElement("span")
+  chevron.className = "fm-chevron"
+  chevron.setAttribute("aria-hidden", "true")
+  chevron.textContent = collapsed ? "▸" : "▾"
+  heading.append(chevron, document.createTextNode(label))
+  const toggle = (): void => {
+    if (collapsedSections.has(sectionId)) collapsedSections.delete(sectionId)
+    else collapsedSections.add(sectionId)
+    persistCollapsedSections()
+    render(state)
+  }
+  heading.addEventListener("click", toggle)
+  heading.addEventListener("keydown", (event) => {
+    if (event.key !== "Enter" && event.key !== " ") return
+    event.preventDefault()
+    toggle()
+  })
+  return heading
+}
+
 // Landings: all the records the service parsed out of reports/landings.md,
 // in a fixed-height scrollable box, with a prominent warning for every entry
 // it had to drop — a partly corrupt log must never read as a clean, empty
@@ -605,9 +668,8 @@ function openChatButton(sessionId: string): HTMLElement {
 // only through textContent.
 function landingsSection(shipping: ShippingInfo, board: Board): HTMLElement {
   const section = document.createElement("section")
-  const heading = document.createElement("h2")
-  heading.textContent = "Landings"
-  section.append(heading)
+  section.append(collapsibleHeading("landings", "Landings"))
+  if (collapsedSections.has("landings")) return section
   for (const error of shipping.landingErrors) section.append(warningCallout(error))
   if (shipping.landings.length === 0) {
     if (shipping.landingErrors.length === 0) section.append(text("No landings."))
@@ -745,9 +807,8 @@ function boardView(board: Board): HTMLElement {
 
 function boardColumn(column: BoardColumn): HTMLElement {
   const section = document.createElement("section")
-  const heading = document.createElement("h2")
-  heading.textContent = column.id
-  section.append(heading)
+  section.append(collapsibleHeading(`column:${column.id}`, column.id))
+  if (collapsedSections.has(`column:${column.id}`)) return section
   if (column.id === "Done") {
     // Done cards confuse the eye: they look finished but keep live actions.
     // The caption explains what the column is for before the captain asks.
@@ -776,9 +837,10 @@ function boardCard(card: BoardCard): HTMLElement {
   const title = document.createElement("strong")
   title.textContent = card.title
   article.append(title, stateBadge(card))
+  if (card.blockedReason !== undefined) article.append(blockedNote(card.blockedReason))
   if (card.warning !== undefined) article.append(warningBadge(card.warning))
   if (card.branch !== undefined) article.append(branchMeta(card.branch, card.worktree))
-  if (card.lastWord !== undefined) article.append(text(card.lastWord))
+  if (card.lastWord !== undefined) article.append(lastWordLine(card.lastWord))
   if (card.prUrl !== undefined) article.append(prLink(card))
   if (card.sessionId === undefined) {
     // A card with no session (e.g. a task landed by direct PR merge) has
@@ -802,6 +864,31 @@ function mutedNote(message: string): HTMLElement {
   const note = document.createElement("p")
   note.className = "fm-note"
   note.textContent = message
+  return note
+}
+
+// The worker's last word, quoted as speech and muted: a visually secondary
+// preview under the title and badges, clamped by CSS to two lines. Cards
+// without one render nothing extra.
+function lastWordLine(lastWord: string): HTMLElement {
+  const quote = document.createElement("p")
+  quote.className = "fm-last-word"
+  quote.textContent = `“${lastWord}”`
+  return quote
+}
+
+// A blocked card says what it waits on in plain words — the state badge's
+// short "(reason)" suffix is not a sentence. Same amber treatment as the
+// panel's other warnings.
+const blockedReasonNotes: Record<NonNullable<BoardCard["blockedReason"]>, string> = {
+  permission: "Blocked — waiting on a permission approval",
+  question: "Blocked — waiting on an answer to a question",
+}
+
+function blockedNote(reason: NonNullable<BoardCard["blockedReason"]>): HTMLElement {
+  const note = document.createElement("p")
+  note.className = "fm-blocked-note"
+  note.textContent = blockedReasonNotes[reason]
   return note
 }
 
@@ -1041,12 +1128,12 @@ function endButton(card: BoardCard, say: ActionFeedback): HTMLElement {
 // refetch that follows every action cannot erase why the line stayed.
 function suggestionsSection(state: PanelState & { kind: "registered" }): HTMLElement {
   const section = document.createElement("section")
-  const heading = document.createElement("h2")
-  heading.textContent = "Suggestions"
+  section.append(collapsibleHeading("suggestions", "Suggestions"))
+  if (collapsedSections.has("suggestions")) return section
   const caption = document.createElement("p")
   caption.className = "fm-caption"
   caption.textContent = "Messages the coordinator suggests — Send relays it to the coordinator."
-  section.append(heading, caption)
+  section.append(caption)
   if (state.suggestionActionFeedback !== undefined) section.append(warningBadge(state.suggestionActionFeedback))
   if (state.suggestionsError !== undefined) {
     if (state.suggestions !== undefined) {
@@ -1176,10 +1263,13 @@ const defaultNewWatchSchedule = "*/30 * * * *"
 // closes any open editor — the module state is a single slot.
 function watchesCard(state: PanelState & { kind: "registered" }): HTMLElement {
   const section = document.createElement("section")
+  const heading = collapsibleHeading("watches", "Watches")
+  if (collapsedSections.has("watches")) {
+    section.append(heading)
+    return section
+  }
   const headerRow = document.createElement("div")
   headerRow.className = "fm-watch-header"
-  const heading = document.createElement("h2")
-  heading.textContent = "Watches"
   headerRow.append(heading)
   if (watchFormState.kind !== "create") headerRow.append(newWatchButton())
   section.append(headerRow)
@@ -1236,9 +1326,15 @@ function watchRow(watch: WatchRow): HTMLElement {
   article.append(schedule)
   const summary = document.createElement("span")
   summary.className = "fm-landing-meta"
+  // The next scheduled run: relative while near, absolute when far out,
+  // "paused" without one; the full timestamp rides on hover.
+  const nextRun = metaValue(nextRunLabel(watch.nextRun, Date.now()))
+  const nextRunFull = nextRunTitle(watch.nextRun)
+  if (nextRunFull !== undefined) nextRun.title = nextRunFull
   summary.append(
     metaPiece("last run", metaValue(formatLastRun(watch.lastRunAt))),
     metaPiece("outcome", metaValue(watchOutcomeLabel(watch))),
+    nextRun,
   )
   if (watch.error !== undefined) summary.append(warningBadge(watch.error))
   article.append(summary)

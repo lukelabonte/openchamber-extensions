@@ -1,5 +1,9 @@
 #!/bin/sh
 set -eu
 cd "$(dirname "$0")/.."
+
+# Type errors fail the build; bundling alone cannot catch unresolved names.
+bunx tsc --noEmit
+
 bunx openchamber-guest-bundle panel/main.ts panel/main.js
 bunx openchamber-guest-bundle --node service/main.ts service/main.js

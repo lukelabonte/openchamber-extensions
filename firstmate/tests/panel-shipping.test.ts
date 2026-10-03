@@ -96,12 +96,12 @@ describe("parseShipping", () => {
 
 describe("shippingBadgeLabel", () => {
   test("labels the unset state plainly", () => {
-    expect(shippingBadgeLabel({ mode: null, yolo: false })).toBe("mode unset")
+    expect(shippingBadgeLabel({ mode: null, yolo: false, landings: [], landingErrors: [] })).toBe("mode unset")
   })
 
   test("labels the mode with its +yolo suffix", () => {
-    expect(shippingBadgeLabel({ mode: "direct-PR", yolo: false })).toBe("direct-PR")
-    expect(shippingBadgeLabel({ mode: "reviewed-PR", yolo: true })).toBe("reviewed-PR+yolo")
+    expect(shippingBadgeLabel({ mode: "direct-PR", yolo: false, landings: [], landingErrors: [] })).toBe("direct-PR")
+    expect(shippingBadgeLabel({ mode: "reviewed-PR", yolo: true, landings: [], landingErrors: [] })).toBe("reviewed-PR+yolo")
   })
 })
 
@@ -109,7 +109,7 @@ describe("panel shipping state", () => {
   test("a loaded shipping mode is stored while registered", () => {
     const state = reduceAll(registeredState(), {
       type: "shipping-loaded",
-      shipping: { mode: "local-only", yolo: false },
+      shipping: { mode: "local-only", yolo: false, landings: [], landingErrors: [] },
     })
     expect(state).toMatchObject({ kind: "registered", shipping: { mode: "local-only", yolo: false } })
   })
@@ -138,7 +138,7 @@ describe("panel shipping state", () => {
   test("shipping events are ignored while the project is not registered", () => {
     const state = reduceAll(initialPanelState(), {
       type: "shipping-loaded",
-      shipping: { mode: "direct-PR", yolo: true },
+      shipping: { mode: "direct-PR", yolo: true, landings: [], landingErrors: [] },
     })
     expect(state).toEqual({ kind: "loading" })
   })

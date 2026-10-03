@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import { initialPanelState, reducePanelState, type PanelEvent, type RegistrationInfo } from "../panel/state"
-import { formatLastRun, formatSchedule, parseWatches, watchOutcomeLabel } from "../panel/watches"
+import { formatLastRun, formatSchedule, nextRunLabel, nextRunTitle, parseWatches, watchOutcomeLabel } from "../panel/watches"
 
 const registration: RegistrationInfo = {
   slug: "sunrise",
@@ -38,6 +38,17 @@ describe("parseWatches", () => {
     ])
   })
 
+  test("nextRun parses as epoch ms, null when disabled, absent when unreported", () => {
+    const [scheduled, disabled, unreported] = parseWatches([
+      { name: "a", source: "shared", schedule: "*", enabled: true, nextRun: 1_792_000_000_000 },
+      { name: "b", source: "project", schedule: "*", enabled: false, nextRun: null },
+      { name: "c", source: "shared", schedule: "*", enabled: true },
+    ])
+    expect(scheduled.nextRun).toBe(1_792_000_000_000)
+    expect(disabled.nextRun).toBeNull()
+    expect(unreported.nextRun).toBeUndefined()
+  })
+
   test("skips malformed entries instead of throwing", () => {
     expect(
       parseWatches([
@@ -50,6 +61,7 @@ describe("parseWatches", () => {
         { name: "w", source: "shared", schedule: "*", enabled: "yes" }, // non-boolean enabled
         { name: "w", source: "shared", schedule: "*", enabled: true, lastOutcome: "exploded" }, // bad outcome
         { name: "w", source: "shared", schedule: "*", enabled: true, lastRunAt: 7 }, // non-string lastRunAt
+        { name: "w", source: "shared", schedule: "*", enabled: true, nextRun: "soon" }, // non-number nextRun
       ]),
     ).toEqual([])
   })
@@ -74,6 +86,28 @@ describe("watch row display mapping", () => {
     for (const lastOutcome of ["ok", "empty", "failed"] as const) {
       expect(watchOutcomeLabel({ name: "w", source: "shared", schedule: "*", enabled: true, lastOutcome })).toBe(lastOutcome)
     }
+  })
+})
+
+describe("nextRun display mapping", () => {
+  const now = Date.parse("2026-10-01T15:00:00")
+
+  test("relative while near, short absolute once further out, paused without a run", () => {
+    expect(nextRunLabel(null, now)).toBe("paused")
+    expect(nextRunLabel(undefined, now)).toBe("paused")
+    expect(nextRunLabel(Date.parse("2026-10-01T15:04:00"), now)).toBe("next in 4m")
+    expect(nextRunLabel(Date.parse("2026-10-01T16:29:00"), now)).toBe("next in 89m")
+    expect(nextRunLabel(Date.parse("2026-10-01T16:30:00"), now)).toBe("next at 4:30 PM")
+  })
+
+  test("an overdue or imminent run never reads as negative minutes", () => {
+    expect(nextRunLabel(Date.parse("2026-10-01T14:59:30"), now)).toBe("next in <1m")
+  })
+
+  test("the title is the locale-independent stamp, or absent", () => {
+    expect(nextRunTitle(undefined)).toBeUndefined()
+    expect(nextRunTitle(null)).toBeUndefined()
+    expect(nextRunTitle(Date.parse("2026-10-01T15:04:00"))).toBe("2026-10-01 15:04")
   })
 })
 

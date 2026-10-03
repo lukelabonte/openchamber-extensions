@@ -7,7 +7,7 @@ import { provisionProject } from "./provision"
 import { findRegistration, loadRegistry, saveRegistry, type Registration } from "./registry"
 import { normalizeProjectDirectory } from "./slug"
 
-interface LaunchFirstMateInput {
+export interface LaunchFirstMateInput {
   filesystem: FileSystemPort
   exec: ExecRunner
   templateReader: (templateName: string) => Promise<string>

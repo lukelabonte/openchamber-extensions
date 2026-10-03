@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import type { ClockPort } from "../service/clock"
+import type { HttpFetcher, InterruptSupport } from "../service/interrupt"
 import { createWatchRunner, WatchSettingsError, type WatchExecPort } from "../service/watches"
 import { InMemoryFileSystem } from "./helpers/in-memory-file-system"
 
@@ -50,6 +51,25 @@ function execStub(results: WatchExecStubResult[]): { exec: WatchExecPort; calls:
 
 type WatchExecStubResult = { stdout: string; exitCode: number | null; timedOut?: boolean }
 
+const noopFetcher: HttpFetcher = async () => ({ status: 200 })
+const noopResolveSupport = async (): Promise<InterruptSupport> => ({ kind: "unsupported", reason: "test" })
+
+// Records the captain-notification POSTs a firing watch makes, always
+// answering 200 (mirrors poller.test.ts's recordingFetcher).
+interface RecordedEmitCall {
+  url: string
+  init: { method: string; body?: string }
+}
+
+function emitRecording(): { fetcher: HttpFetcher; calls: RecordedEmitCall[] } {
+  const calls: RecordedEmitCall[] = []
+  const fetcher: HttpFetcher = async (url, init) => {
+    calls.push({ url, init })
+    return { status: 200 }
+  }
+  return { fetcher, calls }
+}
+
 function seedRegistry(filesystem: InMemoryFileSystem): void {
   filesystem.seedFile(
     `${homeRoot}/registry.json`,
@@ -79,7 +99,7 @@ describe("createWatchRunner discovery", () => {
     const filesystem = new InMemoryFileSystem()
     seedRegistry(filesystem)
     seedWatches(filesystem)
-    const runner = createWatchRunner({ filesystem: filesystem.port, exec: execStub([]).exec, clock: new FakeClock().port, homeRoot })
+    const runner = createWatchRunner({ filesystem: filesystem.port, exec: execStub([]).exec, clock: new FakeClock().port, fetcher: noopFetcher, resolveSupport: noopResolveSupport, homeRoot })
 
     expect(await runner.listWatches(slug)).toEqual([
       {
@@ -87,6 +107,7 @@ describe("createWatchRunner discovery", () => {
         source: "shared",
         schedule: "*/5 * * * *",
         enabled: true,
+        nextRun: local(2026, 10, 1, 9, 0).getTime(),
         path: `${homeRoot}/shared/watches/pr-watch`,
       },
       {
@@ -94,6 +115,7 @@ describe("createWatchRunner discovery", () => {
         source: "project",
         schedule: "0 9 * * 1-5",
         enabled: true,
+        nextRun: local(2026, 10, 1, 9, 0).getTime(),
         path: `${projectHome}/watches/nightly`,
       },
     ])
@@ -106,7 +128,7 @@ describe("createWatchRunner discovery", () => {
     filesystem.seedFile(`${homeRoot}/shared/watches/not-executable`, "#!/bin/sh\n# schedule: 0 9 * * *\n")
     filesystem.seedExecutableFile(`${homeRoot}/shared/watches/no-schedule`, "#!/bin/sh\necho hi\n")
 
-    const runner = createWatchRunner({ filesystem: filesystem.port, exec: execStub([]).exec, clock: new FakeClock().port, homeRoot })
+    const runner = createWatchRunner({ filesystem: filesystem.port, exec: execStub([]).exec, clock: new FakeClock().port, fetcher: noopFetcher, resolveSupport: noopResolveSupport, homeRoot })
 
     const watches = await runner.listWatches(slug)
     expect(watches).toHaveLength(1)
@@ -119,7 +141,7 @@ describe("createWatchRunner discovery", () => {
     filesystem.seedExecutableFile(`${projectHome}/watches/broken`, "#!/bin/sh\n# schedule: 0 25 * * *\n")
     const { exec, calls } = execStub([])
     const clock = new FakeClock()
-    const runner = createWatchRunner({ filesystem: filesystem.port, exec, clock: clock.port, homeRoot })
+    const runner = createWatchRunner({ filesystem: filesystem.port, exec, clock: clock.port, fetcher: noopFetcher, resolveSupport: noopResolveSupport, homeRoot })
 
     const watches = await runner.listWatches(slug)
     expect(watches[0].name).toBe("broken")
@@ -145,7 +167,7 @@ describe("createWatchRunner tick", () => {
       { stdout: "all quiet", exitCode: 0 },
     ])
     const clock = new FakeClock()
-    const runner = createWatchRunner({ filesystem: filesystem.port, exec, clock: clock.port, homeRoot })
+    const runner = createWatchRunner({ filesystem: filesystem.port, exec, clock: clock.port, fetcher: noopFetcher, resolveSupport: noopResolveSupport, homeRoot })
 
     await runner.tick() // first sight: schedules forward, runs nothing
     expect(calls).toEqual([])
@@ -183,7 +205,7 @@ describe("createWatchRunner tick", () => {
     filesystem.seedExecutableFile(`${projectHome}/watches/nightly`, "#!/bin/sh\n# schedule: * * * * *\n")
     const { exec, calls } = execStub([{ stdout: "  \n", exitCode: 0 }])
     const clock = new FakeClock()
-    const runner = createWatchRunner({ filesystem: filesystem.port, exec, clock: clock.port, homeRoot })
+    const runner = createWatchRunner({ filesystem: filesystem.port, exec, clock: clock.port, fetcher: noopFetcher, resolveSupport: noopResolveSupport, homeRoot })
 
     await runner.tick()
     clock.advance(dueAdvanceMs)
@@ -208,7 +230,7 @@ describe("createWatchRunner tick", () => {
     ]
     const { exec } = execStub(results)
     const clock = new FakeClock()
-    const runner = createWatchRunner({ filesystem: filesystem.port, exec, clock: clock.port, homeRoot })
+    const runner = createWatchRunner({ filesystem: filesystem.port, exec, clock: clock.port, fetcher: noopFetcher, resolveSupport: noopResolveSupport, homeRoot })
 
     await runner.tick()
     clock.advance(dueAdvanceMs)
@@ -236,7 +258,7 @@ describe("createWatchRunner tick", () => {
     filesystem.seedExecutableFile(`${projectHome}/watches/nightly`, "#!/bin/sh\n# schedule: * * * * *\n")
     const { exec } = execStub([{ stdout: "partial", exitCode: null, timedOut: true }])
     const clock = new FakeClock()
-    const runner = createWatchRunner({ filesystem: filesystem.port, exec, clock: clock.port, homeRoot, timeoutMs: 50 })
+    const runner = createWatchRunner({ filesystem: filesystem.port, exec, clock: clock.port, fetcher: noopFetcher, resolveSupport: noopResolveSupport, homeRoot, timeoutMs: 50 })
 
     await runner.tick()
     clock.advance(dueAdvanceMs)
@@ -253,7 +275,7 @@ describe("createWatchRunner tick", () => {
     filesystem.seedFile(`${projectHome}/settings.json`, JSON.stringify({ watches: { project: { nightly: { enabled: false } } } }))
     const { exec, calls } = execStub([])
     const clock = new FakeClock()
-    const runner = createWatchRunner({ filesystem: filesystem.port, exec, clock: clock.port, homeRoot })
+    const runner = createWatchRunner({ filesystem: filesystem.port, exec, clock: clock.port, fetcher: noopFetcher, resolveSupport: noopResolveSupport, homeRoot })
 
     await runner.tick()
     clock.advance(dueAdvanceMs)
@@ -270,7 +292,7 @@ describe("createWatchRunner tick", () => {
     const longOutput = `${"x".repeat(2500)}tail`
     const { exec } = execStub([{ stdout: longOutput, exitCode: 0 }])
     const clock = new FakeClock()
-    const runner = createWatchRunner({ filesystem: filesystem.port, exec, clock: clock.port, homeRoot })
+    const runner = createWatchRunner({ filesystem: filesystem.port, exec, clock: clock.port, fetcher: noopFetcher, resolveSupport: noopResolveSupport, homeRoot })
 
     await runner.tick()
     clock.advance(dueAdvanceMs)
@@ -289,7 +311,7 @@ describe("createWatchRunner tick", () => {
     filesystem.seedExecutableFile(`${projectHome}/watches/nightly`, "#!/bin/sh\n# schedule: * * * * *\n")
     const { exec, calls } = execStub([])
     const clock = new FakeClock()
-    const runner = createWatchRunner({ filesystem: filesystem.port, exec, clock: clock.port, homeRoot })
+    const runner = createWatchRunner({ filesystem: filesystem.port, exec, clock: clock.port, fetcher: noopFetcher, resolveSupport: noopResolveSupport, homeRoot })
 
     clock.advance(dueAdvanceMs)
     const round = await runner.tick()
@@ -305,7 +327,7 @@ describe("createWatchRunner setEnabled", () => {
     seedRegistry(filesystem)
     seedWatches(filesystem)
     filesystem.seedFile(`${projectHome}/settings.json`, JSON.stringify({ projectDirectory: "/repos/sunrise" }))
-    const runner = createWatchRunner({ filesystem: filesystem.port, exec: execStub([]).exec, clock: new FakeClock().port, homeRoot })
+    const runner = createWatchRunner({ filesystem: filesystem.port, exec: execStub([]).exec, clock: new FakeClock().port, fetcher: noopFetcher, resolveSupport: noopResolveSupport, homeRoot })
 
     const result = await runner.setEnabled(slug, "project", "nightly", false)
 
@@ -330,7 +352,7 @@ describe("createWatchRunner setEnabled", () => {
     seedRegistry(filesystem)
     seedWatches(filesystem)
     filesystem.seedExecutableFile(`${projectHome}/watches/pr-watch`, "#!/bin/sh\n# schedule: 0 9 * * *\n")
-    const runner = createWatchRunner({ filesystem: filesystem.port, exec: execStub([]).exec, clock: new FakeClock().port, homeRoot })
+    const runner = createWatchRunner({ filesystem: filesystem.port, exec: execStub([]).exec, clock: new FakeClock().port, fetcher: noopFetcher, resolveSupport: noopResolveSupport, homeRoot })
 
     // Without a source the name is ambiguous and the toggle is refused.
     expect(await runner.setEnabled(slug, undefined, "pr-watch", false)).toBe("ambiguous-watch")
@@ -346,7 +368,7 @@ describe("createWatchRunner setEnabled", () => {
     seedRegistry(filesystem)
     seedWatches(filesystem)
     filesystem.seedFile(`${projectHome}/settings.json`, "this is not json")
-    const runner = createWatchRunner({ filesystem: filesystem.port, exec: execStub([]).exec, clock: new FakeClock().port, homeRoot })
+    const runner = createWatchRunner({ filesystem: filesystem.port, exec: execStub([]).exec, clock: new FakeClock().port, fetcher: noopFetcher, resolveSupport: noopResolveSupport, homeRoot })
 
     const failure = runner.setEnabled(slug, "project", "nightly", false)
     await expect(failure).rejects.toBeInstanceOf(WatchSettingsError)
@@ -361,7 +383,7 @@ describe("createWatchRunner setEnabled", () => {
     const filesystem = new InMemoryFileSystem()
     seedRegistry(filesystem)
     seedWatches(filesystem)
-    const runner = createWatchRunner({ filesystem: filesystem.port, exec: execStub([]).exec, clock: new FakeClock().port, homeRoot })
+    const runner = createWatchRunner({ filesystem: filesystem.port, exec: execStub([]).exec, clock: new FakeClock().port, fetcher: noopFetcher, resolveSupport: noopResolveSupport, homeRoot })
 
     await runner.setEnabled(slug, "project", "nightly", false)
 
@@ -374,9 +396,85 @@ describe("createWatchRunner setEnabled", () => {
     const filesystem = new InMemoryFileSystem()
     seedRegistry(filesystem)
     seedWatches(filesystem)
-    const runner = createWatchRunner({ filesystem: filesystem.port, exec: execStub([]).exec, clock: new FakeClock().port, homeRoot })
+    const runner = createWatchRunner({ filesystem: filesystem.port, exec: execStub([]).exec, clock: new FakeClock().port, fetcher: noopFetcher, resolveSupport: noopResolveSupport, homeRoot })
 
     expect(await runner.setEnabled(slug, undefined, "absent", false)).toBe("unknown-watch")
     expect(await runner.setEnabled(slug, "shared", "nightly", false)).toBe("unknown-watch")
+  })
+})
+
+describe("createWatchRunner nextRun and captain notifications", () => {
+  test("enabled watches carry their next scheduled run; disabled watches carry none", async () => {
+    const filesystem = new InMemoryFileSystem()
+    seedRegistry(filesystem)
+    seedWatches(filesystem)
+    filesystem.seedFile(`${projectHome}/settings.json`, JSON.stringify({ watches: { project: { nightly: { enabled: false } } } }))
+    const runner = createWatchRunner({ filesystem: filesystem.port, exec: execStub([]).exec, clock: new FakeClock().port, fetcher: noopFetcher, resolveSupport: noopResolveSupport, homeRoot })
+
+    const watches = await runner.listWatches(slug)
+    expect(watches.find((watch) => watch.name === "pr-watch")?.nextRun).toBe(local(2026, 10, 1, 9, 0).getTime())
+    expect(watches.find((watch) => watch.name === "nightly")?.nextRun).toBeNull()
+  })
+
+  test("a watch with a broken schedule carries no next run", async () => {
+    const filesystem = new InMemoryFileSystem()
+    seedRegistry(filesystem)
+    filesystem.seedExecutableFile(`${projectHome}/watches/broken`, "#!/bin/sh\n# schedule: 0 25 * * *\n")
+    const runner = createWatchRunner({ filesystem: filesystem.port, exec: execStub([]).exec, clock: new FakeClock().port, fetcher: noopFetcher, resolveSupport: noopResolveSupport, homeRoot })
+
+    const watches = await runner.listWatches(slug)
+    expect(watches[0].nextRun).toBeNull()
+  })
+
+  test("a firing watch notifies the captain once with the 500-character output cap", async () => {
+    const filesystem = new InMemoryFileSystem()
+    seedRegistry(filesystem)
+    filesystem.seedExecutableFile(`${projectHome}/watches/nightly`, "#!/bin/sh\n# schedule: * * * * *\n")
+    const { exec } = execStub([{ stdout: "x".repeat(600), exitCode: 0 }])
+    const clock = new FakeClock()
+    const { fetcher, calls } = emitRecording()
+    const runner = createWatchRunner({
+      filesystem: filesystem.port,
+      exec,
+      clock: clock.port,
+      fetcher,
+      resolveSupport: async () => ({ kind: "supported", port: 4096 }),
+      homeRoot,
+    })
+
+    await runner.tick() // first sight: schedules forward, runs nothing
+    clock.advance(dueAdvanceMs)
+    await runner.tick()
+
+    expect(calls).toHaveLength(1)
+    expect(calls[0].url).toBe("http://127.0.0.1:4096/api/notifications/emit")
+    expect(calls[0].init.method).toBe("POST")
+    expect(JSON.parse(calls[0].init.body ?? "")).toEqual({
+      title: "FirstMate — nightly fired",
+      body: "x".repeat(500),
+    })
+  })
+
+  test("a watch that prints nothing makes no captain-notification call", async () => {
+    const filesystem = new InMemoryFileSystem()
+    seedRegistry(filesystem)
+    filesystem.seedExecutableFile(`${projectHome}/watches/nightly`, "#!/bin/sh\n# schedule: * * * * *\n")
+    const { exec } = execStub([{ stdout: "  \n", exitCode: 0 }])
+    const clock = new FakeClock()
+    const { fetcher, calls } = emitRecording()
+    const runner = createWatchRunner({
+      filesystem: filesystem.port,
+      exec,
+      clock: clock.port,
+      fetcher,
+      resolveSupport: async () => ({ kind: "supported", port: 4096 }),
+      homeRoot,
+    })
+
+    await runner.tick()
+    clock.advance(dueAdvanceMs)
+    await runner.tick()
+
+    expect(calls).toEqual([])
   })
 })

@@ -397,8 +397,13 @@ async function callDesktopProxy(input) {
     headers.authorization = `Bearer ${input.support.token}`;
   try {
     const result = await input.fetcher(url, { method: input.method, headers, ...input.body !== undefined ? { body: input.body } : {} });
-    if (result.status >= 200 && result.status < 300)
-      return { kind: "ok" };
+    if (result.status >= 200 && result.status < 300) {
+      try {
+        return { kind: "ok", text: await result.text() };
+      } catch {
+        return { kind: "ok" };
+      }
+    }
     if (result.status === 401 || result.status === 403) {
       return {
         kind: "unsupported",
@@ -775,7 +780,29 @@ function truncateLastWord(text) {
   return text.length > lastWordMaxLength ? `${text.slice(0, lastWordMaxLength)}…` : text;
 }
 
+// service/notifications.ts
+async function notifyCaptain(input) {
+  try {
+    await callDesktopProxy({
+      fetcher: input.fetcher,
+      support: input.support,
+      method: "POST",
+      path: "/api/notifications/emit",
+      body: JSON.stringify({
+        title: input.title,
+        body: input.body,
+        ...input.sessionId !== undefined ? { sessionId: input.sessionId } : {},
+        ...input.directory !== undefined ? { directory: input.directory } : {}
+      }),
+      label: "captain notification"
+    });
+  } catch {}
+}
+
 // service/poller.ts
+function isRecord3(value) {
+  return typeof value === "object" && value !== null;
+}
 function createSupervisionPoller(input) {
   const { filesystem, exec, homeRoot, fetcher, resolveSupport } = input;
   const observations = new Map;
@@ -793,15 +820,24 @@ ${sessionId}`;
     } catch {
       return { notifications };
     }
+    let support;
+    try {
+      support = await resolveSupport();
+    } catch {
+      support = undefined;
+    }
+    const pending = await fetchPendingSnapshot(support);
     for (const registration of Object.values(registrations)) {
-      const events = await pollProject(registration);
+      const events = await pollProject(registration, pending);
       if (events.length > 0) {
         notifications.push(composeNotification(registration, events));
       }
+      for (const event of events)
+        await notifyEvent(registration, event, support);
     }
     return { notifications };
   }
-  async function pollProject(registration) {
+  async function pollProject(registration, pending) {
     const events = [];
     let backlog;
     try {
@@ -838,6 +874,9 @@ ${sessionId}`;
         const status = await sessionStatus(exec, { sessionId: task.sessionId, directory });
         const lastWord = await sessionMessagesLastAssistant(exec, { sessionId: task.sessionId, directory });
         const current = { status, ...lastWord !== undefined ? { lastWord } : {} };
+        const waiting = pending === undefined ? undefined : pendingActivity(pending[task.sessionId]);
+        if (waiting !== undefined)
+          current.status = { ...current.status, activity: waiting };
         observations.set(key, current);
         pollErrors.delete(key);
         events.push(...detectEvents(task, previous, current));
@@ -872,6 +911,40 @@ ${sessionId}`;
     if (outcomeFinished || idleFinished)
       events.push(emit("finished"));
     return events;
+  }
+  async function fetchPendingSnapshot(support) {
+    if (support === undefined || support.kind === "unsupported")
+      return;
+    const outcome = await callDesktopProxy({
+      fetcher,
+      support,
+      method: "GET",
+      path: "/api/sessions/status",
+      label: "session status"
+    });
+    if (outcome.kind !== "ok" || outcome.text === undefined)
+      return;
+    try {
+      const parsed = JSON.parse(outcome.text);
+      if (!isRecord3(parsed) || !isRecord3(parsed.pending))
+        return;
+      return parsed.pending;
+    } catch {
+      return;
+    }
+  }
+  async function notifyEvent(registration, event, support) {
+    const body = captainEventBody(event);
+    if (body === undefined || support === undefined)
+      return;
+    await notifyCaptain({
+      fetcher,
+      support,
+      title: `FirstMate — ${registration.slug}`,
+      body,
+      sessionId: event.sessionId,
+      directory: registration.projectDirectory
+    });
   }
   function getBoardWorkers(slug, tasks) {
     return tasks.map((task) => {
@@ -918,6 +991,27 @@ function describeEvent(event) {
       return "was waiting on a permission; the service auto-approves worker permissions, so this should clear itself. If it persists, tell the captain.";
     case "steered-answer":
       return `answered the captain's steer: ${event.answer ?? ""}`;
+  }
+}
+function pendingActivity(entry) {
+  if (entry === undefined)
+    return;
+  if (Array.isArray(entry.permissions) && entry.permissions.length > 0)
+    return "waiting-permission";
+  if (Array.isArray(entry.forms) && entry.forms.length > 0)
+    return "waiting-question";
+  return;
+}
+function captainEventBody(event) {
+  switch (event.kind) {
+    case "waiting-permission":
+      return `"${event.taskTitle}" is waiting on a permission approval.`;
+    case "waiting-question":
+      return `"${event.taskTitle}" is waiting on an answer to a question.`;
+    case "failed":
+      return `"${event.taskTitle}" failed.`;
+    default:
+      return;
   }
 }
 
@@ -1231,7 +1325,7 @@ class WatchSettingsError extends Error {
 var lastOutputMaxLength = 2000;
 var watchTimeoutMs = 60000;
 function createWatchRunner(input) {
-  const { filesystem, exec, clock, homeRoot } = input;
+  const { filesystem, exec, clock, homeRoot, fetcher, resolveSupport } = input;
   const timeoutMs = input.timeoutMs ?? watchTimeoutMs;
   const runStates = new Map;
   const stateKey = (slug, source, name) => `${slug}
@@ -1384,19 +1478,30 @@ ${name}`;
       message: `FirstMate (${slug}) watch ${watch.name}:
 ${output}`
     });
+    try {
+      await notifyCaptain({
+        fetcher,
+        support: await resolveSupport(),
+        title: `FirstMate — ${watch.name} fired`,
+        body: output.slice(0, 500)
+      });
+    } catch {}
   }
   async function listWatches(slug) {
     const watches = await discoverWatches(slug);
     const enabledOverrides = await loadEnabledOverrides(slug);
+    const now = new Date(clock.nowMs());
     return watches.map((watch) => {
       const runState = runStates.get(stateKey(slug, watch.source, watch.name));
+      const enabled = isEnabled(enabledOverrides, watch.source, watch.name);
       return {
         name: watch.name,
         source: watch.source,
         schedule: watch.schedule,
-        enabled: isEnabled(enabledOverrides, watch.source, watch.name),
+        enabled,
         path: watch.scriptPath,
         ...watch.error !== undefined ? { error: watch.error } : {},
+        nextRun: enabled && watch.error === undefined ? computeNextRun(parseCronExpression(watch.schedule), now)?.getTime() ?? null : null,
         ...runState?.lastRunAt !== undefined ? { lastRunAt: runState.lastRunAt } : {},
         ...runState?.lastOutcome !== undefined ? { lastOutcome: runState.lastOutcome } : {},
         ...runState?.lastOutput !== undefined && runState.lastOutput !== "" ? { lastOutput: runState.lastOutput } : {}
@@ -1516,7 +1621,9 @@ var nodeFileSystem = {
   readFile: (filePath) => readFile(filePath, "utf8"),
   writeFile: (filePath, contents) => writeFile(filePath, contents, "utf8"),
   appendFile: (filePath, contents) => appendFile(filePath, contents, "utf8"),
-  createDirectory: (directoryPath) => mkdir(directoryPath, { recursive: true }),
+  createDirectory: async (directoryPath) => {
+    await mkdir(directoryPath, { recursive: true });
+  },
   rename: (fromPath, toPath) => rename(fromPath, toPath),
   listDirectories: async (directoryPath) => {
     try {
@@ -1635,7 +1742,14 @@ var supervisionPoller = createSupervisionPoller({
   fetcher: nodeFetcher,
   resolveSupport: () => discoverSupport({ filesystem: nodeFileSystem, settingsPath: openchamberSettingsPath })
 });
-var watchRunner = createWatchRunner({ filesystem: nodeFileSystem, exec: nodeWatchExec, clock, homeRoot });
+var watchRunner = createWatchRunner({
+  filesystem: nodeFileSystem,
+  exec: nodeWatchExec,
+  clock,
+  homeRoot,
+  fetcher: nodeFetcher,
+  resolveSupport: () => discoverSupport({ filesystem: nodeFileSystem, settingsPath: openchamberSettingsPath })
+});
 var roundInFlight = false;
 async function runSupervisionRound() {
   if (roundInFlight)
@@ -1674,7 +1788,7 @@ async function runWatchRound() {
 function isAuthorized(request) {
   return request.headers.authorization === `Bearer ${serviceToken}`;
 }
-function isRecord3(value) {
+function isRecord4(value) {
   return typeof value === "object" && value !== null;
 }
 function respondJson(response, statusCode, body) {
@@ -1699,7 +1813,7 @@ function readJsonBody(request) {
 async function readJsonRecord(request) {
   try {
     const payload = await readJsonBody(request);
-    return isRecord3(payload) ? payload : undefined;
+    return isRecord4(payload) ? payload : undefined;
   } catch {
     return;
   }
@@ -1708,6 +1822,9 @@ function recordString(record, key) {
   const value = record?.[key];
   return typeof value === "string" && value.trim() !== "" ? value : undefined;
 }
+function isWatchSource(value) {
+  return value === undefined || value === "shared" || value === "project";
+}
 async function readProjectDirectory(request) {
   let payload;
   try {
@@ -1715,7 +1832,7 @@ async function readProjectDirectory(request) {
   } catch {
     return;
   }
-  const projectDirectory = isRecord3(payload) ? payload.projectDirectory : undefined;
+  const projectDirectory = isRecord4(payload) ? payload.projectDirectory : undefined;
   if (typeof projectDirectory !== "string" || projectDirectory.trim() === "") {
     return;
   }
@@ -1883,14 +2000,14 @@ async function handleSteer(request, response) {
       text
     });
     supervisionPoller.markSteered(slug, sessionId);
-    if (outcome.coordinatorNotified) {
-      respondJson(response, 200, { sent: true });
+    if (outcome.coordinatorNotified === false) {
+      respondJson(response, 200, {
+        sent: true,
+        warning: `steered the worker, but could not tell the coordinator: ${outcome.coordinatorError}`
+      });
       return;
     }
-    respondJson(response, 200, {
-      sent: true,
-      warning: `steered the worker, but could not tell the coordinator: ${outcome.coordinatorError}`
-    });
+    respondJson(response, 200, { sent: true });
   } catch (error) {
     respondActionError(response, error, "steer failed");
   }
@@ -1998,7 +2115,7 @@ async function handleWatchesToggle(request, response) {
     respondJson(response, 400, { error: "slug and name must be non-empty strings and enabled a boolean" });
     return;
   }
-  if (source !== undefined && source !== "shared" && source !== "project") {
+  if (!isWatchSource(source)) {
     respondJson(response, 400, { error: `source must be "shared" or "project" when given` });
     return;
   }
@@ -2043,7 +2160,7 @@ async function handleWatchSchedule(request, response) {
     respondJson(response, 400, { error: "slug, name, and schedule must be non-empty strings" });
     return;
   }
-  if (source !== undefined && source !== "shared" && source !== "project") {
+  if (!isWatchSource(source)) {
     respondJson(response, 400, { error: `source must be "shared" or "project" when given` });
     return;
   }

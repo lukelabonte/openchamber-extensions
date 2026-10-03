@@ -1,9 +1,11 @@
 import { loadBacklog, type BacklogTask } from "./backlog"
 import { loadArchivedSessionIds } from "./archive"
 import { buildBoardWorker, type BoardWorker, type WorkerObservation } from "./board"
-import { sessionMessagesLastAssistant, sessionStatus, type ExecRunner } from "./control-client"
+import { sessionMessagesLastAssistant, sessionStatus, type ExecRunner, type SessionActivity } from "./control-client"
+import { callDesktopProxy } from "./desktop-proxy"
 import type { FileSystemPort } from "./file-system"
 import type { HttpFetcher, InterruptSupport } from "./interrupt"
+import { notifyCaptain } from "./notifications"
 import { setSessionPermissionAuto } from "./permissions"
 import { loadRegistry, type Registration } from "./registry"
 
@@ -26,6 +28,17 @@ export interface ProjectNotification {
 
 export interface PollRound {
   notifications: ProjectNotification[]
+}
+
+// The host's pending blocking requests keyed by session id, from the desktop
+// server's /api/sessions/status: the permission and form lists each worker
+// session is waiting on.
+interface PendingSnapshot {
+  [sessionId: string]: { permissions?: unknown[]; forms?: unknown[] }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null
 }
 
 // Deterministic relay half of the supervision loop: each round reads the
@@ -91,16 +104,29 @@ export function createSupervisionPoller(input: {
       // project to attach a poll error to.
       return { notifications }
     }
+    // Once per round, not per session: the host's snapshot of pending blocking
+    // requests is one GET, and the captain notifications below ride the same
+    // resolved support. Anything wrong — no support, failed call, unexpected
+    // shape — answers undefined and the round degrades to the CLI-only
+    // behavior; a host without the desktop proxy must never fail the round.
+    let support: InterruptSupport | undefined
+    try {
+      support = await resolveSupport()
+    } catch {
+      support = undefined
+    }
+    const pending = await fetchPendingSnapshot(support)
     for (const registration of Object.values(registrations)) {
-      const events = await pollProject(registration)
+      const events = await pollProject(registration, pending)
       if (events.length > 0) {
         notifications.push(composeNotification(registration, events))
       }
+      for (const event of events) await notifyEvent(registration, event, support)
     }
     return { notifications }
   }
 
-  async function pollProject(registration: Registration): Promise<WorkerEvent[]> {
+  async function pollProject(registration: Registration, pending: PendingSnapshot | undefined): Promise<WorkerEvent[]> {
     const events: WorkerEvent[] = []
     let backlog: Awaited<ReturnType<typeof loadBacklog>>
     try {
@@ -140,6 +166,11 @@ export function createSupervisionPoller(input: {
         const status = await sessionStatus(exec, { sessionId: task.sessionId, directory })
         const lastWord = await sessionMessagesLastAssistant(exec, { sessionId: task.sessionId, directory })
         const current: WorkerObservation = { status, ...(lastWord !== undefined ? { lastWord } : {}) }
+        // Host data wins over the CLI's busy/idle: a permission request or
+        // form pending on the desktop server is the authoritative blocked
+        // state. No pending entry keeps the CLI-derived activity.
+        const waiting = pending === undefined ? undefined : pendingActivity(pending[task.sessionId])
+        if (waiting !== undefined) current.status = { ...current.status, activity: waiting }
         observations.set(key, current)
         pollErrors.delete(key)
         events.push(...detectEvents(task, previous, current))
@@ -184,6 +215,45 @@ export function createSupervisionPoller(input: {
       activity === "idle" && (previous === undefined ? task.state === "Working" : previous.status.activity === "running")
     if (outcomeFinished || idleFinished) events.push(emit("finished"))
     return events
+  }
+
+  // One GET per round: the host's map of sessions with pending blocking
+  // requests, read through the desktop proxy. Never throws — every failure
+  // mode answers undefined.
+  async function fetchPendingSnapshot(support: InterruptSupport | undefined): Promise<PendingSnapshot | undefined> {
+    if (support === undefined || support.kind === "unsupported") return undefined
+    const outcome = await callDesktopProxy({
+      fetcher,
+      support,
+      method: "GET",
+      path: "/api/sessions/status",
+      label: "session status",
+    })
+    if (outcome.kind !== "ok" || outcome.text === undefined) return undefined
+    try {
+      const parsed: unknown = JSON.parse(outcome.text)
+      if (!isRecord(parsed) || !isRecord(parsed.pending)) return undefined
+      return parsed.pending as PendingSnapshot
+    } catch {
+      return undefined
+    }
+  }
+
+  // Only the blocking and failed transitions reach the captain's desktop: the
+  // coordinator message already carries every event, and the notification is
+  // for the captain away from the desk. Transitions only — the event logic
+  // above is transition-based, so a persisting block never re-notifies.
+  async function notifyEvent(registration: Registration, event: WorkerEvent, support: InterruptSupport | undefined): Promise<void> {
+    const body = captainEventBody(event)
+    if (body === undefined || support === undefined) return
+    await notifyCaptain({
+      fetcher,
+      support,
+      title: `FirstMate — ${registration.slug}`,
+      body,
+      sessionId: event.sessionId,
+      directory: registration.projectDirectory,
+    })
   }
 
   function getBoardWorkers(slug: string, tasks: BacklogTask[]): BoardWorker[] {
@@ -238,5 +308,30 @@ function describeEvent(event: WorkerEvent): string {
       return "was waiting on a permission; the service auto-approves worker permissions, so this should clear itself. If it persists, tell the captain."
     case "steered-answer":
       return `answered the captain's steer: ${event.answer ?? ""}`
+  }
+}
+
+// The waiting activity a host snapshot entry reports: a non-empty permission
+// list wins over a pending form. Entries that do not match the host shape
+// report nothing, keeping the CLI-derived activity.
+function pendingActivity(entry: { permissions?: unknown[]; forms?: unknown[] } | undefined): SessionActivity | undefined {
+  if (entry === undefined) return undefined
+  if (Array.isArray(entry.permissions) && entry.permissions.length > 0) return "waiting-permission"
+  if (Array.isArray(entry.forms) && entry.forms.length > 0) return "waiting-question"
+  return undefined
+}
+
+// The captain notification bodies for the transition kinds that page the
+// captain; other kinds are relayed to the coordinator only.
+function captainEventBody(event: WorkerEvent): string | undefined {
+  switch (event.kind) {
+    case "waiting-permission":
+      return `"${event.taskTitle}" is waiting on a permission approval.`
+    case "waiting-question":
+      return `"${event.taskTitle}" is waiting on an answer to a question.`
+    case "failed":
+      return `"${event.taskTitle}" failed.`
+    default:
+      return undefined
   }
 }

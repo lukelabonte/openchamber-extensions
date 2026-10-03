@@ -70,6 +70,27 @@
         color: var(--fm-muted);
       }
 
+      /* Collapsible sections: the heading toggles its section; the chevron
+         points down when expanded and right when collapsed. */
+      h2.fm-collapsible-heading {
+        cursor: pointer;
+        user-select: none;
+      }
+
+      h2.fm-collapsible-heading:hover {
+        color: var(--fm-fg);
+      }
+
+      h2.fm-collapsible-heading:focus-visible {
+        outline: none;
+        color: var(--fm-accent);
+      }
+
+      .fm-chevron {
+        display: inline-block;
+        margin-right: 4px;
+      }
+
       p {
         margin: 4px 0;
         overflow-wrap: anywhere;
@@ -214,6 +235,32 @@
         margin: 0;
         font-size: 11px;
         color: var(--fm-muted);
+        overflow-wrap: anywhere;
+      }
+
+      /* Worker card extras: the last word is a muted quoted preview clamped
+         to two lines; a blocked card gets an amber note naming what it
+         waits on, in the panel's warning tokens. */
+      .fm-last-word {
+        margin: 0;
+        font-size: 11px;
+        color: var(--fm-muted);
+        overflow-wrap: anywhere;
+        display: -webkit-box;
+        -webkit-box-orient: vertical;
+        -webkit-line-clamp: 2;
+        overflow: hidden;
+      }
+
+      .fm-blocked-note {
+        margin: 0;
+        font-size: 11px;
+        line-height: 1.45;
+        color: var(--fm-warning);
+        background: color-mix(in srgb, var(--fm-warning) 10%, transparent);
+        border: 1px solid color-mix(in srgb, var(--fm-warning) 35%, transparent);
+        border-radius: 6px;
+        padding: 4px 8px;
         overflow-wrap: anywhere;
       }
 

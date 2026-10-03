@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { groupBoardColumns, parseBoardWorkers, toBoardCard } from "../panel/board"
+import { groupBoardColumns, parseBoardWorkers, parseSupervision, toBoardCard, type SupervisionHealth } from "../panel/board"
 
 describe("board columns", () => {
   test("hides empty columns and orders the rest in board order", () => {
@@ -112,5 +112,66 @@ describe("board worker parsing", () => {
 
   test("a non-array payload yields an empty board", () => {
     expect(parseBoardWorkers("nope")).toEqual({ workers: [], malformedCount: 0 })
+  })
+
+  test("keeps a parseable stall baseline and drops an unparseable one", () => {
+    const parsed = parseBoardWorkers([{ title: "Ship login", state: "Working", possiblyStalledSince: "2026-10-01T10:00:00.000Z" }])
+    expect(parsed.workers).toEqual([{ title: "Ship login", state: "Working", possiblyStalledSince: "2026-10-01T10:00:00.000Z" }])
+    const dropped = parseBoardWorkers([{ title: "Ship login", state: "Working", possiblyStalledSince: "not a date" }])
+    expect(dropped.workers).toEqual([{ title: "Ship login", state: "Working" }])
+  })
+
+  test("a non-string stall baseline makes the whole worker malformed", () => {
+    const parsed = parseBoardWorkers([{ title: "t", state: "Working", possiblyStalledSince: 7 }])
+    expect(parsed.workers).toEqual([])
+    expect(parsed.malformedCount).toBe(1)
+  })
+})
+
+describe("supervision parsing", () => {
+  const validRecord = {
+    blockedObservation: "degraded",
+    blockedObservationReason: "worker transcript unreadable",
+    failureObservation: "unavailable",
+    failureObservationReason: "host bridge closed",
+    lastSuccessfulPollAt: "2026-10-01T10:00:00.000Z",
+  } satisfies SupervisionHealth
+
+  test("preserves a valid exact service object, optional fields included", () => {
+    expect(parseSupervision(validRecord)).toEqual(validRecord)
+  })
+
+  test("keeps a record without the optional fields and adds none", () => {
+    expect(parseSupervision({ blockedObservation: "working", failureObservation: "working" })).toEqual({
+      blockedObservation: "working",
+      failureObservation: "working",
+    })
+  })
+
+  test("rejects invalid observation states and non-string reasons", () => {
+    expect(parseSupervision({ blockedObservation: "available", failureObservation: "working" })).toBeUndefined()
+    expect(parseSupervision({ failureObservation: "working" })).toBeUndefined() // blocked observation missing
+    expect(
+      parseSupervision({ blockedObservation: "working", failureObservation: "working", failureObservationReason: 7 }),
+    ).toBeUndefined()
+  })
+
+  test("drops invalid timestamps but keeps the rest of the record", () => {
+    expect(parseSupervision({ blockedObservation: "working", failureObservation: "working", lastSuccessfulPollAt: 7 })).toEqual({
+      blockedObservation: "working",
+      failureObservation: "working",
+    })
+    expect(
+      parseSupervision({ blockedObservation: "working", failureObservation: "working", lastSuccessfulPollAt: "day before yesterday" }),
+    ).toEqual({
+      blockedObservation: "working",
+      failureObservation: "working",
+    })
+  })
+
+  test("non-object payloads yield no record", () => {
+    expect(parseSupervision(undefined)).toBeUndefined()
+    expect(parseSupervision(null)).toBeUndefined()
+    expect(parseSupervision("nope")).toBeUndefined()
   })
 })

@@ -2,6 +2,16 @@
 // landings list the service serves at GET /shipping?slug=… . projects.md is
 // the record; the panel only displays the mode and offers no editing.
 
+// The optional cleanup claim the service joins onto a landing from the
+// backlog record: the recorded absolute worktree directory and its on-disk
+// state as of one stat. FirstMate itself never deletes anything.
+export type LandingCleanupState = "pending" | "removed" | "unknown"
+
+export interface LandingCleanup {
+  worktree: string
+  state: LandingCleanupState
+}
+
 export interface LandingRow {
   task: string
   commit: string
@@ -10,6 +20,7 @@ export interface LandingRow {
   authorization: string
   landedAt: string
   pr?: string
+  cleanup?: LandingCleanup
 }
 
 export interface ShippingInfo {
@@ -17,6 +28,8 @@ export interface ShippingInfo {
   yolo: boolean
   landings: LandingRow[]
   landingErrors: string[]
+  /** Present when the service could not establish worktree cleanup state at all (e.g. the backlog could not be read). */
+  cleanupError?: string
 }
 
 // Panel-side shape guard for the /shipping payload: a malformed answer means
@@ -36,6 +49,7 @@ export function parseShipping(value: unknown): ShippingInfo | undefined {
     yolo,
     landings: parseLandingRows(record.landings),
     landingErrors: parseStringList(record.landingErrors),
+    ...(typeof record.cleanupError === "string" ? { cleanupError: record.cleanupError } : {}),
   }
 }
 
@@ -50,7 +64,8 @@ function parseLandingRows(value: unknown): LandingRow[] {
 }
 
 // Only a row with all six canonical fields as strings is shown; the optional
-// pr rides along only when it is a string.
+// pr rides along only when it is a string. An invalid cleanup claim drops the
+// cleanup field alone — the landing itself stays visible.
 function toLandingRow(value: unknown): LandingRow | undefined {
   if (typeof value !== "object" || value === null) return undefined
   const record = value as Record<string, unknown>
@@ -67,7 +82,17 @@ function toLandingRow(value: unknown): LandingRow | undefined {
   }
   const row: LandingRow = { task, commit, ci, mode, authorization, landedAt }
   if (typeof record.pr === "string") row.pr = record.pr
+  const cleanup = toLandingCleanup(record.cleanup)
+  if (cleanup !== undefined) row.cleanup = cleanup
   return row
+}
+
+function toLandingCleanup(value: unknown): LandingCleanup | undefined {
+  if (typeof value !== "object" || value === null) return undefined
+  const record = value as Record<string, unknown>
+  if (typeof record.worktree !== "string" || record.worktree === "") return undefined
+  if (record.state !== "pending" && record.state !== "removed" && record.state !== "unknown") return undefined
+  return { worktree: record.worktree, state: record.state }
 }
 
 function parseStringList(value: unknown): string[] {

@@ -48,10 +48,28 @@ export async function sessionStatus(exec: ExecRunner, input: { sessionId: string
   return { activity: extractActivity(parsed), outcome: extractOutcome(parsed) }
 }
 
-export async function sessionMessagesLastAssistant(exec: ExecRunner, input: { sessionId: string; directory: string }): Promise<string | undefined> {
+// The last assistant message's identity and full text, from the SAME
+// `session messages --last-assistant` CLI command the plain text reader uses.
+// The stall detector signatures on all of id + timestamps + full text — a
+// streaming message keeps its id while its text grows, and that growth is
+// progress. Timestamps are accepted only as finite numbers (the
+// runtime-verified shape carries numbers; numeric strings are not part of
+// the contract). Absent fields are simply absent — never fabricated.
+export interface SessionLastAssistant {
+  text?: string
+  id?: string
+  createdAt?: number
+  completedAt?: number
+}
+
+export async function sessionLastAssistant(exec: ExecRunner, input: { sessionId: string; directory: string }): Promise<SessionLastAssistant> {
   const output = await runControlCommand(exec, ["session", "messages", "--session", input.sessionId, "--dir", input.directory, "--last-assistant", "--json"])
   const parsed = parseJsonOutput(output)
-  return extractAssistantText(parsed)
+  return extractLastAssistant(parsed)
+}
+
+export async function sessionMessagesLastAssistant(exec: ExecRunner, input: { sessionId: string; directory: string }): Promise<string | undefined> {
+  return (await sessionLastAssistant(exec, input)).text
 }
 
 export async function sessionSend(exec: ExecRunner, input: { sessionId: string; directory: string; prompt: string }): Promise<void> {
@@ -142,20 +160,30 @@ function extractOutcome(parsed: unknown): SessionOutcome {
 
 // Runtime-verified shape (openchamber CLI, captured 2026-10-02):
 // `session messages --last-assistant --json` → {"status":"ok","sessionId":"…","directory":"…","role":"assistant","sessionStatus":{"type":"idle"},"messages":[{"id":"…","role":"assistant","createdAt":…,"completedAt":…,"model":"…","text":"…"}]}
-// — assistant text is messages[0].text. The older top-level text keys stay as
-// fallback for other host classes.
-function extractAssistantText(parsed: unknown): string | undefined {
-  if (typeof parsed === "string") return parsed === "" ? undefined : parsed
-  if (!isRecord(parsed)) return undefined
-  if (Array.isArray(parsed.messages)) {
-    const first = parsed.messages[0]
-    if (isRecord(first) && typeof first.text === "string" && first.text !== "") return first.text
+// — identity fields come from messages[0]; assistant text is messages[0].text.
+// The older top-level text keys stay as fallback for other host classes
+// (they carry no message id, so only the text is taken from there).
+function extractLastAssistant(parsed: unknown): SessionLastAssistant {
+  if (typeof parsed === "string") return parsed === "" ? {} : { text: parsed }
+  if (!isRecord(parsed)) return {}
+  const first = Array.isArray(parsed.messages) && isRecord(parsed.messages[0]) ? parsed.messages[0] : undefined
+  const text =
+    first !== undefined && typeof first.text === "string" && first.text !== ""
+      ? first.text
+      : (["text", "content", "message"] as const).map((key) => parsed[key]).find((value): value is string => typeof value === "string" && value !== "")
+  const id = first !== undefined && typeof first.id === "string" && first.id !== "" ? first.id : undefined
+  const createdAt = finiteTimestamp(first?.createdAt)
+  const completedAt = finiteTimestamp(first?.completedAt)
+  return {
+    ...(text !== undefined ? { text } : {}),
+    ...(id !== undefined ? { id } : {}),
+    ...(createdAt !== undefined ? { createdAt } : {}),
+    ...(completedAt !== undefined ? { completedAt } : {}),
   }
-  for (const key of ["text", "content", "message"]) {
-    const value = parsed[key]
-    if (typeof value === "string" && value !== "") return value
-  }
-  return undefined
+}
+
+function finiteTimestamp(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

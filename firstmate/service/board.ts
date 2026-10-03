@@ -1,5 +1,5 @@
 import type { BacklogState, BacklogTask } from "./backlog"
-import type { SessionStatus } from "./control-client"
+import type { SessionLastAssistant, SessionStatus } from "./control-client"
 
 // Board-state mapping. The backlog entry's `state:` field is the
 // human/coordinator-owned record; the live session signals from polling only
@@ -38,6 +38,17 @@ export interface WorkerObservation {
   status: SessionStatus
   lastWord?: string
   error?: string
+  /** time.idle of the terminal outcome merged from the host's session info; distinguishes a second, distinct failed terminal from the same one re-observed. */
+  terminalAt?: number
+  /** The last assistant message's id, timestamps, and FULL text from the richer extraction — the signature source for the stall detector. */
+  last?: SessionLastAssistant
+  /**
+   * ISO baseline time of the fixed 30-minute no-message-progress stall flag.
+   * Present only while the flag is currently observable — a poll failure,
+   * any non-running activity, or a new message signature drops it, so a
+   * stale flag is never shown as current confidence.
+   */
+  possiblyStalledSince?: string
 }
 
 export interface BoardWorker {
@@ -50,6 +61,8 @@ export interface BoardWorker {
   worktree?: string
   branch?: string
   lastPollError?: string
+  /** ISO baseline of the cautious stall flag: >=30 minutes of no observed message progress on a continuously running worker. Advisory only — nothing stops automatically. */
+  possiblyStalledSince?: string
 }
 
 const lastWordMaxLength = 280
@@ -85,6 +98,7 @@ export function buildBoardWorker(task: BacklogTask, observation?: WorkerObservat
   const lastWord = observation?.lastWord
   if (lastWord !== undefined) worker.lastWord = truncateLastWord(lastWord)
   if (observation?.error !== undefined) worker.lastPollError = observation.error
+  if (observation?.possiblyStalledSince !== undefined) worker.possiblyStalledSince = observation.possiblyStalledSince
   return worker
 }
 

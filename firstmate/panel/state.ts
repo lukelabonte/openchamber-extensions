@@ -1,4 +1,4 @@
-import { groupBoardColumns, type BoardColumn, type BoardWorker } from "./board"
+import { groupBoardColumns, type BoardColumn, type BoardWorker, type SupervisionHealth } from "./board"
 import type { ShippingInfo } from "./shipping"
 import type { SuggestionRow } from "./suggestions"
 import type { WatchRow } from "./watches"
@@ -16,7 +16,14 @@ export interface RegistrationInfo {
 // when the live onSessions subscription fires.
 export type Board =
   | { kind: "loading" }
-  | { kind: "ready"; columns: BoardColumn[]; warning?: string; refreshing: boolean }
+  | {
+      kind: "ready"
+      columns: BoardColumn[]
+      warning?: string
+      /** The service's supervision health, when this payload carried a well-formed record. */
+      supervision?: SupervisionHealth
+      refreshing: boolean
+    }
   | { kind: "error"; message: string }
 
 export type PanelState =
@@ -29,9 +36,11 @@ export type PanelState =
       registration: RegistrationInfo
       coordinatorTitle?: string
       board: Board
-      /** The service's watch list for this project, once fetched. */
+      /** The project's watch rows, once fetched. */
       watches?: WatchRow[]
       watchesError?: string
+      /** The service's top-level watch delivery summary, when any watch has an undelivered notification. */
+      watchesDeliveryError?: string
       /** The project's shipping mode, once fetched from GET /shipping. */
       shipping?: ShippingInfo
       /** The project's suggestion rows, once fetched from GET /suggestions. */
@@ -52,9 +61,9 @@ export type PanelEvent =
   | { type: "launch-started" }
   | { type: "launch-succeeded"; registration: RegistrationInfo }
   | { type: "launch-failed"; cliMissing: boolean; message: string }
-  | { type: "board-loaded"; workers: BoardWorker[]; malformedCount?: number; deliveryError?: string }
+  | { type: "board-loaded"; workers: BoardWorker[]; malformedCount?: number; deliveryError?: string; supervision?: SupervisionHealth }
   | { type: "board-failed"; message: string }
-  | { type: "watches-loaded"; watches: WatchRow[] }
+  | { type: "watches-loaded"; watches: WatchRow[]; deliveryError?: string }
   | { type: "watches-failed"; message: string }
   | { type: "shipping-loaded"; shipping: ShippingInfo }
   | { type: "suggestions-loaded"; suggestions: SuggestionRow[] }
@@ -110,6 +119,10 @@ export function reducePanelState(state: PanelState, event: PanelEvent): PanelSta
           kind: "ready",
           columns: groupBoardColumns(event.workers),
           ...(warning !== undefined ? { warning } : {}),
+          // A payload without a well-formed supervision record (older
+          // service, version skew) leaves the field unset — rendered as
+          // "Unknown", never as a healthy claim.
+          ...(event.supervision !== undefined ? { supervision: event.supervision } : {}),
           refreshing: false,
         },
       }
@@ -119,7 +132,12 @@ export function reducePanelState(state: PanelState, event: PanelEvent): PanelSta
       return { ...state, board: { kind: "error", message: event.message } }
     case "watches-loaded":
       if (state.kind !== "registered") return state
-      return { ...state, watches: event.watches, watchesError: undefined }
+      return {
+        ...state,
+        watches: event.watches,
+        watchesDeliveryError: event.deliveryError,
+        watchesError: undefined,
+      }
     case "watches-failed":
       if (state.kind !== "registered") return state
       return { ...state, watchesError: event.message }

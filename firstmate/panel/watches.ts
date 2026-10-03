@@ -21,6 +21,10 @@ export interface WatchRow {
   nextRun?: number | null
   /** Present when the schedule expression does not parse; such a watch never runs. */
   error?: string
+  /** Why the last execution failed, when it did; independent of delivery state. */
+  lastError?: string
+  /** Why the last run's coordinator notification could not be delivered; independent of execution state. */
+  deliveryError?: string
 }
 
 // Panel-side shape guard for the /watches payload: a malformed watch entry is
@@ -38,7 +42,7 @@ export function parseWatches(value: unknown): WatchRow[] {
 function parseWatch(value: unknown): WatchRow | undefined {
   if (typeof value !== "object" || value === null) return undefined
   const record = value as Record<string, unknown>
-  const { name, source, schedule, enabled, path, lastRunAt, lastOutcome, lastOutput, nextRun, error } = record
+  const { name, source, schedule, enabled, path, lastRunAt, lastOutcome, lastOutput, nextRun, error, lastError, deliveryError } = record
   if (typeof name !== "string" || name === "") return undefined
   if (source !== "shared" && source !== "project") return undefined
   if (typeof schedule !== "string" || schedule === "") return undefined
@@ -48,7 +52,9 @@ function parseWatch(value: unknown): WatchRow | undefined {
     !isOptionalString(lastRunAt) ||
     !isOptionalString(lastOutput) ||
     !isOptionalNumberOrNull(nextRun) ||
-    !isOptionalString(error)
+    !isOptionalString(error) ||
+    !isOptionalString(lastError) ||
+    !isOptionalString(deliveryError)
   ) {
     return undefined
   }
@@ -66,6 +72,8 @@ function parseWatch(value: unknown): WatchRow | undefined {
     ...(lastOutput !== undefined ? { lastOutput } : {}),
     ...(nextRun !== undefined ? { nextRun } : {}),
     ...(error !== undefined ? { error } : {}),
+    ...(lastError !== undefined ? { lastError } : {}),
+    ...(deliveryError !== undefined ? { deliveryError } : {}),
   }
 }
 

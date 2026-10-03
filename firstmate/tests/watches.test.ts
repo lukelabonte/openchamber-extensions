@@ -189,12 +189,16 @@ describe("createWatchRunner tick", () => {
         coordinatorSessionId: "ses_coord_1",
         homeDirectory: projectHome,
         message: "FirstMate (sunrise) watch pr-watch:\nall quiet",
+        watchName: "pr-watch",
+        source: "shared",
       },
       {
         slug,
         coordinatorSessionId: "ses_coord_1",
         homeDirectory: projectHome,
         message: "FirstMate (sunrise) watch nightly:\nall quiet",
+        watchName: "nightly",
+        source: "project",
       },
     ])
   })

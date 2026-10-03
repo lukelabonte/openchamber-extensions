@@ -1,6 +1,6 @@
 import { connectHost } from "@openchamber/sdk"
 import { applyHostReady, mountBadge, type Tone } from "@openchamber/sdk/ui"
-import { parseBoardWorkers, type BoardCard, type BoardColumn } from "./board"
+import { parseBoardWorkers, parseSupervision, type BoardCard, type BoardColumn, type SupervisionHealth } from "./board"
 import { parseShipping, shippingBadgeLabel, type LandingRow, type ShippingInfo } from "./shipping"
 import { parseSuggestions, type SuggestionRow } from "./suggestions"
 import { initialPanelState, reducePanelState, type Board, type PanelEvent, type PanelState, type RegistrationInfo } from "./state"
@@ -13,6 +13,7 @@ const boardRefreshIntervalMs = 30_000
 
 let state: PanelState = initialPanelState()
 let currentDirectory: string | null = null
+let hasReceivedReady = false
 let activeRegistration: RegistrationInfo | null = null
 let unsubscribeSessions: (() => void) | null = null
 let sessionsAttachInFlight = false
@@ -21,9 +22,16 @@ let boardFetchTimer: number | null = null
 let refreshLabelTimer: number | null = null
 let manualRefreshInFlight = false
 let lastRefreshedAt: number | null = null
+let refreshFailed = false
 
 host.onReady((ctx) => {
   applyHostReady(ctx, document.documentElement)
+  // The host replays ready with an unchanged directory (iframe loads,
+  // payload changes): the theme above reapplies every time, but the flow
+  // only starts on the first ready — even a null-directory one, which a
+  // naive equality guard would swallow — or on a genuine directory change.
+  if (hasReceivedReady && ctx.directory === currentDirectory) return
+  hasReceivedReady = true
   resetTo(ctx.directory)
 })
 
@@ -136,9 +144,13 @@ function stopBoardFlow(): void {
   refreshLabelTimer = null
   manualRefreshInFlight = false
   lastRefreshedAt = null
+  refreshFailed = false
   // A directory change (or re-registration) closes any open watch editor or
-  // creation form; its drafts belonged to the previous project.
+  // creation form; its drafts belonged to the previous project. Run-now
+  // in-flight markers and per-watch feedback belong to it too.
   watchFormState = { kind: "closed" }
+  watchRunsInFlight.clear()
+  watchRunMessages.clear()
 }
 
 // Attaches the live onSessions subscription for the registration's project.
@@ -187,33 +199,54 @@ function scheduleBoardFetch(): void {
 }
 
 // The periodic cycle runs the same four fetches as the manual refresh. Only
-// the initial mount and the manual click mark freshness (`markRefreshed`):
-// the periodic cycle and the subscription-driven refetches must never reset
-// the timestamp, so the label can age instead of being pinned at "just now".
+// the initial mount and the manual click (the deliberate cycles) settle the
+// control: they mark freshness only when all four fetches succeeded — the
+// shipping badge's quiet "no badge this round" counts as a failure too — and
+// any failed deliberate cycle shows the explicit failure state. The periodic
+// cycle and the subscription-driven refetches never reset the timestamp or
+// the failure state, so the label can age instead of being pinned at "just
+// now".
 async function runFullRefresh(markRefreshed: boolean): Promise<void> {
-  await Promise.all([fetchBoard(), fetchWatches(), fetchShipping(), fetchSuggestions()])
+  const registration = activeRegistration
+  if (registration === null) return
+  const outcomes = await Promise.all([fetchBoard(), fetchWatches(), fetchShipping(), fetchSuggestions()])
+  // The captain may have switched projects while the cycle ran; a
+  // superseded cycle's completion must not mark the new flow's age or
+  // failure state.
+  if (activeRegistration !== registration) return
   if (!markRefreshed) return
-  lastRefreshedAt = Date.now()
+  if (outcomes.every((succeeded) => succeeded)) {
+    refreshFailed = false
+    lastRefreshedAt = Date.now()
+  } else {
+    refreshFailed = true
+  }
   updateRefreshControl()
 }
 
 // A manual press marks the control ("Refreshing…" + disabled) for the run's
-// duration and then reports the fresh age.
+// duration and then reports the outcome: a fresh age on success, the last
+// good age plus the failure otherwise. A stale completion (the directory
+// switched mid-run) leaves the control alone — the new flow owns it now.
 async function manualRefresh(): Promise<void> {
+  const registration = activeRegistration
   manualRefreshInFlight = true
   updateRefreshControl()
   try {
     await runFullRefresh(true)
   } finally {
-    manualRefreshInFlight = false
-    updateRefreshControl()
+    if (activeRegistration === registration) {
+      manualRefreshInFlight = false
+      updateRefreshControl()
+    }
   }
 }
 
 function refreshButton(): HTMLElement {
   const button = document.createElement("button")
   button.className = "fm-button fm-refresh"
-  button.title = "Data refreshes automatically in the background; this shows the last manual refresh."
+  button.title =
+    "The age shows the last successful initial or manual refresh; automatic background refreshes do not reset it, so it can be older than the most recent background fetch."
   button.addEventListener("click", () => {
     if (manualRefreshInFlight || activeRegistration === null) return
     void manualRefresh()
@@ -231,11 +264,22 @@ function updateRefreshControl(): void {
 
 function applyRefreshLabel(button: HTMLButtonElement): void {
   button.disabled = manualRefreshInFlight || activeRegistration === null
+  if (manualRefreshInFlight) {
+    button.textContent = "Refreshing…"
+    return
+  }
+  // A failed deliberate cycle (initial or manual) must never read as fresh:
+  // without a prior successful age the failure is all there is to say, with
+  // one the last good age stays visible beside the failure.
+  if (refreshFailed) {
+    button.textContent = lastRefreshedAt === null
+      ? "Refresh failed"
+      : `Refresh failed (${refreshAgeLabel(lastRefreshedAt)})`
+    return
+  }
   // Before a freshly registered panel's first fetch settles there is no age
   // to report; the run is already under way, so say so.
-  button.textContent = manualRefreshInFlight || lastRefreshedAt === null
-    ? "Refreshing…"
-    : refreshAgeLabel(lastRefreshedAt)
+  button.textContent = lastRefreshedAt === null ? "Refreshing…" : refreshAgeLabel(lastRefreshedAt)
 }
 
 function refreshAgeLabel(timestamp: number): string {
@@ -246,22 +290,22 @@ function refreshAgeLabel(timestamp: number): string {
   return `Refreshed ${Math.floor(minutes / 60)}h ago`
 }
 
-async function fetchBoard(): Promise<void> {
+async function fetchBoard(): Promise<boolean> {
   const registration = activeRegistration
-  if (registration === null) return
+  if (registration === null) return false
   try {
     const result = await host.serviceRequest({ method: "GET", path: "/board", query: { slug: registration.slug } })
-    if (activeRegistration !== registration) return
+    if (activeRegistration !== registration) return false
     if (result.status !== 200) {
       dispatch({ type: "board-failed", message: `Reading the board failed (status ${result.status}).` })
-      return
+      return false
     }
-    let body: { workers?: unknown; deliveryError?: string }
+    let body: { workers?: unknown; deliveryError?: string; supervision?: unknown }
     try {
-      body = JSON.parse(result.body) as { workers?: unknown; deliveryError?: string }
+      body = JSON.parse(result.body) as { workers?: unknown; deliveryError?: string; supervision?: unknown }
     } catch {
       dispatch({ type: "board-failed", message: "Reading the board failed: the service sent a malformed answer." })
-      return
+      return false
     }
     // Per-worker shape guard: malformed entries are skipped and counted here,
     // so the reducer never throws on a lying payload.
@@ -271,54 +315,70 @@ async function fetchBoard(): Promise<void> {
       workers: parsed.workers,
       malformedCount: parsed.malformedCount,
       deliveryError: body.deliveryError,
+      supervision: parseSupervision(body.supervision),
     })
+    return true
   } catch {
-    if (activeRegistration !== registration) return
+    if (activeRegistration !== registration) return false
     dispatch({ type: "board-failed", message: "Reading the board failed: the service is unreachable." })
+    return false
   }
 }
 
 // Watches ride the same cadence as the board: one fetch on mount and one per
 // refresh interval. The service is the authority; a toggle is only sent to
 // it, and the refetch carries the authoritative switch state back.
-async function fetchWatches(): Promise<void> {
+async function fetchWatches(): Promise<boolean> {
   const registration = activeRegistration
-  if (registration === null) return
+  if (registration === null) return false
   try {
     const result = await host.serviceRequest({ method: "GET", path: "/watches", query: { slug: registration.slug } })
-    if (activeRegistration !== registration) return
+    if (activeRegistration !== registration) return false
     if (result.status !== 200) {
       dispatch({ type: "watches-failed", message: `Reading the watches failed (status ${result.status}).` })
-      return
+      return false
     }
-    let body: { watches?: unknown }
+    let body: { watches?: unknown; deliveryError?: string }
     try {
-      body = JSON.parse(result.body) as { watches?: unknown }
+      body = JSON.parse(result.body) as { watches?: unknown; deliveryError?: string }
     } catch {
       dispatch({ type: "watches-failed", message: "Reading the watches failed: the service sent a malformed answer." })
-      return
+      return false
     }
-    dispatch({ type: "watches-loaded", watches: parseWatches(body.watches) })
+    dispatch({ type: "watches-loaded", watches: parseWatches(body.watches), deliveryError: body.deliveryError })
+    return true
   } catch {
-    if (activeRegistration !== registration) return
+    if (activeRegistration !== registration) return false
     dispatch({ type: "watches-failed", message: "Reading the watches failed: the service is unreachable." })
+    return false
   }
 }
 
 // The shipping mode rides the same cadence as the board and the watches: one
 // fetch on mount and one per refresh interval. A failed or malformed answer
-// means no badge this round; the next tick retries.
-async function fetchShipping(): Promise<void> {
+// means no badge this round and reports failure to the refresh aggregate —
+// a quietly absent badge must never read as a successful refresh; the next
+// tick retries.
+async function fetchShipping(): Promise<boolean> {
   const registration = activeRegistration
-  if (registration === null) return
+  if (registration === null) return false
   try {
     const result = await host.serviceRequest({ method: "GET", path: "/shipping", query: { slug: registration.slug } })
-    if (activeRegistration !== registration) return
-    if (result.status !== 200) return
-    const shipping = parseShipping(JSON.parse(result.body))
-    if (shipping !== undefined) dispatch({ type: "shipping-loaded", shipping })
+    if (activeRegistration !== registration) return false
+    if (result.status !== 200) return false
+    let body: unknown
+    try {
+      body = JSON.parse(result.body)
+    } catch {
+      return false
+    }
+    const shipping = parseShipping(body)
+    if (shipping === undefined) return false
+    dispatch({ type: "shipping-loaded", shipping })
+    return true
   } catch {
-    // Retried on the next refresh tick.
+    // Retried on the next refresh tick; reported as a failed fetch above.
+    return false
   }
 }
 
@@ -326,27 +386,29 @@ async function fetchShipping(): Promise<void> {
 // shipping badge: one fetch on mount and one per refresh interval. The
 // service is the authority on suggestions.md; a send or dismiss is only sent
 // to it, and the refetch carries the file's new state back.
-async function fetchSuggestions(): Promise<void> {
+async function fetchSuggestions(): Promise<boolean> {
   const registration = activeRegistration
-  if (registration === null) return
+  if (registration === null) return false
   try {
     const result = await host.serviceRequest({ method: "GET", path: "/suggestions", query: { slug: registration.slug } })
-    if (activeRegistration !== registration) return
+    if (activeRegistration !== registration) return false
     if (result.status !== 200) {
       dispatch({ type: "suggestions-failed", message: `Reading the suggestions failed (status ${result.status}).` })
-      return
+      return false
     }
     let body: { suggestions?: unknown }
     try {
       body = JSON.parse(result.body) as { suggestions?: unknown }
     } catch {
       dispatch({ type: "suggestions-failed", message: "Reading the suggestions failed: the service sent a malformed answer." })
-      return
+      return false
     }
     dispatch({ type: "suggestions-loaded", suggestions: parseSuggestions(body.suggestions) })
+    return true
   } catch {
-    if (activeRegistration !== registration) return
+    if (activeRegistration !== registration) return false
     dispatch({ type: "suggestions-failed", message: "Reading the suggestions failed: the service is unreachable." })
+    return false
   }
 }
 
@@ -670,6 +732,12 @@ function landingsSection(shipping: ShippingInfo, board: Board): HTMLElement {
   const section = document.createElement("section")
   section.append(collapsibleHeading("landings", "Landings"))
   if (collapsedSections.has("landings")) return section
+  // Cleanup visibility ground rule, stated once: the extension never deletes.
+  const cleanupCaption = document.createElement("p")
+  cleanupCaption.className = "fm-caption"
+  cleanupCaption.textContent = "FirstMate does not delete worktrees or branches; cleanup after a landing is yours."
+  section.append(cleanupCaption)
+  if (shipping.cleanupError !== undefined) section.append(warningCallout(shipping.cleanupError))
   for (const error of shipping.landingErrors) section.append(warningCallout(error))
   if (shipping.landings.length === 0) {
     if (shipping.landingErrors.length === 0) section.append(text("No landings."))
@@ -732,7 +800,39 @@ function landingRow(landing: LandingRow, sessionId: string | undefined): HTMLEle
     metaPiece("landed", metaValue(formatLanded(landing.landedAt))),
   )
   row.append(task, meta)
+  if (landing.cleanup !== undefined) row.append(cleanupDisplay(landing.cleanup))
   return row
+}
+
+// The landing's worktree cleanup state as the service observed it with one
+// stat of the recorded directory: pending shows the amber badge plus the
+// wrapped recorded path, removed may say so, unknown says exactly that, and
+// no claim renders nothing. There is deliberately no cleanup action —
+// FirstMate does not delete worktrees or branches.
+function cleanupDisplay(cleanup: NonNullable<LandingRow["cleanup"]>): HTMLElement {
+  const block = document.createElement("div")
+  block.className = "fm-cleanup"
+  if (cleanup.state === "pending") {
+    const badge = warningBadge("Awaiting captain cleanup")
+    badge.title = cleanup.worktree
+    block.append(badge)
+    const worktreePath = document.createElement("span")
+    worktreePath.className = "fm-watch-path"
+    worktreePath.textContent = cleanup.worktree
+    worktreePath.title = cleanup.worktree
+    block.append(worktreePath)
+  } else if (cleanup.state === "removed") {
+    const note = document.createElement("span")
+    note.className = "fm-note"
+    note.textContent = "Worktree removed."
+    block.append(note)
+  } else {
+    const note = document.createElement("span")
+    note.className = "fm-note"
+    note.textContent = "Cleanup status unknown."
+    block.append(note)
+  }
+  return block
 }
 
 // One labeled piece of the landing meta line: muted label, then the value.
@@ -783,6 +883,71 @@ function formatLanded(iso: string): string {
     : parsed.toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" })
 }
 
+// Supervision health rows above the board columns: what the service's two
+// host-observation channels saw on their last round, and when that round
+// was. Nothing here claims to be live — the poll age is shown as its own
+// number, marked stale once it passes a minute, and a missing or
+// malformed record reads "Unknown" rather than healthy. The words reuse the
+// panel's tiny text tokens; the state is always spelled out, never color-only.
+function supervisionRows(supervision: SupervisionHealth | undefined): HTMLElement {
+  const block = document.createElement("div")
+  block.className = "fm-supervision"
+  const rows = document.createElement("div")
+  rows.className = "fm-landing-meta"
+  const blockedValue = metaValue(observationLabel(supervision?.blockedObservation, supervision?.blockedObservationReason))
+  if (supervision?.blockedObservationReason !== undefined) blockedValue.title = supervision.blockedObservationReason
+  const failureValue = metaValue(observationLabel(supervision?.failureObservation, supervision?.failureObservationReason))
+  if (supervision?.failureObservationReason !== undefined) failureValue.title = supervision.failureObservationReason
+  const poll = pollAge(supervision?.lastSuccessfulPollAt)
+  const pollValue = metaValue(poll.label)
+  if (poll.title !== undefined) pollValue.title = poll.title
+  rows.append(
+    metaPiece("blocked observation", blockedValue),
+    metaPiece("failure observation", failureValue),
+    metaPiece("last successful poll", pollValue),
+  )
+  block.append(rows)
+  // The fallback spelled out: an observation channel can answer and still
+  // miss what the captain actually cares about.
+  const caption = document.createElement("p")
+  caption.className = "fm-caption"
+  caption.textContent =
+    "When observation is degraded or unavailable, a Working card may still be waiting on a question or permission; failures may be unobserved."
+  block.append(caption)
+  return block
+}
+
+// The service's channel states, word for word; a missing or malformed record
+// is "Unknown" — never a healthy claim.
+function observationLabel(state: SupervisionHealth["blockedObservation"] | undefined, reason: string | undefined): string {
+  const word = state === "working" ? "Available" : state === "degraded" ? "Degraded" : state === "unavailable" ? "Unavailable" : "Unknown"
+  return reason === undefined ? word : `${word} — ${reason}`
+}
+
+// The last successful poll as a relative age ("just now", "3m ago") with the
+// full timestamp on hover; past a minute it is marked stale, and an absent
+// or unparseable time reads "Not polled yet". A timestamp ahead of the
+// local clock is an anomaly, not freshness — it says so instead of reading
+// "just now" as healthy. Never the word "live".
+function pollAge(iso: string | undefined): { label: string; title?: string } {
+  if (iso === undefined) return { label: "Not polled yet" }
+  const date = new Date(iso)
+  if (Number.isNaN(date.getTime())) return { label: "Not polled yet" }
+  const elapsed = Date.now() - date.getTime()
+  if (elapsed < 0) {
+    return {
+      label: "timestamp ahead of local clock",
+      title: date.toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" }),
+    }
+  }
+  const minutes = Math.floor(elapsed / 60_000)
+  const relative = elapsed < 60_000 ? "just now" : minutes < 60 ? `${minutes}m ago` : `${Math.floor(minutes / 60)}h ago`
+  return {
+    label: elapsed <= 60_000 ? relative : `${relative} (stale)`,
+    title: date.toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" }),
+  }
+}
+
 function boardView(board: Board): HTMLElement {
   const container = document.createElement("div")
   container.className = "fm-board"
@@ -795,6 +960,7 @@ function boardView(board: Board): HTMLElement {
       break
     case "ready":
       if (board.warning !== undefined) container.append(warningBadge(board.warning))
+      container.append(supervisionRows(board.supervision))
       if (board.columns.length === 0) {
         container.append(text("The board is empty."))
       } else {
@@ -839,6 +1005,7 @@ function boardCard(card: BoardCard): HTMLElement {
   article.append(title, stateBadge(card))
   if (card.blockedReason !== undefined) article.append(blockedNote(card.blockedReason))
   if (card.warning !== undefined) article.append(warningBadge(card.warning))
+  if (isUnfinished(card.state) && card.possiblyStalledSince !== undefined) article.append(stallNote())
   if (card.branch !== undefined) article.append(branchMeta(card.branch, card.worktree))
   if (card.lastWord !== undefined) article.append(lastWordLine(card.lastWord))
   if (card.prUrl !== undefined) article.append(prLink(card))
@@ -889,6 +1056,25 @@ function blockedNote(reason: NonNullable<BoardCard["blockedReason"]>): HTMLEleme
   const note = document.createElement("p")
   note.className = "fm-blocked-note"
   note.textContent = blockedReasonNotes[reason]
+  return note
+}
+
+// Advisory stall flag, rendered in the same amber as the other cautionary
+// notes. It is deliberately not a state: the card stays Working (or whatever
+// the backlog records), nothing stops automatically, and the note never calls
+// the worker Failed or Blocked. Only shown while the service currently
+// provides the flag on an unfinished worker.
+const stallNoteText =
+  "Possibly stalled — no observed message progress for 30 minutes. Open the session or Interrupt; nothing stops automatically."
+
+function isUnfinished(state: BoardCard["state"]): boolean {
+  return state !== "Done" && state !== "Failed"
+}
+
+function stallNote(): HTMLElement {
+  const note = document.createElement("p")
+  note.className = "fm-blocked-note"
+  note.textContent = stallNoteText
   return note
 }
 
@@ -1296,6 +1482,12 @@ function watchesCard(state: PanelState & { kind: "registered" }): HTMLElement {
     section.append(text("No watches. Add an executable script with a `# schedule:` comment to the home's watches/ directory."))
     return section
   }
+  // The service's top-level delivery summary shows only when no row can show
+  // its own delivery error — the per-row badge is the detail; a summary on
+  // top of it would say the same thing twice.
+  if (state.watchesDeliveryError !== undefined && !state.watches.some((watch) => watch.deliveryError !== undefined)) {
+    section.append(warningCallout(state.watchesDeliveryError))
+  }
   for (const watch of state.watches) section.append(watchRow(watch))
   return section
 }
@@ -1337,6 +1529,8 @@ function watchRow(watch: WatchRow): HTMLElement {
     nextRun,
   )
   if (watch.error !== undefined) summary.append(warningBadge(watch.error))
+  if (watch.lastError !== undefined) summary.append(warningBadge(`run failed: ${watch.lastError}`))
+  if (watch.deliveryError !== undefined) summary.append(warningBadge(`coordinator delivery failed: ${watch.deliveryError}`))
   article.append(summary)
   if (watch.lastOutput !== undefined) article.append(lastOutput(watch.lastOutput))
   const formState = watchFormState
@@ -1345,6 +1539,7 @@ function watchRow(watch: WatchRow): HTMLElement {
   } else {
     article.append(watchEditRow(watch))
   }
+  article.append(watchRunRow(watch))
   return article
 }
 
@@ -1370,6 +1565,95 @@ function watchEditRow(watch: WatchRow): HTMLElement {
   })
   row.append(edit)
   return row
+}
+
+// Manual runs: the in-flight marker and the per-watch feedback message live
+// here, module level, keyed by registration and watch — the DOM is rebuilt on
+// every dispatch, so live elements could carry neither across a background
+// rerender. Keys include the coordinator session id, so a re-registration of
+// the same slug can never mistake an old run's settle for its own feedback.
+const watchRunsInFlight = new Map<string, RegistrationInfo>()
+
+const watchRunMessages = new Map<string, string>()
+
+function watchRunKey(registration: RegistrationInfo, watch: WatchRow): string {
+  return `${registration.coordinatorSessionId}\n${watch.source}\n${watch.name}`
+}
+
+function watchRunRow(watch: WatchRow): HTMLElement {
+  const row = document.createElement("div")
+  row.className = "fm-actions"
+  const run = document.createElement("button")
+  run.className = "fm-button"
+  run.textContent = "Run now"
+  run.setAttribute("aria-label", `Run watch ${watch.name} now`)
+  run.title = "Run this watch once now; a manual run works even while the schedule switch is off."
+  // A watch whose schedule does not parse can never run — the service would
+  // refuse it — so the button stays disabled and says why.
+  if (watch.error !== undefined) {
+    run.disabled = true
+    run.title = `This watch's schedule does not parse, so it cannot run: ${watch.error}`
+  }
+  const registration = activeRegistration
+  const key = registration === null ? undefined : watchRunKey(registration, watch)
+  // The marker lives outside the DOM on purpose: a background refetch
+  // rebuilds this row mid-run, and the rebuilt button must still be disabled.
+  if (key !== undefined && watchRunsInFlight.has(key)) run.disabled = true
+  run.addEventListener("click", () => {
+    const clickRegistration = activeRegistration
+    if (clickRegistration === null) return
+    const runKey = watchRunKey(clickRegistration, watch)
+    // Duplicate-press guard, checked before any await.
+    if (watchRunsInFlight.has(runKey)) return
+    watchRunsInFlight.set(runKey, clickRegistration)
+    run.disabled = true
+    void runWatchNow(clickRegistration, watch, runKey)
+  })
+  const feedback = document.createElement("span")
+  feedback.className = "fm-feedback"
+  feedback.textContent = key === undefined ? "" : watchRunMessages.get(key) ?? ""
+  row.append(run, feedback)
+  return row
+}
+
+async function runWatchNow(registration: RegistrationInfo, watch: WatchRow, key: string): Promise<void> {
+  let feedback: string
+  try {
+    const result = await host.serviceRequest({
+      method: "POST",
+      path: "/watch/run",
+      body: JSON.stringify({ slug: registration.slug, name: watch.name, source: watch.source }),
+    })
+    let parsed: { lastOutcome?: string; lastError?: string; deliveryError?: string; error?: string } = {}
+    try {
+      parsed = JSON.parse(result.body) as typeof parsed
+    } catch {
+      // A non-JSON body only matters through the generic messages below.
+    }
+    if (result.status !== 200) {
+      feedback = parsed.error ?? `Running the watch failed (status ${result.status}).`
+    } else if (parsed.lastOutcome === "failed") {
+      // A failed script is still a completed run: the reason is the message,
+      // never a generic success.
+      feedback = `Watch failed: ${parsed.lastError ?? "the run failed"}`
+    } else if (parsed.deliveryError !== undefined) {
+      feedback = `Ran; coordinator delivery failed: ${parsed.deliveryError}`
+    } else {
+      feedback = "Ran."
+    }
+  } catch {
+    feedback = "Running the watch failed: the service is unreachable."
+  }
+  watchRunsInFlight.delete(key)
+  // Feedback lands only on the project that pressed the button; a stale
+  // settle after a directory switch changes nothing for the new project.
+  if (activeRegistration === registration) {
+    watchRunMessages.set(key, feedback)
+    render(state)
+  }
+  // The refetch carries the run's authoritative outcome back; it is a
+  // background fetch and does not reset the manual-refresh age.
+  void fetchWatches()
 }
 
 // The schedule editor rendered on the card itself: a raw cron input with a

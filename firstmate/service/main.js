@@ -33,10 +33,10 @@ async function sessionStatus(exec, input) {
   const parsed = parseJsonOutput(output);
   return { activity: extractActivity(parsed), outcome: extractOutcome(parsed) };
 }
-async function sessionMessagesLastAssistant(exec, input) {
+async function sessionLastAssistant(exec, input) {
   const output = await runControlCommand(exec, ["session", "messages", "--session", input.sessionId, "--dir", input.directory, "--last-assistant", "--json"]);
   const parsed = parseJsonOutput(output);
-  return extractAssistantText(parsed);
+  return extractLastAssistant(parsed);
 }
 async function sessionSend(exec, input) {
   try {
@@ -104,22 +104,25 @@ function extractOutcome(parsed) {
     return value;
   return null;
 }
-function extractAssistantText(parsed) {
+function extractLastAssistant(parsed) {
   if (typeof parsed === "string")
-    return parsed === "" ? undefined : parsed;
+    return parsed === "" ? {} : { text: parsed };
   if (!isRecord(parsed))
-    return;
-  if (Array.isArray(parsed.messages)) {
-    const first = parsed.messages[0];
-    if (isRecord(first) && typeof first.text === "string" && first.text !== "")
-      return first.text;
-  }
-  for (const key of ["text", "content", "message"]) {
-    const value = parsed[key];
-    if (typeof value === "string" && value !== "")
-      return value;
-  }
-  return;
+    return {};
+  const first = Array.isArray(parsed.messages) && isRecord(parsed.messages[0]) ? parsed.messages[0] : undefined;
+  const text = first !== undefined && typeof first.text === "string" && first.text !== "" ? first.text : ["text", "content", "message"].map((key) => parsed[key]).find((value) => typeof value === "string" && value !== "");
+  const id = first !== undefined && typeof first.id === "string" && first.id !== "" ? first.id : undefined;
+  const createdAt = finiteTimestamp(first?.createdAt);
+  const completedAt = finiteTimestamp(first?.completedAt);
+  return {
+    ...text !== undefined ? { text } : {},
+    ...id !== undefined ? { id } : {},
+    ...createdAt !== undefined ? { createdAt } : {},
+    ...completedAt !== undefined ? { completedAt } : {}
+  };
+}
+function finiteTimestamp(value) {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 function isRecord(value) {
   return typeof value === "object" && value !== null;
@@ -774,6 +777,8 @@ function buildBoardWorker(task, observation) {
     worker.lastWord = truncateLastWord(lastWord);
   if (observation?.error !== undefined)
     worker.lastPollError = observation.error;
+  if (observation?.possiblyStalledSince !== undefined)
+    worker.possiblyStalledSince = observation.possiblyStalledSince;
   return worker;
 }
 function truncateLastWord(text) {
@@ -799,16 +804,77 @@ async function notifyCaptain(input) {
   } catch {}
 }
 
-// service/poller.ts
+// service/session-observation.ts
+async function fetchSessionInfo(input) {
+  if (input.support.kind === "unsupported") {
+    return { kind: "unsupported", reason: input.support.reason };
+  }
+  const outcome = await callDesktopProxy({
+    fetcher: input.fetcher,
+    support: input.support,
+    method: "GET",
+    path: `/api/session/${encodeURIComponent(input.sessionId)}?directory=${encodeURIComponent(input.directory)}`,
+    label: "session info"
+  });
+  if (outcome.kind === "unsupported")
+    return { kind: "unsupported", reason: outcome.reason };
+  if (outcome.kind === "failed")
+    return { kind: "failed", reason: outcome.message };
+  if (outcome.text === undefined)
+    return { kind: "failed", reason: "the session info response body could not be read" };
+  return parseSessionInfo(outcome.text, input.sessionId);
+}
+function parseSessionInfo(text, sessionId) {
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return { kind: "failed", reason: "the session info response was not valid JSON" };
+  }
+  if (!isRecord3(parsed))
+    return { kind: "failed", reason: "the session info response was not a JSON object" };
+  let payload = parsed;
+  if (typeof parsed.id !== "string") {
+    if (!isRecord3(parsed.data)) {
+      return { kind: "failed", reason: "the session info response did not name the requested session" };
+    }
+    payload = parsed.data;
+  }
+  if (typeof payload.id !== "string" || payload.id !== sessionId) {
+    return { kind: "failed", reason: "the session info response did not name the requested session" };
+  }
+  if (!isRecord3(payload.time))
+    return { kind: "failed", reason: "the session info response had no time object" };
+  const idle = payload.time.idle;
+  if (idle !== undefined && idle !== null && (typeof idle !== "number" || !Number.isFinite(idle))) {
+    return { kind: "failed", reason: "the session info response had a malformed time.idle" };
+  }
+  const outcome = sessionInfoOutcome(payload.outcome);
+  const time = typeof idle === "number" ? { idle } : {};
+  return { kind: "ok", info: { id: sessionId, ...outcome !== undefined ? { outcome } : {}, time } };
+}
+function sessionInfoOutcome(value) {
+  if (value === "succeeded" || value === "failed" || value === "interrupted")
+    return value;
+  return;
+}
 function isRecord3(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+// service/poller.ts
+function isRecord4(value) {
   return typeof value === "object" && value !== null;
 }
 function createSupervisionPoller(input) {
-  const { filesystem, exec, homeRoot, fetcher, resolveSupport } = input;
+  const { filesystem, exec, homeRoot, fetcher, resolveSupport, nowMs = () => Date.now() } = input;
   const observations = new Map;
   const pollErrors = new Map;
   const deliveryErrors = new Map;
+  const supervisionHealth = new Map;
   const steeredBaselines = new Map;
+  const stallBaselines = new Map;
+  const lastSeenTerminals = new Map;
   const autoAcceptedSessions = new Set;
   const observationKey = (slug, sessionId) => `${slug}
 ${sessionId}`;
@@ -828,7 +894,7 @@ ${sessionId}`;
     }
     const pending = await fetchPendingSnapshot(support);
     for (const registration of Object.values(registrations)) {
-      const events = await pollProject(registration, pending);
+      const events = await pollProject(registration, support, pending);
       if (events.length > 0) {
         notifications.push(composeNotification(registration, events));
       }
@@ -837,7 +903,7 @@ ${sessionId}`;
     }
     return { notifications };
   }
-  async function pollProject(registration, pending) {
+  async function pollProject(registration, support, pending) {
     const events = [];
     let backlog;
     try {
@@ -851,6 +917,9 @@ ${sessionId}`;
     } catch {
       return events;
     }
+    let workerObservationFailed = false;
+    let infoDegradedReason;
+    let infoUnavailableReason;
     for (const task of backlog.tasks) {
       if (task.sessionId === undefined)
         continue;
@@ -858,12 +927,13 @@ ${sessionId}`;
         continue;
       const key = observationKey(registration.slug, task.sessionId);
       const previous = observations.get(key);
+      const lastSeenTerminal = lastSeenTerminals.get(key);
       try {
         const directory = registration.projectDirectory;
-        if (!autoAcceptedSessions.has(task.sessionId)) {
+        if (support !== undefined && !autoAcceptedSessions.has(task.sessionId)) {
           const outcome = await setSessionPermissionAuto({
             fetcher,
-            support: await resolveSupport(),
+            support,
             sessionId: task.sessionId,
             directory
           });
@@ -872,14 +942,42 @@ ${sessionId}`;
           }
         }
         const status = await sessionStatus(exec, { sessionId: task.sessionId, directory });
-        const lastWord = await sessionMessagesLastAssistant(exec, { sessionId: task.sessionId, directory });
-        const current = { status, ...lastWord !== undefined ? { lastWord } : {} };
-        const waiting = pending === undefined ? undefined : pendingActivity(pending[task.sessionId]);
+        const last = await sessionLastAssistant(exec, { sessionId: task.sessionId, directory });
+        const current = { status, ...last.text !== undefined ? { lastWord: last.text } : {}, last };
+        const waiting = pending.kind === "ok" ? pendingActivity(pending.pending[task.sessionId]) : undefined;
         if (waiting !== undefined)
           current.status = { ...current.status, activity: waiting };
+        let seenTerminal;
+        if (support !== undefined && support.kind === "supported") {
+          const info = await fetchSessionInfo({
+            fetcher,
+            support,
+            sessionId: task.sessionId,
+            directory: task.worktreeDirectory ?? registration.projectDirectory
+          });
+          if (info.kind === "failed") {
+            if (infoDegradedReason === undefined)
+              infoDegradedReason = info.reason;
+          } else if (info.kind === "unsupported") {
+            if (infoUnavailableReason === undefined)
+              infoUnavailableReason = info.reason;
+          } else {
+            const terminal = terminalOutcome(info.info);
+            if (terminal !== undefined) {
+              if (current.status.activity === "idle") {
+                current.status = { ...current.status, outcome: terminal.outcome };
+                current.terminalAt = terminal.idleAt;
+              }
+              seenTerminal = terminal;
+            }
+          }
+        }
         observations.set(key, current);
+        updateStallTracking(key, task, current, nowMs());
         pollErrors.delete(key);
-        events.push(...detectEvents(task, previous, current));
+        events.push(...detectEvents(task, previous, current, lastSeenTerminal));
+        if (seenTerminal !== undefined)
+          lastSeenTerminals.set(key, seenTerminal);
         if (steeredBaselines.has(key) && current.lastWord !== undefined && current.lastWord !== steeredBaselines.get(key)) {
           steeredBaselines.delete(key);
           events.push({
@@ -891,30 +989,54 @@ ${sessionId}`;
         }
       } catch (error) {
         pollErrors.set(key, error instanceof Error ? error.message : String(error));
+        workerObservationFailed = true;
+        stallBaselines.delete(key);
+        const kept = observations.get(key);
+        if (kept !== undefined && kept.possiblyStalledSince !== undefined) {
+          const { possiblyStalledSince: _droppedStall, ...withoutStall } = kept;
+          observations.set(key, withoutStall);
+        }
       }
     }
+    recordSupervisionHealth(registration.slug, {
+      support,
+      pending,
+      workerObservationFailed,
+      infoDegradedReason,
+      infoUnavailableReason
+    });
     return events;
   }
-  function detectEvents(task, previous, current) {
+  function detectEvents(task, previous, current, lastSeenTerminal) {
     const events = [];
-    const emit = (kind) => ({ taskTitle: task.title, sessionId: task.sessionId, kind });
+    const emit = (kind) => ({
+      taskTitle: task.title,
+      sessionId: task.sessionId,
+      kind,
+      ...task.worktreeDirectory !== undefined ? { directory: task.worktreeDirectory } : {}
+    });
     const activity = current.status.activity;
     const outcome = current.status.outcome;
-    if (outcome === "failed" && previous?.status.outcome !== "failed")
+    const sameSeenTerminal = current.terminalAt !== undefined && lastSeenTerminal !== undefined && lastSeenTerminal.outcome === outcome && lastSeenTerminal.idleAt === current.terminalAt;
+    const previousSameTerminal = previous !== undefined && previous.status.outcome === outcome && previous.terminalAt === current.terminalAt;
+    if (outcome === "failed" && !sameSeenTerminal && (current.terminalAt !== undefined || !previousSameTerminal)) {
       events.push(emit("failed"));
+    }
     if (activity === "waiting-question" && previous?.status.activity !== "waiting-question")
       events.push(emit("waiting-question"));
     if (activity === "waiting-permission" && previous?.status.activity !== "waiting-permission")
       events.push(emit("waiting-permission"));
-    const outcomeFinished = outcome === "completed" && previous?.status.outcome !== "completed";
-    const idleFinished = activity === "idle" && (previous === undefined ? task.state === "Working" : previous.status.activity === "running");
+    const outcomeFinished = outcome === "completed" && !sameSeenTerminal && (current.terminalAt !== undefined || previous?.status.outcome !== "completed");
+    const idleFinished = activity === "idle" && outcome !== "failed" && !sameSeenTerminal && (previous === undefined ? task.state === "Working" : previous.status.activity === "running");
     if (outcomeFinished || idleFinished)
       events.push(emit("finished"));
     return events;
   }
   async function fetchPendingSnapshot(support) {
-    if (support === undefined || support.kind === "unsupported")
-      return;
+    if (support === undefined)
+      return { kind: "unsupported", reason: "the desktop proxy support could not be resolved this round" };
+    if (support.kind === "unsupported")
+      return { kind: "unsupported", reason: support.reason };
     const outcome = await callDesktopProxy({
       fetcher,
       support,
@@ -922,15 +1044,28 @@ ${sessionId}`;
       path: "/api/sessions/status",
       label: "session status"
     });
-    if (outcome.kind !== "ok" || outcome.text === undefined)
-      return;
+    if (outcome.kind === "unsupported")
+      return { kind: "unsupported", reason: outcome.reason };
+    if (outcome.kind === "failed")
+      return { kind: "failed", reason: outcome.message };
+    if (outcome.text === undefined)
+      return { kind: "failed", reason: "the session status response body could not be read" };
     try {
       const parsed = JSON.parse(outcome.text);
-      if (!isRecord3(parsed) || !isRecord3(parsed.pending))
-        return;
-      return parsed.pending;
+      if (!isRecord4(parsed) || !isRecord4(parsed.pending) || Array.isArray(parsed.pending)) {
+        return { kind: "failed", reason: "the session status response had no pending map" };
+      }
+      for (const entry of Object.values(parsed.pending)) {
+        if (!isRecord4(entry) || Array.isArray(entry)) {
+          return { kind: "failed", reason: "the session status response had a malformed pending entry" };
+        }
+        if (entry.permissions !== undefined && !Array.isArray(entry.permissions) || entry.forms !== undefined && !Array.isArray(entry.forms)) {
+          return { kind: "failed", reason: "the session status response had a malformed pending entry" };
+        }
+      }
+      return { kind: "ok", pending: parsed.pending };
     } catch {
-      return;
+      return { kind: "failed", reason: "the session status response was not valid JSON" };
     }
   }
   async function notifyEvent(registration, event, support) {
@@ -943,7 +1078,7 @@ ${sessionId}`;
       title: `FirstMate — ${registration.slug}`,
       body,
       sessionId: event.sessionId,
-      directory: registration.projectDirectory
+      directory: event.directory ?? registration.projectDirectory
     });
   }
   function getBoardWorkers(slug, tasks) {
@@ -953,6 +1088,9 @@ ${sessionId}`;
       const merged = observation === undefined && error === undefined ? undefined : { ...observation ?? { status: { activity: "unknown", outcome: null } }, ...error !== undefined ? { error } : {} };
       return buildBoardWorker(task, merged);
     });
+  }
+  function getSupervisionHealth(slug) {
+    return { ...supervisionHealth.get(slug) ?? initialSupervisionHealth() };
   }
   function getDeliveryError(slug) {
     return deliveryErrors.get(slug);
@@ -967,7 +1105,68 @@ ${sessionId}`;
     const key = observationKey(slug, sessionId);
     steeredBaselines.set(key, observations.get(key)?.lastWord);
   }
-  return { poll, getBoardWorkers, getDeliveryError, recordDeliveryError, clearDeliveryError, markSteered };
+  function recordSupervisionHealth(slug, input) {
+    const blocked = input.pending.kind === "ok" ? { state: "working" } : { state: input.pending.kind === "failed" ? "degraded" : "unavailable", reason: input.pending.reason };
+    const failure = input.support === undefined ? { state: "unavailable", reason: "the desktop proxy support could not be resolved this round" } : input.support.kind === "unsupported" ? { state: "unavailable", reason: input.support.reason } : input.infoDegradedReason !== undefined ? { state: "degraded", reason: input.infoDegradedReason } : input.infoUnavailableReason !== undefined ? { state: "unavailable", reason: input.infoUnavailableReason } : { state: "working" };
+    const requiredHttpObservationsClean = input.support === undefined || input.support.kind === "unsupported" || input.pending.kind === "ok" && input.infoDegradedReason === undefined && input.infoUnavailableReason === undefined;
+    const clean = !input.workerObservationFailed && requiredHttpObservationsClean;
+    const previous = supervisionHealth.get(slug);
+    const health = {
+      blockedObservation: blocked.state,
+      ...blocked.reason !== undefined ? { blockedObservationReason: blocked.reason } : {},
+      failureObservation: failure.state,
+      ...failure.reason !== undefined ? { failureObservationReason: failure.reason } : {}
+    };
+    if (clean) {
+      health.lastSuccessfulPollAt = new Date(nowMs()).toISOString();
+    } else if (previous?.lastSuccessfulPollAt !== undefined) {
+      health.lastSuccessfulPollAt = previous.lastSuccessfulPollAt;
+    }
+    supervisionHealth.set(slug, health);
+  }
+  function updateStallTracking(key, task, observation, now) {
+    const activity = observation.status.activity;
+    const unfinished = task.state === "Queued" || task.state === "Working";
+    const signature = unfinished && (activity === "running" || activity === "retrying") ? messageSignature(observation.last) : undefined;
+    if (signature === undefined) {
+      stallBaselines.delete(key);
+      return;
+    }
+    const existing = stallBaselines.get(key);
+    if (existing === undefined || existing.signature !== signature) {
+      stallBaselines.set(key, { signature, sinceMs: now });
+      return;
+    }
+    if (now - existing.sinceMs >= stallThresholdMs) {
+      observation.possiblyStalledSince = new Date(existing.sinceMs).toISOString();
+    }
+  }
+  return { poll, getBoardWorkers, getSupervisionHealth, getDeliveryError, recordDeliveryError, clearDeliveryError, markSteered };
+}
+function terminalOutcome(info) {
+  if (info.outcome === undefined || info.time.idle === undefined)
+    return;
+  if (info.outcome === "succeeded")
+    return { outcome: "completed", idleAt: info.time.idle };
+  if (info.outcome === "failed")
+    return { outcome: "failed", idleAt: info.time.idle };
+  return { outcome: null, idleAt: info.time.idle };
+}
+var stallThresholdMs = 30 * 60 * 1000;
+function messageSignature(last) {
+  if (last === undefined)
+    return;
+  if (last.id === undefined && last.createdAt === undefined && last.completedAt === undefined)
+    return;
+  return JSON.stringify([last.id ?? null, last.createdAt ?? null, last.completedAt ?? null, last.text ?? null]);
+}
+function initialSupervisionHealth() {
+  return {
+    blockedObservation: "unavailable",
+    blockedObservationReason: "Not polled yet",
+    failureObservation: "unavailable",
+    failureObservationReason: "Not polled yet"
+  };
 }
 function composeNotification(registration, events) {
   const lines = events.map((event) => `- "${event.taskTitle}" (${event.sessionId}): ${describeEvent(event)}`);
@@ -994,7 +1193,7 @@ function describeEvent(event) {
   }
 }
 function pendingActivity(entry) {
-  if (entry === undefined)
+  if (!isRecord4(entry))
     return;
   if (Array.isArray(entry.permissions) && entry.permissions.length > 0)
     return "waiting-permission";
@@ -1328,6 +1527,7 @@ function createWatchRunner(input) {
   const { filesystem, exec, clock, homeRoot, fetcher, resolveSupport } = input;
   const timeoutMs = input.timeoutMs ?? watchTimeoutMs;
   const runStates = new Map;
+  const inFlightWatches = new Set;
   const stateKey = (slug, source, name) => `${slug}
 ${source}
 ${name}`;
@@ -1397,9 +1597,8 @@ ${name}`;
       return { notifications };
     }
     const nowMs = clock.nowMs();
-    const now = new Date(nowMs);
     for (const registration of Object.values(registrations)) {
-      const { slug, homeDirectory, coordinatorSessionId } = registration;
+      const { slug } = registration;
       const watches = await discoverWatches(slug);
       if (watches.length === 0)
         continue;
@@ -1410,20 +1609,36 @@ ${name}`;
         if (!isEnabled(enabledOverrides, watch.source, watch.name))
           continue;
         const key = stateKey(slug, watch.source, watch.name);
-        let runState = runStates.get(key);
-        if (runState === undefined) {
-          const next = computeNextRun(parseCronExpression(watch.schedule), now);
-          runState = { nextRunAtMs: next === null ? Number.POSITIVE_INFINITY : next.getTime() };
-          runStates.set(key, runState);
-        }
+        const runState = ensureRunState(key, watch);
         if (nowMs < runState.nextRunAtMs)
           continue;
-        await runWatch(registration, watch, runState, notifications);
-        const following = computeNextRun(parseCronExpression(watch.schedule), new Date(clock.nowMs()));
-        runState.nextRunAtMs = following === null ? Number.POSITIVE_INFINITY : following.getTime();
+        await executeWatch(registration, watch, runState, notifications);
       }
     }
     return { notifications };
+  }
+  function ensureRunState(key, watch) {
+    let runState = runStates.get(key);
+    if (runState === undefined) {
+      const next = computeNextRun(parseCronExpression(watch.schedule), new Date(clock.nowMs()));
+      runState = { nextRunAtMs: next === null ? Number.POSITIVE_INFINITY : next.getTime() };
+      runStates.set(key, runState);
+    }
+    return runState;
+  }
+  async function executeWatch(registration, watch, runState, notifications) {
+    const key = stateKey(registration.slug, watch.source, watch.name);
+    if (inFlightWatches.has(key))
+      return;
+    inFlightWatches.add(key);
+    try {
+      const result = await runWatch(registration, watch, runState, notifications);
+      const following = computeNextRun(parseCronExpression(watch.schedule), new Date(clock.nowMs()));
+      runState.nextRunAtMs = following === null ? Number.POSITIVE_INFINITY : following.getTime();
+      return result;
+    } finally {
+      inFlightWatches.delete(key);
+    }
   }
   async function runWatch(registration, watch, runState, notifications) {
     const { slug, homeDirectory, coordinatorSessionId } = registration;
@@ -1451,23 +1666,31 @@ ${name}`;
       const reason = execError ?? (execution?.timedOut === true ? `timed out after ${timeoutMs} ms` : execution?.exitCode === null ? "was killed without an exit code" : `exited with code ${execution?.exitCode}`);
       runState.lastOutcome = "failed";
       runState.lastOutput = execution === undefined ? "" : presentOutput(execution.stdout.trim());
+      runState.lastError = reason;
       if (runState.reportedFailure !== true) {
         runState.reportedFailure = true;
         notifications.push({
           slug,
           coordinatorSessionId,
           homeDirectory,
-          message: `FirstMate (${slug}) watch ${watch.name} failed: ${reason}`
+          message: `FirstMate (${slug}) watch ${watch.name} failed: ${reason}`,
+          watchName: watch.name,
+          source: watch.source
         });
+        const captain = captainWatchNotification(watch.name, "failed", reason);
+        try {
+          await notifyCaptain({ fetcher, support: await resolveSupport(), title: captain.title, body: captain.body });
+        } catch {}
       }
-      return;
+      return { outcome: "failed", lastError: reason };
     }
     runState.reportedFailure = false;
+    runState.lastError = undefined;
     const output = presentOutput(execution.stdout.trim());
     if (output === "") {
       runState.lastOutcome = "empty";
       runState.lastOutput = "";
-      return;
+      return { outcome: "empty" };
     }
     runState.lastOutcome = "ok";
     runState.lastOutput = output;
@@ -1476,16 +1699,15 @@ ${name}`;
       coordinatorSessionId,
       homeDirectory,
       message: `FirstMate (${slug}) watch ${watch.name}:
-${output}`
+${output}`,
+      watchName: watch.name,
+      source: watch.source
     });
+    const captain = captainWatchNotification(watch.name, "fired", output);
     try {
-      await notifyCaptain({
-        fetcher,
-        support: await resolveSupport(),
-        title: `FirstMate — ${watch.name} fired`,
-        body: output.slice(0, 500)
-      });
+      await notifyCaptain({ fetcher, support: await resolveSupport(), title: captain.title, body: captain.body });
     } catch {}
+    return { outcome: "ok" };
   }
   async function listWatches(slug) {
     const watches = await discoverWatches(slug);
@@ -1504,7 +1726,8 @@ ${output}`
         nextRun: enabled && watch.error === undefined ? computeNextRun(parseCronExpression(watch.schedule), now)?.getTime() ?? null : null,
         ...runState?.lastRunAt !== undefined ? { lastRunAt: runState.lastRunAt } : {},
         ...runState?.lastOutcome !== undefined ? { lastOutcome: runState.lastOutcome } : {},
-        ...runState?.lastOutput !== undefined && runState.lastOutput !== "" ? { lastOutput: runState.lastOutput } : {}
+        ...runState?.lastOutput !== undefined && runState.lastOutput !== "" ? { lastOutput: runState.lastOutput } : {},
+        ...runState?.lastError !== undefined ? { lastError: runState.lastError } : {}
       };
     });
   }
@@ -1579,7 +1802,36 @@ ${command}
     await filesystem.setExecutable(scriptPath);
     return "ok";
   }
-  return { tick, listWatches, setEnabled, setSchedule, createWatch };
+  async function runNow(slug, source, name) {
+    const registrations = await loadRegistry(filesystem, homeRoot);
+    const registration = registrations[slug];
+    if (registration === undefined)
+      return { kind: "unknown-slug" };
+    const candidates = (await discoverWatches(slug)).filter((watch) => watch.name === name);
+    const targets = source === undefined ? candidates : candidates.filter((watch) => watch.source === source);
+    if (targets.length === 0)
+      return { kind: "unknown-watch" };
+    if (targets.length > 1)
+      return { kind: "ambiguous-watch" };
+    const watch = targets[0];
+    if (watch.error !== undefined)
+      return { kind: "invalid-schedule", error: watch.error };
+    const key = stateKey(slug, watch.source, watch.name);
+    const runState = ensureRunState(key, watch);
+    const notifications = [];
+    const run = await executeWatch(registration, watch, runState, notifications);
+    if (run === undefined)
+      return { kind: "already-running" };
+    return {
+      kind: "ran",
+      name: watch.name,
+      source: watch.source,
+      lastOutcome: run.outcome,
+      ...run.lastError !== undefined ? { lastError: run.lastError } : {},
+      notifications
+    };
+  }
+  return { tick, runNow, listWatches, setEnabled, setSchedule, createWatch };
 }
 function isEnabled(overrides, source, name) {
   const entry = overrides[source]?.[name];
@@ -1594,6 +1846,14 @@ function presentOutput(text) {
   const dropped = text.length - lastOutputMaxLength;
   return `…[truncated ${dropped} chars]
 ${text.slice(-lastOutputMaxLength)}`;
+}
+var captainTitleMaxLength = 100;
+var captainBodyMaxLength = 500;
+function captainWatchNotification(watchName, event, body) {
+  return {
+    title: `FirstMate — ${watchName} ${event}`.slice(0, captainTitleMaxLength),
+    body: body.slice(0, captainBodyMaxLength)
+  };
 }
 
 // service/main.ts
@@ -1740,7 +2000,8 @@ var supervisionPoller = createSupervisionPoller({
   exec: nodeExec,
   homeRoot,
   fetcher: nodeFetcher,
-  resolveSupport: () => discoverSupport({ filesystem: nodeFileSystem, settingsPath: openchamberSettingsPath })
+  resolveSupport: () => discoverSupport({ filesystem: nodeFileSystem, settingsPath: openchamberSettingsPath }),
+  nowMs: clock.nowMs
 });
 var watchRunner = createWatchRunner({
   filesystem: nodeFileSystem,
@@ -1769,6 +2030,41 @@ async function runSupervisionRound() {
     roundInFlight = false;
   }
 }
+var watchDeliveryErrors = new Map;
+function watchDeliveryKey(slug, source, name) {
+  return `${slug}
+${source ?? ""}
+${name ?? ""}`;
+}
+async function deliverWatchNotifications(notifications) {
+  for (const notification of notifications) {
+    const key = watchDeliveryKey(notification.slug, notification.source, notification.watchName);
+    try {
+      await sessionSend(nodeExec, {
+        sessionId: notification.coordinatorSessionId,
+        directory: notification.homeDirectory,
+        prompt: notification.message
+      });
+      watchDeliveryErrors.delete(key);
+    } catch (error) {
+      watchDeliveryErrors.set(key, error instanceof Error ? error.message : String(error));
+    }
+  }
+}
+function watchDeliverySummary(slug) {
+  const failedNames = [];
+  for (const [key] of watchDeliveryErrors) {
+    if (!key.startsWith(`${slug}
+`))
+      continue;
+    const name = key.split(`
+`)[2];
+    failedNames.push(name === undefined || name === "" ? "(unattributed)" : name);
+  }
+  if (failedNames.length === 0)
+    return;
+  return `watch notification delivery failed for: ${failedNames.sort().join(", ")}`;
+}
 var watchRoundInFlight = false;
 async function runWatchRound() {
   if (watchRoundInFlight)
@@ -1776,11 +2072,7 @@ async function runWatchRound() {
   watchRoundInFlight = true;
   try {
     const round = await watchRunner.tick();
-    for (const notification of round.notifications) {
-      try {
-        await deliverNotification({ exec: nodeExec, clock, notification });
-      } catch {}
-    }
+    await deliverWatchNotifications(round.notifications);
   } catch {} finally {
     watchRoundInFlight = false;
   }
@@ -1788,7 +2080,7 @@ async function runWatchRound() {
 function isAuthorized(request) {
   return request.headers.authorization === `Bearer ${serviceToken}`;
 }
-function isRecord4(value) {
+function isRecord5(value) {
   return typeof value === "object" && value !== null;
 }
 function respondJson(response, statusCode, body) {
@@ -1813,7 +2105,7 @@ function readJsonBody(request) {
 async function readJsonRecord(request) {
   try {
     const payload = await readJsonBody(request);
-    return isRecord4(payload) ? payload : undefined;
+    return isRecord5(payload) ? payload : undefined;
   } catch {
     return;
   }
@@ -1832,7 +2124,7 @@ async function readProjectDirectory(request) {
   } catch {
     return;
   }
-  const projectDirectory = isRecord4(payload) ? payload.projectDirectory : undefined;
+  const projectDirectory = isRecord5(payload) ? payload.projectDirectory : undefined;
   if (typeof projectDirectory !== "string" || projectDirectory.trim() === "") {
     return;
   }
@@ -1926,7 +2218,12 @@ async function handleBoard(url, response) {
     const tasks = backlog.tasks.filter((task) => task.sessionId === undefined || !archivedSessionIds.has(task.sessionId));
     const workers = supervisionPoller.getBoardWorkers(slug, tasks);
     const deliveryError = supervisionPoller.getDeliveryError(slug);
-    respondJson(response, 200, deliveryError === undefined ? { workers } : { workers, deliveryError });
+    const supervision = supervisionPoller.getSupervisionHealth(slug);
+    respondJson(response, 200, {
+      workers,
+      supervision,
+      ...deliveryError !== undefined ? { deliveryError } : {}
+    });
   } catch (error) {
     respondJson(response, 500, { error: error instanceof Error ? error.message : "board read failed" });
   }
@@ -2100,7 +2397,20 @@ async function handleWatchesList(url, response) {
       return;
     }
     const watches = await watchRunner.listWatches(slug);
-    respondJson(response, 200, { watches });
+    const discoveredWatchKeys = new Set(watches.map((watch) => watchDeliveryKey(slug, watch.source, watch.name)));
+    const unattributedWatchKey = watchDeliveryKey(slug, undefined, undefined);
+    for (const key of [...watchDeliveryErrors.keys()]) {
+      if (key.startsWith(`${slug}
+`) && key !== unattributedWatchKey && !discoveredWatchKeys.has(key)) {
+        watchDeliveryErrors.delete(key);
+      }
+    }
+    const decorated = watches.map((watch) => {
+      const deliveryError = watchDeliveryErrors.get(watchDeliveryKey(slug, watch.source, watch.name));
+      return deliveryError === undefined ? watch : { ...watch, deliveryError };
+    });
+    const summary = watchDeliverySummary(slug);
+    respondJson(response, 200, { watches: decorated, ...summary !== undefined ? { deliveryError: summary } : {} });
   } catch (error) {
     respondJson(response, 500, { error: error instanceof Error ? error.message : "watches read failed" });
   }
@@ -2228,6 +2538,57 @@ async function handleWatchCreate(request, response) {
     respondJson(response, 500, { error: error instanceof Error ? error.message : "watch creation failed" });
   }
 }
+async function handleWatchRun(request, response) {
+  const payload = await readJsonRecord(request);
+  const slug = recordString(payload, "slug");
+  const name = recordString(payload, "name");
+  const source = payload?.source;
+  if (slug === undefined || name === undefined) {
+    respondJson(response, 400, { error: "slug and name must be non-empty strings" });
+    return;
+  }
+  if (!isWatchSource(source)) {
+    respondJson(response, 400, { error: `source must be "shared" or "project" when given` });
+    return;
+  }
+  try {
+    const result = await watchRunner.runNow(slug, source, name);
+    if (result.kind === "unknown-slug") {
+      respondJson(response, 404, { error: `no first mate registered for slug ${slug}` });
+      return;
+    }
+    if (result.kind === "unknown-watch") {
+      respondJson(response, 404, { error: `no watch named ${name} for slug ${slug}` });
+      return;
+    }
+    if (result.kind === "ambiguous-watch") {
+      respondJson(response, 409, {
+        error: `the watch name ${name} matches both a shared and a project watch for ${slug}; pass source "shared" or "project"`
+      });
+      return;
+    }
+    if (result.kind === "invalid-schedule") {
+      respondJson(response, 400, { error: result.error });
+      return;
+    }
+    if (result.kind === "already-running") {
+      respondJson(response, 409, { error: `the watch ${name} is already running` });
+      return;
+    }
+    await deliverWatchNotifications(result.notifications);
+    const deliveryError = watchDeliveryErrors.get(watchDeliveryKey(slug, result.source, result.name));
+    respondJson(response, 200, {
+      ran: true,
+      name: result.name,
+      source: result.source,
+      lastOutcome: result.lastOutcome,
+      ...result.lastError !== undefined ? { lastError: result.lastError } : {},
+      ...deliveryError !== undefined ? { deliveryError } : {}
+    });
+  } catch (error) {
+    respondJson(response, 500, { error: error instanceof Error ? error.message : "watch run failed" });
+  }
+}
 async function handleEnd(request, response) {
   const payload = await readJsonRecord(request);
   const slug = recordString(payload, "slug");
@@ -2270,14 +2631,44 @@ async function handleShipping(url, response) {
     const projectsMdPath = `${homeRoot}/projects/${slug}/projects.md`;
     const shipping = await nodeFileSystem.exists(projectsMdPath) ? parseShippingMode(await nodeFileSystem.readFile(projectsMdPath)) : { mode: null, yolo: false };
     const landings = await loadLandingRecords(nodeFileSystem, homeRoot, slug);
+    let backlogTasks;
+    let cleanupError;
+    try {
+      backlogTasks = (await loadBacklog(nodeFileSystem, `${homeRoot}/projects/${slug}/backlog.md`)).tasks;
+    } catch {
+      cleanupError = "the backlog could not be read, so worktree cleanup state could not be established";
+    }
+    const landingsWithCleanup = [];
+    for (const record of landings.records) {
+      const cleanup = backlogTasks === undefined ? undefined : await landingCleanupState(backlogTasks, record.task);
+      landingsWithCleanup.push(cleanup === undefined ? record : { ...record, cleanup });
+    }
     respondJson(response, 200, {
       mode: shipping.mode,
       yolo: shipping.yolo,
-      landings: landings.records,
-      landingErrors: landings.errors.map((error) => `line ${error.line}: ${error.message}`)
+      landings: landingsWithCleanup,
+      landingErrors: landings.errors.map((error) => `line ${error.line}: ${error.message}`),
+      ...cleanupError !== undefined ? { cleanupError } : {}
     });
   } catch (error) {
     respondJson(response, 500, { error: error instanceof Error ? error.message : "shipping read failed" });
+  }
+}
+async function landingCleanupState(tasks, landingTask) {
+  const matches = tasks.filter((task) => task.title === landingTask);
+  if (matches.length !== 1)
+    return;
+  const worktree = matches[0].worktreeDirectory;
+  if (worktree === undefined || !path2.isAbsolute(worktree))
+    return;
+  try {
+    const stats = await stat(worktree);
+    return { worktree, state: stats.isDirectory() ? "pending" : "unknown" };
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      return { worktree, state: "removed" };
+    }
+    return { worktree, state: "unknown" };
   }
 }
 async function resolveSuggestion(slug, label) {
@@ -2485,6 +2876,10 @@ async function handleRequest(request, response) {
   }
   if (request.method === "POST" && pathname === "/watch/create") {
     await handleWatchCreate(request, response);
+    return;
+  }
+  if (request.method === "POST" && pathname === "/watch/run") {
+    await handleWatchRun(request, response);
     return;
   }
   if (request.method === "POST" && pathname === "/steer") {

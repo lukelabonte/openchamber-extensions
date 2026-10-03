@@ -14,6 +14,8 @@ export interface BoardWorker {
   worktree?: string
   branch?: string
   lastPollError?: string
+  /** ISO baseline of the service's cautious stall flag; advisory only. */
+  possiblyStalledSince?: string
 }
 
 export interface BoardCard {
@@ -31,6 +33,8 @@ export interface BoardCard {
   worktree?: string
   /** The worker's branch from the backlog record; shown as the card's meta line. */
   branch?: string
+  /** Advisory stall flag from the service; shown as an amber note, never as a state change. */
+  possiblyStalledSince?: string
 }
 
 export interface BoardColumn {
@@ -68,7 +72,7 @@ export function parseBoardWorkers(value: unknown): { workers: BoardWorker[]; mal
 function parseBoardWorker(value: unknown): BoardWorker | undefined {
   if (typeof value !== "object" || value === null) return undefined
   const record = value as Record<string, unknown>
-  const { title, state, blockedReason, lastWord, prUrl, sessionId, worktree, branch, lastPollError } = record
+  const { title, state, blockedReason, lastWord, prUrl, sessionId, worktree, branch, lastPollError, possiblyStalledSince } = record
   if (typeof title !== "string") return undefined
   if (typeof state !== "string" || !boardColumnOrder.includes(state as BoardWorkerState)) return undefined
   if (
@@ -78,7 +82,8 @@ function parseBoardWorker(value: unknown): BoardWorker | undefined {
     !isOptionalString(sessionId) ||
     !isOptionalString(worktree) ||
     !isOptionalString(branch) ||
-    !isOptionalString(lastPollError)
+    !isOptionalString(lastPollError) ||
+    !isOptionalString(possiblyStalledSince)
   ) {
     return undefined
   }
@@ -93,7 +98,14 @@ function parseBoardWorker(value: unknown): BoardWorker | undefined {
     ...(worktree !== undefined ? { worktree } : {}),
     ...(branch !== undefined ? { branch } : {}),
     ...(lastPollError !== undefined ? { lastPollError } : {}),
+    // A stall baseline that is not a finite, parseable timestamp is dropped
+    // rather than displayed as a number-shaped lie.
+    ...(possiblyStalledSince !== undefined && hasFiniteDate(possiblyStalledSince) ? { possiblyStalledSince } : {}),
   }
+}
+
+function hasFiniteDate(iso: string): boolean {
+  return !Number.isNaN(new Date(iso).getTime())
 }
 
 function isOptionalString(value: unknown): value is string | undefined {
@@ -121,6 +133,7 @@ export function toBoardCard(worker: BoardWorker): BoardCard {
   if (worker.sessionId !== undefined) card.sessionId = worker.sessionId
   if (worker.worktree !== undefined) card.worktree = worker.worktree
   if (worker.branch !== undefined) card.branch = worker.branch
+  if (worker.possiblyStalledSince !== undefined) card.possiblyStalledSince = worker.possiblyStalledSince
   return card
 }
 
@@ -150,4 +163,49 @@ function truncate(text: string): string {
 
 function isHttpUrl(url: string): boolean {
   return /^https?:\/\//i.test(url)
+}
+
+// Supervision health: the state of the service's two host-observation
+// channels plus the last clean poll's time, served at GET /board. "working"
+// means the channel answered; it does NOT establish that no question or
+// permission wait exists, and a failure may not be observed — the panel
+// phrases it exactly that cautiously.
+export type SupervisionObservationState = "working" | "degraded" | "unavailable"
+
+export interface SupervisionHealth {
+  blockedObservation: SupervisionObservationState
+  blockedObservationReason?: string
+  failureObservation: SupervisionObservationState
+  failureObservationReason?: string
+  lastSuccessfulPollAt?: string
+}
+
+// Panel-side shape guard for the supervision record: missing, malformed, or
+// version-skewed payloads yield undefined, which renders as "Unknown" — never
+// as a false healthy claim.
+export function parseSupervision(value: unknown): SupervisionHealth | undefined {
+  if (typeof value !== "object" || value === null) return undefined
+  const record = value as Record<string, unknown>
+  const blocked = parseObservation(record.blockedObservation, record.blockedObservationReason)
+  const failure = parseObservation(record.failureObservation, record.failureObservationReason)
+  if (blocked === undefined || failure === undefined) return undefined
+  return {
+    blockedObservation: blocked.state,
+    ...(blocked.reason !== undefined ? { blockedObservationReason: blocked.reason } : {}),
+    failureObservation: failure.state,
+    ...(failure.reason !== undefined ? { failureObservationReason: failure.reason } : {}),
+    // Only a parseable timestamp is kept; anything else reads as "not polled".
+    ...(typeof record.lastSuccessfulPollAt === "string" && hasFiniteDate(record.lastSuccessfulPollAt)
+      ? { lastSuccessfulPollAt: record.lastSuccessfulPollAt }
+      : {}),
+  }
+}
+
+function parseObservation(
+  state: unknown,
+  reason: unknown,
+): { state: SupervisionObservationState; reason?: string } | undefined {
+  if (state !== "working" && state !== "degraded" && state !== "unavailable") return undefined
+  if (reason !== undefined && typeof reason !== "string") return undefined
+  return { state, ...(typeof reason === "string" ? { reason } : {}) }
 }

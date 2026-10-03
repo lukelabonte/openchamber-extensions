@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test"
 import {
   createSession,
   MissingCliError,
+  sessionLastAssistant,
   sessionList,
   sessionMessagesLastAssistant,
   sessionSend,
@@ -171,5 +172,56 @@ describe("sessionList", () => {
     expect(await sessionList(exec, { directory: "/d" })).toEqual([
       { sessionId: "ses_c", status: { activity: "unknown", outcome: null } },
     ])
+  })
+})
+
+describe("sessionLastAssistant", () => {
+  test("extracts the richer last-assistant fields from the runtime-verified shape with the same CLI argv", async () => {
+    const { exec, calls } = fakeExec(
+      '{"status":"ok","sessionId":"s","directory":"/d","role":"assistant","sessionStatus":{"type":"idle"},"messages":[{"id":"msg_1","role":"assistant","createdAt":10,"completedAt":20,"model":"test-model","text":"acknowledged"}]}',
+    )
+
+    const last = await sessionLastAssistant(exec, { sessionId: "s", directory: "/d" })
+
+    expect(last).toEqual({ text: "acknowledged", id: "msg_1", createdAt: 10, completedAt: 20 })
+    // The richer extraction rides the exact same command the plain text
+    // reader used — one CLI call, unchanged argv.
+    expect(calls).toEqual([
+      { command: "openchamber", args: ["session", "messages", "--session", "s", "--dir", "/d", "--last-assistant", "--json"] },
+    ])
+  })
+
+  test("timestamps are accepted only as finite numbers, and absent fields stay absent — never fabricated", async () => {
+    // Numeric strings and nulls are not part of the contract.
+    const numericStrings = fakeExec('{"messages":[{"id":"msg_1","createdAt":"10","completedAt":null,"text":"acknowledged"}]}')
+    expect(await sessionLastAssistant(numericStrings.exec, { sessionId: "s", directory: "/d" })).toEqual({
+      text: "acknowledged",
+      id: "msg_1",
+    })
+
+    // A non-finite number (JSON 1e999 parses to Infinity) is not a timestamp.
+    const nonFinite = fakeExec('{"messages":[{"id":"msg_1","createdAt":1e999,"text":"acknowledged"}]}')
+    expect(await sessionLastAssistant(nonFinite.exec, { sessionId: "s", directory: "/d" })).toEqual({
+      text: "acknowledged",
+      id: "msg_1",
+    })
+
+    const textOnly = fakeExec('{"messages":[{"text":"no identity here"}]}')
+    expect(await sessionLastAssistant(textOnly.exec, { sessionId: "s", directory: "/d" })).toEqual({ text: "no identity here" })
+  })
+
+  test("the plain-string output stays backward compatible for both readers", async () => {
+    // With --json the plain string arrives as a quoted JSON string envelope;
+    // unquoted output is corrupt JSON and stays rejected.
+    const plain = fakeExec(JSON.stringify("plain words"))
+    expect(await sessionLastAssistant(plain.exec, { sessionId: "s", directory: "/d" })).toEqual({ text: "plain words" })
+    expect(await sessionMessagesLastAssistant(plain.exec, { sessionId: "s", directory: "/d" })).toBe("plain words")
+
+    const empty = fakeExec(JSON.stringify(""))
+    expect(await sessionMessagesLastAssistant(empty.exec, { sessionId: "s", directory: "/d" })).toBeUndefined()
+
+    const unquoted = fakeExec("plain words")
+    await expect(sessionLastAssistant(unquoted.exec, { sessionId: "s", directory: "/d" })).rejects.toThrow("valid JSON")
+    await expect(sessionMessagesLastAssistant(unquoted.exec, { sessionId: "s", directory: "/d" })).rejects.toThrow("valid JSON")
   })
 })

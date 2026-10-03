@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test"
 import { spawn, type ChildProcess } from "node:child_process"
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import net from "node:net"
 import os from "node:os"
 import path from "node:path"
@@ -14,6 +14,11 @@ let tempRoot: string
 let tempHome: string
 let serviceProcess: ChildProcess | undefined
 let servicePort = 0
+// Worktree-cleanup probe paths, all inside the fixture's own temp root —
+// the tests create and remove them; nothing real is ever touched.
+let pendingWorktree: string
+let removedWorktree: string
+let notADirectory: string
 
 beforeAll(async () => {
   tempRoot = mkdtempSync(path.join(os.tmpdir(), "firstmate-shipping-test-"))
@@ -21,6 +26,8 @@ beforeAll(async () => {
   const sunriseHome = path.join(tempHome, "projects", "sunrise")
   const drifterHome = path.join(tempHome, "projects", "drifter")
   const corruptHome = path.join(tempHome, "projects", "corrupt")
+  const cleanupHome = path.join(tempHome, "projects", "cleanup")
+  const unreadableHome = path.join(tempHome, "projects", "unreadable")
   mkdirSync(path.join(sunriseHome, "reports"), { recursive: true })
   mkdirSync(drifterHome, { recursive: true })
   mkdirSync(path.join(corruptHome, "reports"), { recursive: true })
@@ -46,6 +53,20 @@ beforeAll(async () => {
         projectDirectory: "/repos/corrupt",
         homeDirectory: corruptHome,
         coordinatorSessionId: "ses_coord_3",
+        createdAt: "2026-10-01T08:00:00Z",
+      },
+      cleanup: {
+        slug: "cleanup",
+        projectDirectory: "/repos/cleanup",
+        homeDirectory: cleanupHome,
+        coordinatorSessionId: "ses_coord_4",
+        createdAt: "2026-10-01T08:00:00Z",
+      },
+      unreadable: {
+        slug: "unreadable",
+        projectDirectory: "/repos/unreadable",
+        homeDirectory: unreadableHome,
+        coordinatorSessionId: "ses_coord_5",
         createdAt: "2026-10-01T08:00:00Z",
       },
     }),
@@ -88,6 +109,71 @@ beforeAll(async () => {
       "  commit: deadbeef",
       "",
     ].join("\n"),
+  )
+
+  // Worktree-cleanup fixture: probe directories and files under the test's
+  // own temp root, a backlog whose tasks record them as worktrees, and a
+  // project with landings but no backlog file at all.
+  const probeDirectory = path.join(tempRoot, "probe")
+  pendingWorktree = path.join(probeDirectory, "pending-wt")
+  removedWorktree = path.join(probeDirectory, "removed-wt")
+  notADirectory = path.join(probeDirectory, "not-a-dir")
+  mkdirSync(pendingWorktree, { recursive: true })
+  mkdirSync(removedWorktree, { recursive: true })
+  writeFileSync(notADirectory, "a file, not a directory\n")
+  mkdirSync(path.join(cleanupHome, "reports"), { recursive: true })
+  mkdirSync(unreadableHome, { recursive: true })
+  mkdirSync(path.join(unreadableHome, "reports"), { recursive: true })
+  const backlog = [
+    "# Backlog",
+    "",
+    `- Task Pending`,
+    "  state: Done",
+    `  worktree: ${pendingWorktree}`,
+    "",
+    `- Task Removed`,
+    "  state: Done",
+    `  worktree: ${removedWorktree}`,
+    "",
+    `- Task NonDirectory`,
+    "  state: Done",
+    `  worktree: ${notADirectory}`,
+    "",
+    `- Task Duplicate`,
+    "  state: Done",
+    `  worktree: ${path.join(probeDirectory, "dup-wt")}`,
+    "",
+    `- Task Duplicate`,
+    "  state: Queued",
+    "",
+    `- Task Relative`,
+    "  state: Done",
+    "  worktree: relative/wt",
+    "",
+  ]
+  writeFileSync(path.join(cleanupHome, "backlog.md"), backlog.join("\n"))
+  const cleanupLandings = [
+    "# Landings",
+    "",
+    ...landingEntry("Task Pending", "captain's word", "2026-10-02T09:00:00.000Z"),
+    "",
+    ...landingEntry("Task Removed", "+yolo", "2026-10-02T09:01:00.000Z"),
+    "",
+    ...landingEntry("Task NonDirectory", "captain's word", "2026-10-02T09:02:00.000Z"),
+    "",
+    ...landingEntry("Task Duplicate", "+yolo", "2026-10-02T09:03:00.000Z"),
+    "",
+    ...landingEntry("Task Relative", "captain's word", "2026-10-02T09:04:00.000Z"),
+    "",
+    ...landingEntry("Task Unrecorded", "+yolo", "2026-10-02T09:05:00.000Z"),
+    "",
+    ...landingEntry("task pending", "captain's word", "2026-10-02T09:06:00.000Z"),
+    "",
+  ]
+  writeFileSync(path.join(cleanupHome, "reports", "landings.md"), cleanupLandings.join("\n"))
+  writeFileSync(
+    path.join(unreadableHome, "reports", "landings.md"),
+    ["# Landings", "", ...landingEntry("Task Landed", "captain's word", "2026-10-02T10:00:00.000Z"), ""].join("\n"),
   )
 
   servicePort = await getFreePort()
@@ -140,6 +226,19 @@ async function waitUntilListening(port: number): Promise<void> {
 
 function fetchShipping(query: string, headers: Record<string, string> = { authorization: `Bearer ${serviceToken}` }): Promise<Response> {
   return fetch(`http://127.0.0.1:${servicePort}/shipping${query}`, { headers })
+}
+
+// One canonical landing entry in the log format the charter prescribes, with
+// only the two authorization spellings the parser accepts.
+function landingEntry(task: string, authorization: string, landedAt: string): string[] {
+  return [
+    `- ${task}`,
+    "  commit: 1a2b3c4d",
+    "  ci: green",
+    "  mode: reviewed-PR",
+    `  authorization: ${authorization}`,
+    `  landed: ${landedAt}`,
+  ]
 }
 
 describe("GET /shipping", () => {
@@ -240,5 +339,60 @@ describe("GET /shipping", () => {
     expect(noToken.status).toBe(401)
     const wrongToken = await fetchShipping("?slug=sunrise", { authorization: "Bearer wrong-token" })
     expect(wrongToken.status).toBe(401)
+  })
+})
+
+// Cleanup visibility: each landing joins its canonical task to the backlog by
+// EXACT unique title, and only a recorded ABSOLUTE worktree directory may
+// claim anything. The claim reads one stat of that exact directory — the
+// probe paths are the test fixture's own temp files; nothing real is ever
+// traversed or removed.
+describe("GET /shipping worktree cleanup", () => {
+  interface CleanupRow {
+    task: string
+    cleanup?: { worktree: string; state: string }
+  }
+
+  async function fetchCleanupRows(): Promise<CleanupRow[]> {
+    const response = await fetchShipping("?slug=cleanup")
+    expect(response.status).toBe(200)
+    const body = (await response.json()) as { landings: CleanupRow[] }
+    return body.landings
+  }
+
+  test("a unique exact title with an absolute recorded directory reads pending; ambiguous, unmatched, relative, and case-mismatched rows claim nothing", async () => {
+    const rows = await fetchCleanupRows()
+    const pending = rows.find((row) => row.task === "Task Pending")
+    expect(pending?.cleanup).toEqual({ worktree: pendingWorktree, state: "pending" })
+
+    for (const title of ["Task Duplicate", "Task Relative", "Task Unrecorded", "task pending"]) {
+      expect(rows.find((row) => row.task === title)?.cleanup).toBeUndefined()
+    }
+    // The read never deletes: the claimed worktree is still on disk after.
+    expect(existsSync(pendingWorktree)).toBe(true)
+  })
+
+  test("a recorded directory that is gone reads removed", async () => {
+    // Removing the test's own probe directory — the fixture stand-in for a
+    // worktree the captain has already deleted by hand.
+    rmSync(removedWorktree, { recursive: true })
+    const rows = await fetchCleanupRows()
+    expect(rows.find((row) => row.task === "Task Removed")?.cleanup).toEqual({ worktree: removedWorktree, state: "removed" })
+  })
+
+  test("a recorded non-directory reads unknown, never removed", async () => {
+    const rows = await fetchCleanupRows()
+    expect(rows.find((row) => row.task === "Task NonDirectory")?.cleanup).toEqual({ worktree: notADirectory, state: "unknown" })
+  })
+
+  test("a backlog that cannot be read keeps the landings visible and surfaces cleanupError", async () => {
+    const response = await fetchShipping("?slug=unreadable")
+    expect(response.status).toBe(200)
+    const body = (await response.json()) as { landings: CleanupRow[]; cleanupError?: string }
+    expect(body.landings).toHaveLength(1)
+    expect(body.landings[0].task).toBe("Task Landed")
+    expect(body.landings[0].cleanup).toBeUndefined()
+    expect(typeof body.cleanupError).toBe("string")
+    expect(body.cleanupError).toContain("backlog")
   })
 })

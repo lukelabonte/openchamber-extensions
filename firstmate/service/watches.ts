@@ -29,13 +29,20 @@ export interface WatchInfo {
   lastRunAt?: string
   lastOutcome?: WatchOutcome
   lastOutput?: string
+  /** Present when the last run failed: the timeout, exit, or exception reason; cleared by the next successful run. */
+  lastError?: string
 }
 
+// The optional watch attribution lets the delivery path record a lost
+// coordinator delivery per watch; the fields stay optional so any existing
+// constructor of a notification keeps compiling unchanged.
 export interface WatchNotification {
   slug: string
   coordinatorSessionId: string
   homeDirectory: string
   message: string
+  watchName?: string
+  source?: WatchSource
 }
 
 export interface WatchExecution {
@@ -53,9 +60,37 @@ export type WatchExecPort = (input: {
   timeoutMs: number
 }) => Promise<WatchExecution>
 
+// The result of a manual run-now: the resolution failures the panel must
+// answer for (unknown slug/watch, an ambiguous same-name pair, a broken
+// schedule, an in-flight execution) and the completed run — whose
+// notifications are main's to deliver, never delivered by the runner.
+export type RunNowResult =
+  | { kind: "unknown-slug" }
+  | { kind: "unknown-watch" }
+  | { kind: "ambiguous-watch" }
+  | { kind: "invalid-schedule"; error: string }
+  | { kind: "already-running" }
+  | {
+      kind: "ran"
+      name: string
+      source: WatchSource
+      lastOutcome: WatchOutcome
+      lastError?: string
+      notifications: WatchNotification[]
+    }
+
 export interface WatchRunner {
   /** One scheduling round over every registered project. Never throws. */
   tick(): Promise<{ notifications: WatchNotification[] }>
+  /**
+   * Runs the named watch immediately through the scheduler's own execution
+   * path — the same executor, run state, streak, env, and timeout. A
+   * disabled watch may be run explicitly (the switch toggles automatic
+   * scheduling only); a broken-schedule watch refuses; an in-flight
+   * execution, scheduled or manual, answers "already-running". Never
+   * delivers: the returned notifications are main's to deliver.
+   */
+  runNow(slug: string, source: WatchSource | undefined, name: string): Promise<RunNowResult>
   listWatches(slug: string): Promise<WatchInfo[]>
   setEnabled(
     slug: string,
@@ -88,8 +123,17 @@ interface RunState {
   lastRunAt?: string
   lastOutcome?: WatchOutcome
   lastOutput?: string
+  /** The timeout/exit/exception reason of the last failed run; cleared by the next success. */
+  lastError?: string
   /** Set while a failure has been reported; reset by the next success. */
   reportedFailure?: boolean
+}
+
+// What one execution of a watch produced: the outcome the run state and
+// the run-now result both carry, plus the failure reason.
+interface WatchRunResult {
+  outcome: WatchOutcome
+  lastError?: string
 }
 
 const lastOutputMaxLength = 2000
@@ -122,6 +166,11 @@ export function createWatchRunner(input: {
   // restart re-derives "next run after now" and the card loses last-run
   // details. The enabled switch is the only persisted piece (settings.json).
   const runStates = new Map<string, RunState>()
+  // Watches whose execution is in flight right now, scheduled or manual,
+  // keyed like the run state. The check-and-set happens before the first
+  // await, so a run-now racing a due scheduled run (or a second run-now)
+  // resolves to one execution and one "already-running" refusal.
+  const inFlightWatches = new Set<string>()
 
   const stateKey = (slug: string, source: WatchSource, name: string): string => `${slug}\n${source}\n${name}`
 
@@ -191,9 +240,8 @@ export function createWatchRunner(input: {
       return { notifications }
     }
     const nowMs = clock.nowMs()
-    const now = new Date(nowMs)
     for (const registration of Object.values(registrations)) {
-      const { slug, homeDirectory, coordinatorSessionId } = registration
+      const { slug } = registration
       const watches = await discoverWatches(slug)
       if (watches.length === 0) continue
       const enabledOverrides = await loadEnabledOverrides(slug)
@@ -201,23 +249,54 @@ export function createWatchRunner(input: {
         if (watch.error !== undefined) continue
         if (!isEnabled(enabledOverrides, watch.source, watch.name)) continue
         const key = stateKey(slug, watch.source, watch.name)
-        let runState = runStates.get(key)
-        if (runState === undefined) {
-          // First sight: start from "next run after now". Nothing is made up
-          // for the time this service was not running. A null sentinel (an
-          // impossible schedule that slipped past parse validation) is never
-          // due.
-          const next = computeNextRun(parseCronExpression(watch.schedule), now)
-          runState = { nextRunAtMs: next === null ? Number.POSITIVE_INFINITY : next.getTime() }
-          runStates.set(key, runState)
-        }
+        const runState = ensureRunState(key, watch)
         if (nowMs < runState.nextRunAtMs) continue
-        await runWatch(registration, watch, runState, notifications)
-        const following = computeNextRun(parseCronExpression(watch.schedule), new Date(clock.nowMs()))
-        runState.nextRunAtMs = following === null ? Number.POSITIVE_INFINITY : following.getTime()
+        // A manual run in flight holds this watch's lock and consumes the due
+        // slot itself when it finishes; the tick simply moves on.
+        await executeWatch(registration, watch, runState, notifications)
       }
     }
     return { notifications }
+  }
+
+  // First sight on either path — a scheduled tick or a manual run — starts
+  // from "next run after now": nothing is made up for the time this service
+  // was not running. A null sentinel (an impossible schedule that slipped
+  // past parse validation) is never due.
+  function ensureRunState(key: string, watch: DiscoveredWatch): RunState {
+    let runState = runStates.get(key)
+    if (runState === undefined) {
+      const next = computeNextRun(parseCronExpression(watch.schedule), new Date(clock.nowMs()))
+      runState = { nextRunAtMs: next === null ? Number.POSITIVE_INFINITY : next.getTime() }
+      runStates.set(key, runState)
+    }
+    return runState
+  }
+
+  // The one execution path the scheduler's tick and a manual run-now share:
+  // the per-watch lock (acquired before the first await, released in finally
+  // so even an exception never wedges a watch), the run itself, and the
+  // next-run advance afterwards. Keeping the advance here — one executor
+  // path — means a manual run of a due watch consumes the due slot exactly
+  // like a scheduled one, so the next tick never immediately repeats it.
+  // Returns undefined when another execution already holds the lock.
+  async function executeWatch(
+    registration: Registration,
+    watch: DiscoveredWatch,
+    runState: RunState,
+    notifications: WatchNotification[],
+  ): Promise<WatchRunResult | undefined> {
+    const key = stateKey(registration.slug, watch.source, watch.name)
+    if (inFlightWatches.has(key)) return undefined
+    inFlightWatches.add(key)
+    try {
+      const result = await runWatch(registration, watch, runState, notifications)
+      const following = computeNextRun(parseCronExpression(watch.schedule), new Date(clock.nowMs()))
+      runState.nextRunAtMs = following === null ? Number.POSITIVE_INFINITY : following.getTime()
+      return result
+    } finally {
+      inFlightWatches.delete(key)
+    }
   }
 
   async function runWatch(
@@ -225,7 +304,7 @@ export function createWatchRunner(input: {
     watch: DiscoveredWatch,
     runState: RunState,
     notifications: WatchNotification[],
-  ): Promise<void> {
+  ): Promise<WatchRunResult> {
     const { slug, homeDirectory, coordinatorSessionId } = registration
     const stateDirectory = `${homeDirectory}/watch-state/${watch.name}`
     runState.lastRunAt = new Date(clock.nowMs()).toISOString()
@@ -258,10 +337,12 @@ export function createWatchRunner(input: {
           : execution?.exitCode === null
             ? "was killed without an exit code"
             : `exited with code ${execution?.exitCode}`)
-      // Reported to the coordinator once per failure streak; the next
-      // successful run resets the streak.
       runState.lastOutcome = "failed"
       runState.lastOutput = execution === undefined ? "" : presentOutput(execution.stdout.trim())
+      runState.lastError = reason
+      // Reported to the coordinator and the captain's desktop once per
+      // failure streak; the next successful run — empty stdout included —
+      // resets the streak, so neither repeats on every failed run.
       if (runState.reportedFailure !== true) {
         runState.reportedFailure = true
         notifications.push({
@@ -269,16 +350,25 @@ export function createWatchRunner(input: {
           coordinatorSessionId,
           homeDirectory,
           message: `FirstMate (${slug}) watch ${watch.name} failed: ${reason}`,
+          watchName: watch.name,
+          source: watch.source,
         })
+        const captain = captainWatchNotification(watch.name, "failed", reason)
+        try {
+          await notifyCaptain({ fetcher, support: await resolveSupport(), title: captain.title, body: captain.body })
+        } catch {
+          // Best effort: never throws into the run.
+        }
       }
-      return
+      return { outcome: "failed", lastError: reason }
     }
     runState.reportedFailure = false
+    runState.lastError = undefined
     const output = presentOutput(execution.stdout.trim())
     if (output === "") {
       runState.lastOutcome = "empty"
       runState.lastOutput = ""
-      return
+      return { outcome: "empty" }
     }
     runState.lastOutcome = "ok"
     runState.lastOutput = output
@@ -287,21 +377,20 @@ export function createWatchRunner(input: {
       coordinatorSessionId,
       homeDirectory,
       message: `FirstMate (${slug}) watch ${watch.name}:\n${output}`,
+      watchName: watch.name,
+      source: watch.source,
     })
     // The captain hears a firing watch on the desktop too, with the same
-    // output capped to the host's 500-character body limit. Best effort —
-    // like the emit route itself, a failed or rate-limited notification
-    // never fails the round.
+    // output capped to the host's limits. Best effort — like the emit
+    // route itself, a failed or rate-limited notification never fails
+    // the run.
+    const captain = captainWatchNotification(watch.name, "fired", output)
     try {
-      await notifyCaptain({
-        fetcher,
-        support: await resolveSupport(),
-        title: `FirstMate — ${watch.name} fired`,
-        body: output.slice(0, 500),
-      })
+      await notifyCaptain({ fetcher, support: await resolveSupport(), title: captain.title, body: captain.body })
     } catch {
-      // Best effort: never throws into the tick.
+      // Best effort: never throws into the run.
     }
+    return { outcome: "ok" }
   }
 
   async function listWatches(slug: string): Promise<WatchInfo[]> {
@@ -327,6 +416,7 @@ export function createWatchRunner(input: {
         ...(runState?.lastRunAt !== undefined ? { lastRunAt: runState.lastRunAt } : {}),
         ...(runState?.lastOutcome !== undefined ? { lastOutcome: runState.lastOutcome } : {}),
         ...(runState?.lastOutput !== undefined && runState.lastOutput !== "" ? { lastOutput: runState.lastOutput } : {}),
+        ...(runState?.lastError !== undefined ? { lastError: runState.lastError } : {}),
       }
     })
   }
@@ -422,7 +512,40 @@ export function createWatchRunner(input: {
     return "ok"
   }
 
-  return { tick, listWatches, setEnabled, setSchedule, createWatch }
+  // A manual run-now resolves the watch exactly like the toggle (by name,
+  // optionally narrowed to a source) and drives the same execution path
+  // the scheduler's tick drives — run state, streak, env, and timeout are
+  // all shared, so a manual run's records and streak resets land exactly
+  // where a scheduled run's would. A disabled watch may be run explicitly
+  // (the switch toggles automatic scheduling only); a broken-schedule
+  // watch refuses — the panel disables its button. Never delivers: the
+  // notifications ride the result for main's shared delivery path.
+  async function runNow(slug: string, source: WatchSource | undefined, name: string): Promise<RunNowResult> {
+    const registrations = await loadRegistry(filesystem, homeRoot)
+    const registration = registrations[slug]
+    if (registration === undefined) return { kind: "unknown-slug" }
+    const candidates = (await discoverWatches(slug)).filter((watch) => watch.name === name)
+    const targets = source === undefined ? candidates : candidates.filter((watch) => watch.source === source)
+    if (targets.length === 0) return { kind: "unknown-watch" }
+    if (targets.length > 1) return { kind: "ambiguous-watch" }
+    const watch = targets[0]
+    if (watch.error !== undefined) return { kind: "invalid-schedule", error: watch.error }
+    const key = stateKey(slug, watch.source, watch.name)
+    const runState = ensureRunState(key, watch)
+    const notifications: WatchNotification[] = []
+    const run = await executeWatch(registration, watch, runState, notifications)
+    if (run === undefined) return { kind: "already-running" }
+    return {
+      kind: "ran",
+      name: watch.name,
+      source: watch.source,
+      lastOutcome: run.outcome,
+      ...(run.lastError !== undefined ? { lastError: run.lastError } : {}),
+      notifications,
+    }
+  }
+
+  return { tick, runNow, listWatches, setEnabled, setSchedule, createWatch }
 }
 
 type EnabledOverrides = Partial<Record<WatchSource, Record<string, unknown>>>
@@ -443,4 +566,19 @@ function presentOutput(text: string): string {
   if (text.length <= lastOutputMaxLength) return text
   const dropped = text.length - lastOutputMaxLength
   return `…[truncated ${dropped} chars]\n${text.slice(-lastOutputMaxLength)}`
+}
+
+// The desktop emit route carries only so much: the 500-character body limit
+// the firing notification has always honored, and a title cap that binds
+// only for absurdly long watch names (created names max out at 40 plus
+// ".sh"). Both captain notifications a watch produces — fired and failed —
+// go through this one helper, so neither can exceed the host's limits.
+const captainTitleMaxLength = 100
+const captainBodyMaxLength = 500
+
+function captainWatchNotification(watchName: string, event: "fired" | "failed", body: string): { title: string; body: string } {
+  return {
+    title: `FirstMate — ${watchName} ${event}`.slice(0, captainTitleMaxLength),
+    body: body.slice(0, captainBodyMaxLength),
+  }
 }

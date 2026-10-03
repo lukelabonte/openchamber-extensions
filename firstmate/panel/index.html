@@ -340,6 +340,19 @@
         overflow-wrap: anywhere;
       }
 
+      /* Supervision health rows and landing cleanup lines: tiny text tokens
+         that stay fluid at ~280px; status is always spelled out in words. */
+      .fm-supervision,
+      .fm-cleanup {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 4px 10px;
+        margin: 4px 0 0;
+        overflow-wrap: anywhere;
+        min-width: 0;
+      }
+
       .fm-landing {
         display: flex;
         flex-direction: column;

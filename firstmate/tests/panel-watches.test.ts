@@ -70,6 +70,28 @@ describe("parseWatches", () => {
     expect(parseWatches(undefined)).toEqual([])
     expect(parseWatches({ watches: [] })).toEqual([])
   })
+
+  test("carries optional lastError and deliveryError strings through", () => {
+    expect(
+      parseWatches([
+        { name: "pr-watch", source: "shared", schedule: "*", enabled: true, lastOutcome: "failed", lastError: "exit code 3", deliveryError: "coordinator unreachable" },
+      ]),
+    ).toEqual([
+      { name: "pr-watch", source: "shared", schedule: "*", enabled: true, lastOutcome: "failed", lastError: "exit code 3", deliveryError: "coordinator unreachable" },
+    ])
+  })
+
+  test("omits absent error fields and skips entries whose error fields are not strings", () => {
+    const [clean] = parseWatches([{ name: "w", source: "shared", schedule: "*", enabled: true }])
+    expect(clean.lastError).toBeUndefined()
+    expect(clean.deliveryError).toBeUndefined()
+    expect(
+      parseWatches([
+        { name: "w", source: "shared", schedule: "*", enabled: true, lastError: 7 },
+        { name: "w", source: "shared", schedule: "*", enabled: true, deliveryError: 9 },
+      ]),
+    ).toEqual([])
+  })
 })
 
 describe("watch row display mapping", () => {
@@ -185,5 +207,24 @@ describe("panel watches state", () => {
       watches: [{ name: "pr-watch", source: "shared", schedule: "*", enabled: true }],
     } as PanelEvent)
     expect(after).toEqual({ kind: "unregistered" })
+  })
+
+  test("the top-level delivery summary is carried and a later clean load clears it", () => {
+    const withSummary = reducePanelState(registeredState(), {
+      type: "watches-loaded",
+      watches: [{ name: "pr-watch", source: "shared", schedule: "*/5 * * * *", enabled: true }],
+      deliveryError: "one notification could not be delivered",
+    })
+    expect(withSummary).toMatchObject({ watchesDeliveryError: "one notification could not be delivered" })
+    const cleared = reducePanelState(withSummary, {
+      type: "watches-loaded",
+      watches: [{ name: "pr-watch", source: "shared", schedule: "*/5 * * * *", enabled: true }],
+    })
+    expect(cleared).toEqual({
+      kind: "registered",
+      registration,
+      board: { kind: "loading" },
+      watches: [{ name: "pr-watch", source: "shared", schedule: "*/5 * * * *", enabled: true }],
+    })
   })
 })

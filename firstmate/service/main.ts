@@ -8,7 +8,7 @@ import { archiveSession, loadArchivedSessionIds } from "./archive"
 import { loadBacklog, type BacklogTask } from "./backlog"
 import { composeInstructions } from "./compose"
 import { createNodeClock } from "./clock"
-import { MissingCliError, type ExecRunner } from "./control-client"
+import { MissingCliError, sessionSend, type ExecRunner } from "./control-client"
 import type { FileSystemPort } from "./file-system"
 import { deliverNotification } from "./forwarder"
 import { discoverSupport, interruptWorker, type HttpFetcher } from "./interrupt"
@@ -16,11 +16,11 @@ import { launchFirstMate } from "./launch"
 import { createSupervisionPoller } from "./poller"
 import { provisionProject } from "./provision"
 import { findRegistration, loadRegistry, type Registration } from "./registry"
-import { loadLandingRecords } from "./landing-record"
+import { loadLandingRecords, type LandingRecord } from "./landing-record"
 import { parseShippingMode } from "./shipping-mode"
 import { loadSuggestions, removeSuggestion, sendSuggestion, suggestionsPath, type Suggestion } from "./suggestions"
 import { parseCronExpression } from "./watch-schedule"
-import { createWatchRunner, type WatchExecPort } from "./watches"
+import { createWatchRunner, type WatchExecPort, type WatchNotification } from "./watches"
 
 const rawServicePort = process.env.OPENCHAMBER_SERVICE_PORT
 const serviceToken = process.env.OPENCHAMBER_SERVICE_TOKEN
@@ -194,6 +194,7 @@ const supervisionPoller = createSupervisionPoller({
   homeRoot,
   fetcher: nodeFetcher,
   resolveSupport: () => discoverSupport({ filesystem: nodeFileSystem, settingsPath: openchamberSettingsPath }),
+  nowMs: clock.nowMs,
 })
 const watchRunner = createWatchRunner({
   filesystem: nodeFileSystem,
@@ -231,10 +232,69 @@ async function runSupervisionRound(): Promise<void> {
   }
 }
 
+// Watch notification delivery — one path for every producer, the
+// scheduler's rounds and manual run-now results alike. A failed delivery is
+// no longer absorbed with a promise that the next due run would re-report
+// it: the failure streak suppresses exactly that. Instead the failure is
+// recorded per watch (slug + source + name, carried on the notification
+// itself) and surfaced on GET /watches; only a successful delivery of THAT
+// watch clears the record, so an unrelated watch's send never touches it.
+// Execution success and delivery success stay separate throughout: a lost
+// delivery never fails the run that produced it, and a successful run
+// never hides a failed delivery. A notification without watch attribution
+// — none exist today, the fields are optional for compatibility — records
+// at the slug level, the closest attribution available.
+const watchDeliveryErrors = new Map<string, string>()
+
+function watchDeliveryKey(slug: string, source: string | undefined, name: string | undefined): string {
+  return `${slug}\n${source ?? ""}\n${name ?? ""}`
+}
+
+// Watch coordinator deliveries are ONE immediate `session send` attempt —
+// no busy backoff, no retry loop. The supervision forwarder may wait a busy
+// coordinator out (its rounds are background intervals that nothing waits
+// on), but a watch delivery sits on paths that must settle: a manual
+// run-now's HTTP response waits on this very call, so an unbounded busy
+// backoff here would wedge the response and the panel's Run now button until
+// reload. A busy or failed attempt is recorded per watch in the map above
+// and surfaces as the row's deliveryError; that watch's own next successful
+// delivery clears it.
+async function deliverWatchNotifications(notifications: WatchNotification[]): Promise<void> {
+  for (const notification of notifications) {
+    const key = watchDeliveryKey(notification.slug, notification.source, notification.watchName)
+    try {
+      await sessionSend(nodeExec, {
+        sessionId: notification.coordinatorSessionId,
+        directory: notification.homeDirectory,
+        prompt: notification.message,
+      })
+      watchDeliveryErrors.delete(key)
+    } catch (error) {
+      watchDeliveryErrors.set(key, error instanceof Error ? error.message : String(error))
+    }
+  }
+}
+
+// The concise top-level line for GET /watches: which watches of this slug
+// have an undelivered notification on record — the full reasons live on
+// the rows themselves. A slug-level record (a delivery without watch
+// attribution) counts as unattributed.
+function watchDeliverySummary(slug: string): string | undefined {
+  const failedNames: string[] = []
+  for (const [key] of watchDeliveryErrors) {
+    if (!key.startsWith(`${slug}\n`)) continue
+    const name = key.split("\n")[2]
+    failedNames.push(name === undefined || name === "" ? "(unattributed)" : name)
+  }
+  if (failedNames.length === 0) return undefined
+  return `watch notification delivery failed for: ${failedNames.sort().join(", ")}`
+}
+
 // One watch round: run every due watch, then deliver its notifications to the
-// project's coordinator. Like the supervision round, rounds never overlap and
-// a failed delivery is absorbed — the coordinator's answer (or the board's
-// delivery error slot) is where a lost watch message would surface from.
+// project's coordinator through the shared watch delivery path. Like the
+// supervision round, rounds never overlap; a failed delivery is recorded per
+// watch, never thrown into the interval, and never conflated with the run's
+// own outcome.
 let watchRoundInFlight = false
 
 async function runWatchRound(): Promise<void> {
@@ -242,13 +302,7 @@ async function runWatchRound(): Promise<void> {
   watchRoundInFlight = true
   try {
     const round = await watchRunner.tick()
-    for (const notification of round.notifications) {
-      try {
-        await deliverNotification({ exec: nodeExec, clock, notification })
-      } catch {
-        // Never thrown into the interval; the next due run re-reports.
-      }
-    }
+    await deliverWatchNotifications(round.notifications)
   } catch {
     // A tick must never reject into the interval — an unhandled rejection
     // would kill the service. The round is skipped; the next one re-reads.
@@ -416,7 +470,17 @@ async function handleBoard(url: URL, response: ServerResponse): Promise<void> {
     const tasks = backlog.tasks.filter((task) => task.sessionId === undefined || !archivedSessionIds.has(task.sessionId))
     const workers = supervisionPoller.getBoardWorkers(slug, tasks)
     const deliveryError = supervisionPoller.getDeliveryError(slug)
-    respondJson(response, 200, deliveryError === undefined ? { workers } : { workers, deliveryError })
+    // Supervision health rides the board for the panel: the state of the two
+    // host-observation channels plus the last clean poll's time. Always
+    // present for a registered slug — a never-polled slug reads the initial
+    // unknown record — so the panel can treat it as optional for older
+    // services but never as missing here.
+    const supervision = supervisionPoller.getSupervisionHealth(slug)
+    respondJson(response, 200, {
+      workers,
+      supervision,
+      ...(deliveryError !== undefined ? { deliveryError } : {}),
+    })
   } catch (error) {
     respondJson(response, 500, { error: error instanceof Error ? error.message : "board read failed" })
   }
@@ -618,7 +682,31 @@ async function handleWatchesList(url: URL, response: ServerResponse): Promise<vo
       return
     }
     const watches = await watchRunner.listWatches(slug)
-    respondJson(response, 200, { watches })
+    // A removed watch keeps no stale error entry: this slug's attributed
+    // records whose (source, name) no longer matches any discovered watch
+    // are pruned here, against the discovered rows themselves. Only that
+    // prunes — an existing watch's recorded failure stays visible until its
+    // own successful delivery clears it, other slugs' records are untouched,
+    // and the slug-level record of an unattributed delivery is not a watch
+    // row's to prune.
+    const discoveredWatchKeys = new Set(watches.map((watch) => watchDeliveryKey(slug, watch.source, watch.name)))
+    const unattributedWatchKey = watchDeliveryKey(slug, undefined, undefined)
+    for (const key of [...watchDeliveryErrors.keys()]) {
+      if (key.startsWith(`${slug}\n`) && key !== unattributedWatchKey && !discoveredWatchKeys.has(key)) {
+        watchDeliveryErrors.delete(key)
+      }
+    }
+    // Delivery visibility rides beside the run fields: each row carries its
+    // own watch's recorded delivery error, and the top level carries a
+    // concise summary when any watch of this slug has an undelivered
+    // notification on record. Execution state (lastRunAt, lastOutcome,
+    // lastOutput, lastError) and delivery state never overwrite each other.
+    const decorated = watches.map((watch) => {
+      const deliveryError = watchDeliveryErrors.get(watchDeliveryKey(slug, watch.source, watch.name))
+      return deliveryError === undefined ? watch : { ...watch, deliveryError }
+    })
+    const summary = watchDeliverySummary(slug)
+    respondJson(response, 200, { watches: decorated, ...(summary !== undefined ? { deliveryError: summary } : {}) })
   } catch (error) {
     respondJson(response, 500, { error: error instanceof Error ? error.message : "watches read failed" })
   }
@@ -758,6 +846,71 @@ async function handleWatchCreate(request: IncomingMessage, response: ServerRespo
   }
 }
 
+// Run now: an explicit manual run through the scheduler's own execution
+// path. Validation and identifier rules match the toggle and schedule
+// routes — the name resolves among the project's discovered watches, so
+// no path is ever built from the request; traversal-shaped names simply
+// match no watch and answer 404. A manual run may execute a disabled
+// watch (the switch toggles automatic scheduling only); a broken-schedule
+// watch refuses with the parser's own reason; an in-flight execution —
+// scheduled or manual — answers 409. A failed script is a completed run:
+// 200 with a failed lastOutcome, never an infrastructure 500. The run's
+// notifications go through the shared watch delivery path, so a lost
+// coordinator delivery is recorded per watch and surfaces here as
+// deliveryError — delivery failure visible even when the script
+// succeeded, and never conflated with it.
+async function handleWatchRun(request: IncomingMessage, response: ServerResponse): Promise<void> {
+  const payload = await readJsonRecord(request)
+  const slug = recordString(payload, "slug")
+  const name = recordString(payload, "name")
+  const source = payload?.source
+  if (slug === undefined || name === undefined) {
+    respondJson(response, 400, { error: "slug and name must be non-empty strings" })
+    return
+  }
+  if (!isWatchSource(source)) {
+    respondJson(response, 400, { error: `source must be "shared" or "project" when given` })
+    return
+  }
+  try {
+    const result = await watchRunner.runNow(slug, source, name)
+    if (result.kind === "unknown-slug") {
+      respondJson(response, 404, { error: `no first mate registered for slug ${slug}` })
+      return
+    }
+    if (result.kind === "unknown-watch") {
+      respondJson(response, 404, { error: `no watch named ${name} for slug ${slug}` })
+      return
+    }
+    if (result.kind === "ambiguous-watch") {
+      respondJson(response, 409, {
+        error: `the watch name ${name} matches both a shared and a project watch for ${slug}; pass source "shared" or "project"`,
+      })
+      return
+    }
+    if (result.kind === "invalid-schedule") {
+      respondJson(response, 400, { error: result.error })
+      return
+    }
+    if (result.kind === "already-running") {
+      respondJson(response, 409, { error: `the watch ${name} is already running` })
+      return
+    }
+    await deliverWatchNotifications(result.notifications)
+    const deliveryError = watchDeliveryErrors.get(watchDeliveryKey(slug, result.source, result.name))
+    respondJson(response, 200, {
+      ran: true,
+      name: result.name,
+      source: result.source,
+      lastOutcome: result.lastOutcome,
+      ...(result.lastError !== undefined ? { lastError: result.lastError } : {}),
+      ...(deliveryError !== undefined ? { deliveryError } : {}),
+    })
+  } catch (error) {
+    respondJson(response, 500, { error: error instanceof Error ? error.message : "watch run failed" })
+  }
+}
+
 async function handleEnd(request: IncomingMessage, response: ServerResponse): Promise<void> {
   const payload = await readJsonRecord(request)
   const slug = recordString(payload, "slug")
@@ -809,14 +962,69 @@ async function handleShipping(url: URL, response: ServerResponse): Promise<void>
       ? parseShippingMode(await nodeFileSystem.readFile(projectsMdPath))
       : { mode: null, yolo: false }
     const landings = await loadLandingRecords(nodeFileSystem, homeRoot, slug)
+    // Cleanup visibility: each landing's canonical task joins to the backlog
+    // by exact title, and only a UNIQUE match whose task records an absolute
+    // worktreeDirectory may claim anything — duplicate titles and unmatched
+    // landings claim nothing. The only disk access is one stat of that exact
+    // recorded directory (explicitly authorized): it exists → the worktree
+    // awaits cleanup; it is gone (ENOENT) → removed; any other error or a
+    // non-directory reads as unknown, never as a false "removed". Contents
+    // are never read, nothing is traversed or removed, and no cleanup worker
+    // is launched. A backlog read failure keeps the landing list available
+    // with no cleanup claims, reported as a concise cleanupError.
+    let backlogTasks: BacklogTask[] | undefined
+    let cleanupError: string | undefined
+    try {
+      backlogTasks = (await loadBacklog(nodeFileSystem, `${homeRoot}/projects/${slug}/backlog.md`)).tasks
+    } catch {
+      cleanupError = "the backlog could not be read, so worktree cleanup state could not be established"
+    }
+    const landingsWithCleanup: (LandingRecord & { cleanup?: LandingCleanup })[] = []
+    for (const record of landings.records) {
+      const cleanup = backlogTasks === undefined ? undefined : await landingCleanupState(backlogTasks, record.task)
+      landingsWithCleanup.push(cleanup === undefined ? record : { ...record, cleanup })
+    }
     respondJson(response, 200, {
       mode: shipping.mode,
       yolo: shipping.yolo,
-      landings: landings.records,
+      landings: landingsWithCleanup,
       landingErrors: landings.errors.map((error) => `line ${error.line}: ${error.message}`),
+      ...(cleanupError !== undefined ? { cleanupError } : {}),
     })
   } catch (error) {
     respondJson(response, 500, { error: error instanceof Error ? error.message : "shipping read failed" })
+  }
+}
+
+// The optional cleanup claim on a /shipping landing: the recorded worktree
+// directory and its on-disk state, read with a single stat of that exact
+// directory — never its contents, never a traversal.
+type LandingCleanupState = "pending" | "removed" | "unknown"
+
+interface LandingCleanup {
+  worktree: string
+  state: LandingCleanupState
+}
+
+// Joins a landing's canonical task to the backlog by exact title. Only a
+// UNIQUE title match with a recorded absolute worktreeDirectory produces a
+// claim: duplicate titles are ambiguous, unmatched landings have no worktree
+// to check, and a relative recorded directory is not trusted. stat success →
+// pending; ENOENT → removed; a permission error, any other failure, or a
+// non-directory reads as unknown rather than a false "removed".
+async function landingCleanupState(tasks: BacklogTask[], landingTask: string): Promise<LandingCleanup | undefined> {
+  const matches = tasks.filter((task) => task.title === landingTask)
+  if (matches.length !== 1) return undefined
+  const worktree = matches[0].worktreeDirectory
+  if (worktree === undefined || !path.isAbsolute(worktree)) return undefined
+  try {
+    const stats = await stat(worktree)
+    return { worktree, state: stats.isDirectory() ? "pending" : "unknown" }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException | undefined)?.code === "ENOENT") {
+      return { worktree, state: "removed" }
+    }
+    return { worktree, state: "unknown" }
   }
 }
 
@@ -1063,6 +1271,10 @@ async function handleRequest(request: IncomingMessage, response: ServerResponse)
   }
   if (request.method === "POST" && pathname === "/watch/create") {
     await handleWatchCreate(request, response)
+    return
+  }
+  if (request.method === "POST" && pathname === "/watch/run") {
+    await handleWatchRun(request, response)
     return
   }
   if (request.method === "POST" && pathname === "/steer") {

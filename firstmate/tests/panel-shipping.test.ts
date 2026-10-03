@@ -94,6 +94,62 @@ describe("parseShipping", () => {
   })
 })
 
+describe("landing cleanup parsing", () => {
+  const landingWith = (cleanup: unknown) => ({ ...landing, cleanup })
+
+  test("carries valid pending, removed, and unknown cleanup claims through exactly", () => {
+    expect(
+      parseShipping({
+        mode: "direct-PR",
+        yolo: false,
+        landings: [
+          landingWith({ worktree: "/repos/sunrise/.worktrees/fm/login-fix", state: "pending" }),
+          landingWith({ worktree: "/repos/sunrise/.worktrees/fm/login-fix", state: "removed" }),
+          landingWith({ worktree: "/repos/sunrise/.worktrees/fm/login-fix", state: "unknown" }),
+        ],
+        landingErrors: [],
+      })?.landings,
+    ).toEqual([
+      { ...landing, cleanup: { worktree: "/repos/sunrise/.worktrees/fm/login-fix", state: "pending" } },
+      { ...landing, cleanup: { worktree: "/repos/sunrise/.worktrees/fm/login-fix", state: "removed" } },
+      { ...landing, cleanup: { worktree: "/repos/sunrise/.worktrees/fm/login-fix", state: "unknown" } },
+    ])
+  })
+
+  test("an invalid cleanup claim drops only the cleanup field, not the landing", () => {
+    const parsed = parseShipping({
+      mode: "direct-PR",
+      yolo: false,
+      landings: [
+        landingWith({ worktree: "", state: "pending" }), // empty worktree path
+        landingWith({ worktree: "/repos/sunrise/.worktrees/fm/login-fix", state: "deleted" }), // bad state
+        landingWith("pending"), // not an object
+        landing, // no cleanup claim at all
+      ],
+      landingErrors: [],
+    })
+    expect(parsed?.landings).toEqual([landing, landing, landing, landing])
+  })
+
+  test("carries a string top-level cleanupError and drops a non-string one", () => {
+    expect(
+      parseShipping({ mode: "direct-PR", yolo: false, landings: [], landingErrors: [], cleanupError: "the backlog could not be read" }),
+    ).toEqual({
+      mode: "direct-PR",
+      yolo: false,
+      landings: [],
+      landingErrors: [],
+      cleanupError: "the backlog could not be read",
+    })
+    expect(parseShipping({ mode: "direct-PR", yolo: false, landings: [], landingErrors: [], cleanupError: 7 })).toEqual({
+      mode: "direct-PR",
+      yolo: false,
+      landings: [],
+      landingErrors: [],
+    })
+  })
+})
+
 describe("shippingBadgeLabel", () => {
   test("labels the unset state plainly", () => {
     expect(shippingBadgeLabel({ mode: null, yolo: false, landings: [], landingErrors: [] })).toBe("mode unset")

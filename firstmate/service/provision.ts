@@ -1,5 +1,6 @@
 import type { FileSystemPort } from "./file-system"
 import { deriveSlug, normalizeProjectDirectory } from "./slug"
+import { syncTemplateCopy } from "./template-upgrades"
 
 interface ProvisionProjectInput {
   filesystem: FileSystemPort
@@ -18,15 +19,22 @@ interface HomeFile {
   fileName: string
   /** Executable watch scripts are installed with the exec bit set. */
   executable?: boolean
+  /** Only shipped shared defaults opt into provenance-aware upgrades. */
+  legacyHashes?: readonly string[]
 }
 
 const sharedDirectories = ["watches"]
 
+export const legacyTemplateHashes = {
+  charter: ["44c30fc03a72d0e3db47f520f77e9d2f256a8595da0c4a92a3613ba8d0bf4bd9"],
+  "pr-watch": ["436ce74feaf4fcb7beaeca787e30b0434ed2a5feeb0e4222540852c6b103fbbe"],
+}
+
 const sharedFiles: HomeFile[] = [
-  { templateName: "charter.md", fileName: "charter.md" },
+  { templateName: "charter.md", fileName: "charter.md", legacyHashes: legacyTemplateHashes.charter },
   { templateName: "captain.md", fileName: "captain.md" },
   { templateName: "watches-README.md", fileName: "watches/README.md" },
-  { templateName: "pr-watch", fileName: "watches/pr-watch", executable: true },
+  { templateName: "pr-watch", fileName: "watches/pr-watch", executable: true, legacyHashes: legacyTemplateHashes["pr-watch"] },
 ]
 
 const projectDirectories = ["briefs", "reports", "watches"]
@@ -36,6 +44,8 @@ const projectFiles: HomeFile[] = [
   { templateName: "captain.md", fileName: "captain.md" },
   { templateName: "backlog.md", fileName: "backlog.md" },
   { templateName: "projects.md", fileName: "projects.md" },
+  { templateName: "opening-note.md", fileName: "opening.md" },
+  { templateName: "learnings.md", fileName: "learnings.md" },
 ]
 
 export async function provisionProject(input: ProvisionProjectInput): Promise<ProvisionedProject> {
@@ -127,6 +137,11 @@ async function createFiles(input: {
   }
   for (const file of files) {
     const filePath = `${parentDirectory}/${file.fileName}`
+    if (file.legacyHashes !== undefined) {
+      const state = await syncTemplateCopy({ filesystem, filePath, contents: await templateReader(file.templateName), legacyHashes: file.legacyHashes })
+      if (file.executable === true && !state.edited && !state.outdated) await filesystem.setExecutable(filePath)
+      continue
+    }
     if (await filesystem.exists(filePath)) continue
     await filesystem.writeFile(filePath, await templateReader(file.templateName))
     if (file.executable === true) await filesystem.setExecutable(filePath)

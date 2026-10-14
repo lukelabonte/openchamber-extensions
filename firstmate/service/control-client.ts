@@ -28,12 +28,19 @@ export interface SessionStatus {
 export interface SessionListEntry {
   sessionId: string
   status: SessionStatus
+  directory?: string
+  archived?: boolean
 }
 
 export type ExecRunner = (command: string, args: readonly string[]) => Promise<string>
 
-export async function createSession(exec: ExecRunner, input: { directory: string; title: string }): Promise<string> {
-  const output = await runControlCommand(exec, ["session", "create", "--dir", input.directory, "--title", input.title, "--json"])
+export async function createSession(exec: ExecRunner, input: { directory: string; title: string; prompt?: string; model?: string; variant?: string }): Promise<string> {
+  const args = ["session", "create", "--dir", input.directory, "--title", input.title]
+  for (const name of ["prompt", "model", "variant"] as const) {
+    if (input[name] !== undefined) args.push(`--${name}`, input[name])
+  }
+  args.push("--json")
+  const output = await runControlCommand(exec, args)
   const parsed = parseJsonOutput(output)
   const sessionId = extractSessionId(parsed)
   if (sessionId === undefined) {
@@ -45,6 +52,8 @@ export async function createSession(exec: ExecRunner, input: { directory: string
 export async function sessionStatus(exec: ExecRunner, input: { sessionId: string; directory: string }): Promise<SessionStatus> {
   const output = await runControlCommand(exec, ["session", "status", "--session", input.sessionId, "--dir", input.directory, "--json"])
   const parsed = parseJsonOutput(output)
+  const sessionId = extractSessionId(parsed)
+  if (sessionId !== undefined && sessionId !== input.sessionId) throw new Error("openchamber session status returned a different session id")
   return { activity: extractActivity(parsed), outcome: extractOutcome(parsed) }
 }
 
@@ -83,15 +92,28 @@ export async function sessionSend(exec: ExecRunner, input: { sessionId: string; 
   }
 }
 
-export async function sessionList(exec: ExecRunner, input: { directory: string }): Promise<SessionListEntry[]> {
-  const output = await runControlCommand(exec, ["session", "list", "--dir", input.directory, "--with-status", "--json"])
+export async function sessionList(exec: ExecRunner, input: { directory: string; all?: boolean }): Promise<SessionListEntry[]> {
+  const args = ["session", "list", "--dir", input.directory, "--with-status"]
+  if (input.all === true) args.push("--all")
+  args.push("--json")
+  const output = await runControlCommand(exec, args)
   const parsed = parseJsonOutput(output)
-  const entries = Array.isArray(parsed) ? parsed : isRecord(parsed) && Array.isArray(parsed.sessions) ? parsed.sessions : []
+  const entries = Array.isArray(parsed) ? parsed : isRecord(parsed) && Array.isArray(parsed.sessions) ? parsed.sessions : undefined
+  if (entries === undefined) throw new Error("openchamber session list output did not include a sessions array")
   const sessions: SessionListEntry[] = []
   for (const entry of entries) {
     const sessionId = extractSessionId(entry)
     if (sessionId === undefined) continue
-    sessions.push({ sessionId, status: { activity: extractActivity(entry), outcome: extractOutcome(entry) } })
+    if (isRecord(entry) && entry.directory !== undefined && (typeof entry.directory !== "string" || entry.directory.trim() === "")) {
+      throw new Error("openchamber session list returned an invalid session directory")
+    }
+    const archived = extractArchived(entry)
+    sessions.push({
+      sessionId,
+      status: { activity: extractActivity(entry), outcome: extractOutcome(entry) },
+      ...(isRecord(entry) && typeof entry.directory === "string" ? { directory: entry.directory } : {}),
+      ...(archived !== undefined ? { archived } : {}),
+    })
   }
   return sessions
 }
@@ -108,11 +130,28 @@ async function runControlCommand(exec: ExecRunner, args: readonly string[]): Pro
 }
 
 function parseJsonOutput(output: string): unknown {
+  let parsed: unknown
   try {
-    return JSON.parse(output)
+    parsed = JSON.parse(output)
   } catch {
     throw new Error("openchamber command did not return valid JSON")
   }
+  if (isRecord(parsed) && (parsed.status === "error" || parsed.ok === false || parsed.success === false || parsed.error != null)) {
+    throw new Error("openchamber command returned an error response")
+  }
+  return parsed
+}
+
+function extractArchived(parsed: unknown): boolean | undefined {
+  if (!isRecord(parsed)) return undefined
+  for (const key of ["archived", "isArchived"] as const) {
+    if (parsed[key] !== undefined && typeof parsed[key] !== "boolean") throw new Error("openchamber session list returned invalid archive metadata")
+  }
+  if (parsed.time !== undefined && !isRecord(parsed.time)) throw new Error("openchamber session list returned invalid session timestamps")
+  const time = isRecord(parsed.time) ? parsed.time : undefined
+  if (parsed.archived === true || parsed.isArchived === true || parsed.archivedAt != null || time?.archived != null) return true
+  if ("archived" in parsed || "isArchived" in parsed || "archivedAt" in parsed || (time !== undefined && "archived" in time)) return false
+  return undefined
 }
 
 // The exact `--json` response shape is not yet runtime-verified (plan.md, "Could
@@ -121,7 +160,7 @@ function extractSessionId(parsed: unknown): string | undefined {
   if (!isRecord(parsed)) return undefined
   for (const key of ["sessionID", "sessionId", "id"]) {
     const value = parsed[key]
-    if (typeof value === "string" && value !== "") return value
+    if (typeof value === "string" && value.trim() !== "") return value
   }
   return undefined
 }
@@ -137,10 +176,12 @@ const knownActivities: readonly SessionActivity[] = ["unknown", "idle", "running
 function extractActivity(parsed: unknown): SessionActivity {
   if (!isRecord(parsed)) return "unknown"
   const nested = parsed.sessionStatus
-  if (isRecord(nested) && typeof nested.type === "string") {
+  if ("sessionStatus" in parsed) {
+    if (!isRecord(nested) || typeof nested.type !== "string") return "unknown"
     if (nested.type === "busy") return "running"
     if (nested.type === "idle") return "idle"
     if ((knownActivities as readonly string[]).includes(nested.type)) return nested.type as SessionActivity
+    return "unknown"
   }
   for (const key of ["type", "activity", "status"]) {
     const value = parsed[key]

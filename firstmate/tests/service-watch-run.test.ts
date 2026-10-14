@@ -4,6 +4,8 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, wr
 import net from "node:net"
 import os from "node:os"
 import path from "node:path"
+import type { StoredWatchRun } from "../service/watch-store"
+import type { QueuedWatchNote, WatchInfo, WatchOutcome, WatchSource } from "../service/watches"
 
 // POST /watch/run end to end against a private spawned service: a temp
 // FIRSTMATE_HOME, a shim `openchamber` CLI on PATH (every send is logged, a
@@ -20,6 +22,13 @@ const serviceEntry = path.join(serviceRoot, "service", "main.ts")
 const projectDirectory = "/repos/sunrise"
 // A valid expression whose first fire is far outside any test's lifetime.
 const neverDueSchedule = "5 4 29 2 *"
+
+interface FixtureSessionStatus {
+  status: "ok"
+  sessionId: string
+  directory: string
+  sessionStatus: { type: "idle" }
+}
 
 let tempRoot: string
 let tempHome: string
@@ -62,23 +71,28 @@ beforeAll(async () => {
   // file exists — with busy wording when the file says "busy", so the
   // service's SessionBusyError classification is exercised too.
   const shim = path.join(shimBin, "openchamber")
+  const idleStatus: FixtureSessionStatus = {
+    status: "ok",
+    sessionId: "ses_coord_1",
+    directory: projectHome,
+    sessionStatus: { type: "idle" },
+  }
   writeFileSync(
     shim,
-    `#!/bin/sh
-echo "$@" >> "$OPENCHAMBER_SHIM_LOG"
-case " $* " in
-  *" send "*)
-    if [ -f "$OPENCHAMBER_SEND_MODE" ]; then
-      if [ "$(cat "$OPENCHAMBER_SEND_MODE")" = "busy" ]; then
-        echo "the session is busy and cannot accept a message right now" >&2
-      else
-        echo "session send failed for the test" >&2
-      fi
-      exit 1
-    fi
-    ;;
-esac
-exit 0
+    `#!${process.execPath}
+import { appendFileSync, existsSync, readFileSync } from "node:fs"
+const argumentsList = process.argv.slice(2)
+appendFileSync(process.env.OPENCHAMBER_SHIM_LOG, JSON.stringify(argumentsList) + "\\n")
+if (argumentsList[0] === "session" && argumentsList[1] === "status") {
+  process.stdout.write(JSON.stringify(${JSON.stringify(idleStatus)}))
+}
+if (argumentsList[0] === "session" && argumentsList[1] === "send" && existsSync(process.env.OPENCHAMBER_SEND_MODE)) {
+  const mode = readFileSync(process.env.OPENCHAMBER_SEND_MODE, "utf8")
+  console.error(mode === "busy"
+    ? "the session is busy and cannot accept a message right now"
+    : "session send failed for the test")
+  process.exit(1)
+}
 `,
   )
   chmodSync(shim, 0o755)
@@ -97,8 +111,8 @@ exit 0
   servicePort = await startService()
 }, 30_000)
 
-afterAll(() => {
-  serviceProcess?.kill()
+afterAll(async () => {
+  await stopService()
   rmSync(tempRoot, { recursive: true, force: true })
 })
 
@@ -107,7 +121,7 @@ function writeWatch(filePath: string, body: string, scheduleComment = `# schedul
   chmodSync(filePath, 0o755)
 }
 
-function startService(): Promise<number> {
+function startService(watchIntervalMs = 60_000): Promise<number> {
   return new Promise((resolve, reject) => {
     getFreePort().then((port) => {
       serviceProcess = spawn(process.execPath, [serviceEntry], {
@@ -117,7 +131,7 @@ function startService(): Promise<number> {
           OPENCHAMBER_SERVICE_TOKEN: serviceToken,
           FIRSTMATE_HOME: tempHome,
           FIRSTMATE_POLL_MS: "60000",
-          FIRSTMATE_WATCH_MS: "1000",
+          FIRSTMATE_WATCH_MS: String(watchIntervalMs),
           // The settings read points at a file that does not exist, so the
           // desktop notification host resolves as unsupported and nothing
           // ever reaches the developer's real desktop server.
@@ -130,6 +144,15 @@ function startService(): Promise<number> {
       })
       waitUntilListening(port).then(() => resolve(port), reject)
     }, reject)
+  })
+}
+
+async function stopService(): Promise<void> {
+  const child = serviceProcess
+  if (child === undefined || child.exitCode !== null || child.signalCode !== null) return
+  await new Promise<void>((resolve) => {
+    child.once("exit", () => resolve())
+    child.kill()
   })
 }
 
@@ -160,8 +183,7 @@ async function waitUntilListening(port: number): Promise<void> {
   throw new Error("service did not start listening within 5 seconds")
 }
 
-// Bounded polling for fixture-side readiness signals (a marker a script
-// writes when it starts), mirroring waitForShim's deadline discipline.
+// Bounded polling for fixture-side readiness and durable acknowledgement.
 async function waitFor(predicate: () => boolean, description: string, deadlineMs = 5000): Promise<void> {
   const deadline = Date.now() + deadlineMs
   while (Date.now() < deadline) {
@@ -183,32 +205,55 @@ function post(pathname: string, body: unknown, headers: Record<string, string> =
   return fetch(`http://127.0.0.1:${servicePort}${pathname}`, { method: "POST", headers, body: JSON.stringify(body) })
 }
 
-function shimLog(): string {
-  return existsSync(shimLogPath) ? readFileSync(shimLogPath, "utf8") : ""
+function shimInvocations(): string[][] {
+  const log = existsSync(shimLogPath) ? readFileSync(shimLogPath, "utf8") : ""
+  return log.split("\n").filter(Boolean).map((line) => {
+    const argumentsList: unknown = JSON.parse(line)
+    if (!Array.isArray(argumentsList) || !argumentsList.every((argument) => typeof argument === "string")) {
+      throw new Error("invalid shim argv record")
+    }
+    return argumentsList
+  })
 }
 
-function sendLines(containing: string): string[] {
-  return shimLog()
-    .split("\n")
-    .filter((line) => line.includes("session") && line.includes("send") && line.includes(containing))
+function argumentValue(argumentsList: readonly string[], option: string): string {
+  const index = argumentsList.indexOf(option)
+  const value = index < 0 ? undefined : argumentsList[index + 1]
+  if (value === undefined) throw new Error(`shim invocation is missing ${option}`)
+  return value
+}
+
+function sendCalls(containing = ""): string[][] {
+  return shimInvocations().filter((argumentsList) =>
+    argumentsList[0] === "session" && argumentsList[1] === "send" && argumentValue(argumentsList, "--prompt").includes(containing))
+}
+
+interface WatchStoreSnapshot {
+  runs: Record<string, StoredWatchRun>
+  pending: QueuedWatchNote[]
+  delivered: QueuedWatchNote[]
+}
+
+function watchStore(): WatchStoreSnapshot {
+  return JSON.parse(readFileSync(path.join(projectHome, "watch-runner.json"), "utf8")) as WatchStoreSnapshot
 }
 
 interface RunResponse {
   ran?: boolean
   name?: string
-  source?: string
-  lastOutcome?: string
+  source?: WatchSource
+  lastOutcome?: WatchOutcome
   lastError?: string
   deliveryError?: string
   error?: string
 }
 
 interface WatchesResponse {
-  watches: Array<{ name: string; deliveryError?: string; lastOutcome?: string; lastError?: string; lastOutput?: string }>
+  watches: Array<WatchInfo & { deliveryError?: string }>
   deliveryError?: string
 }
 
-function setSendMode(mode: string | undefined): void {
+function setSendMode(mode: "fail" | "busy" | undefined): void {
   if (mode === undefined) {
     if (existsSync(sendModePath)) rmSync(sendModePath)
     return
@@ -233,7 +278,10 @@ describe("POST /watch/run resolution", () => {
     const row = listed.watches.find((watch) => watch.name === "flaky")
     expect(row).toMatchObject({ lastOutcome: "failed", lastError: "exited with code 3", lastOutput: "partial signal" })
     // The failure notification reached the coordinator through the shim.
-    expect(sendLines("watch flaky failed: exited with code 3")).toHaveLength(1)
+    expect(sendCalls("watch flaky failed: exited with code 3")).toHaveLength(1)
+    expect(watchStore().pending).toEqual([])
+    expect(watchStore().delivered).toHaveLength(1)
+    expect(watchStore().delivered[0]?.notification).toMatchObject({ watchName: "flaky", source: "project" })
   })
 
   test("answers 400 for bad input", async () => {
@@ -262,7 +310,7 @@ describe("POST /watch/run resolution", () => {
     expect(traversal.status).toBe(404)
     expect(existsSync(path.join(markersDirectory, "twin-shared"))).toBe(false)
     expect(existsSync(path.join(markersDirectory, "twin-project"))).toBe(false)
-    expect(sendLines("../twin")).toEqual([])
+    expect(sendCalls("../twin")).toEqual([])
   })
 
   test("answers 400 with the parser's reason for a broken-schedule watch", async () => {
@@ -283,13 +331,14 @@ describe("POST /watch/run resolution", () => {
     expect((await shared.json()) as RunResponse).toMatchObject({ ran: true, name: "twin", source: "shared", lastOutcome: "ok" })
     expect(existsSync(path.join(markersDirectory, "twin-shared"))).toBe(true)
     expect(existsSync(path.join(markersDirectory, "twin-project"))).toBe(false)
-    expect(shimLog()).toContain("shared twin ran")
+    expect(sendCalls("shared twin ran")).toHaveLength(1)
 
     const project = await post("/watch/run", { slug: "sunrise", name: "twin", source: "project" })
     expect(project.status).toBe(200)
     expect((await project.json()) as RunResponse).toMatchObject({ ran: true, name: "twin", source: "project", lastOutcome: "ok" })
     expect(existsSync(path.join(markersDirectory, "twin-project"))).toBe(true)
-    expect(shimLog()).toContain("project twin ran")
+    expect(sendCalls("project twin ran")).toHaveLength(1)
+    expect(watchStore().delivered.filter((note) => note.notification.watchName === "twin").map((note) => note.notification.source)).toEqual(["shared", "project"])
   })
 })
 
@@ -313,6 +362,7 @@ describe("POST /watch/run concurrency", () => {
 
 describe("watch delivery errors", () => {
   test("a failed send settles the run-now promptly with the per-watch error, the row, and the summary", async () => {
+    const sendsBefore = sendCalls().length
     setSendMode("fail")
     const started = Date.now()
     const response = await post("/watch/run", { slug: "sunrise", name: "notify" })
@@ -328,36 +378,83 @@ describe("watch delivery errors", () => {
 
     const listed = (await (await get("/watches?slug=sunrise")).json()) as WatchesResponse
     expect(listed.watches.find((watch) => watch.name === "notify")?.deliveryError).toContain("session send failed for the test")
+    expect(listed.watches.find((watch) => watch.name === "other")?.deliveryError).toBeUndefined()
     expect(listed.deliveryError).toBe("watch notification delivery failed for: notify")
-    // Exactly one attempt was made for this watch — no retry loop.
-    expect(sendLines("watch notify:")).toHaveLength(1)
+    // Exactly one send attempt, not a count of status probes or prompt lines.
+    expect(sendCalls().slice(sendsBefore)).toHaveLength(1)
+    const pending = watchStore().pending
+    expect(pending).toHaveLength(1)
+    expect(pending[0]?.notification).toMatchObject({ watchName: "notify", source: "project" })
+    expect(watchStore().delivered.some((note) => note.id === pending[0]?.id)).toBe(false)
     setSendMode(undefined)
+
+    // A repeated script failure queues no second streak note, but its delivery
+    // round still retries and acknowledges the persisted notify note.
+    const retry = await post("/watch/run", { slug: "sunrise", name: "flaky" })
+    expect(retry.status).toBe(200)
+    expect((await retry.json()) as RunResponse).toMatchObject({ ran: true, lastOutcome: "failed" })
+    expect(sendCalls().slice(sendsBefore)).toHaveLength(2)
+    expect(argumentValue(sendCalls().at(-1) ?? [], "--prompt")).toContain(JSON.stringify(pending[0]?.notification.message))
+    expect(watchStore().pending).toEqual([])
+    expect(watchStore().delivered.some((note) => note.id === pending[0]?.id)).toBe(true)
+    const afterRetry = (await (await get("/watches?slug=sunrise")).json()) as WatchesResponse
+    expect(afterRetry.watches.find((watch) => watch.name === "notify")?.deliveryError).toBeUndefined()
+    expect(afterRetry.deliveryError).toBeUndefined()
   })
 
-  test("an unrelated successful delivery cannot clear the failing watch's error; the same watch's success clears it", async () => {
+  test("failures stay attributed per watch; a successful batch clears every included watch's error", async () => {
+    const sendsBefore = sendCalls().length
+    const deliveredBefore = watchStore().delivered.length
     setSendMode("fail")
     const failing = await post("/watch/run", { slug: "sunrise", name: "notify" })
     expect(failing.status).toBe(200)
+    expect(((await failing.json()) as RunResponse).deliveryError).toContain("session send failed for the test")
 
-    setSendMode(undefined)
+    // An unrelated failure has its own reason; retrying the earlier note in
+    // the same failed batch neither clears nor overwrites notify's error.
+    setSendMode("busy")
     const unrelated = await post("/watch/run", { slug: "sunrise", name: "other" })
     expect(unrelated.status).toBe(200)
-    expect(((await unrelated.json()) as RunResponse).deliveryError).toBeUndefined()
+    expect(((await unrelated.json()) as RunResponse).deliveryError).toContain("busy")
 
     const afterUnrelated = (await (await get("/watches?slug=sunrise")).json()) as WatchesResponse
     expect(afterUnrelated.watches.find((watch) => watch.name === "notify")?.deliveryError).toContain("session send failed for the test")
-    expect(afterUnrelated.watches.find((watch) => watch.name === "other")?.deliveryError).toBeUndefined()
-    expect(afterUnrelated.deliveryError).toBe("watch notification delivery failed for: notify")
+    expect(afterUnrelated.watches.find((watch) => watch.name === "other")?.deliveryError).toContain("busy")
+    expect(afterUnrelated.deliveryError).toBe("watch notification delivery failed for: notify, other")
+    const pending = watchStore().pending
+    expect(pending.map((note) => note.notification.watchName)).toEqual(["notify", "other"])
+    expect(watchStore().delivered.some((note) => pending.some((queued) => queued.id === note.id))).toBe(false)
 
-    const clearing = await post("/watch/run", { slug: "sunrise", name: "notify" })
+    setSendMode(undefined)
+    const clearing = await post("/watch/run", { slug: "sunrise", name: "other" })
     expect(clearing.status).toBe(200)
     expect(((await clearing.json()) as RunResponse).deliveryError).toBeUndefined()
+    const attempts = sendCalls().slice(sendsBefore)
+    expect(attempts).toHaveLength(3)
+    const prompt = argumentValue(attempts.at(-1) ?? [], "--prompt")
+    for (const note of pending) expect(prompt).toContain(`QUOTED ${JSON.stringify(note.notification.message)}`)
+    // The one successful send carries three notes, including both earlier
+    // failures; successful delivery is attributed to every acknowledged note.
+    const delivered = watchStore().delivered.slice(deliveredBefore)
+    expect(delivered.map((note) => note.notification.watchName)).toEqual(["notify", "other", "other"])
+    expect(delivered.slice(0, 2)).toEqual(pending)
+    expect(watchStore().pending).toEqual([])
     const afterClearing = (await (await get("/watches?slug=sunrise")).json()) as WatchesResponse
     expect(afterClearing.watches.find((watch) => watch.name === "notify")?.deliveryError).toBeUndefined()
+    expect(afterClearing.watches.find((watch) => watch.name === "other")?.deliveryError).toBeUndefined()
     expect(afterClearing.deliveryError).toBeUndefined()
+
+    const sameWatch = await post("/watch/run", { slug: "sunrise", name: "notify" })
+    expect(sameWatch.status).toBe(200)
+    expect(((await sameWatch.json()) as RunResponse).deliveryError).toBeUndefined()
+    expect(sendCalls().slice(sendsBefore)).toHaveLength(4)
+    expect(watchStore().pending).toEqual([])
+    expect(watchStore().delivered.at(-1)?.notification.watchName).toBe("notify")
   })
 
-  test("a busy coordinator is recorded the same way and still settles promptly", async () => {
+  test("an idle status followed by a busy send race is recorded the same way and still settles promptly", async () => {
+    const invocationsBefore = shimInvocations().length
+    const sendsBefore = sendCalls().length
     setSendMode("busy")
     const started = Date.now()
     const response = await post("/watch/run", { slug: "sunrise", name: "notify" })
@@ -369,25 +466,72 @@ describe("watch delivery errors", () => {
     const listed = (await (await get("/watches?slug=sunrise")).json()) as WatchesResponse
     expect(listed.watches.find((watch) => watch.name === "notify")?.deliveryError).toContain("busy")
     expect(listed.deliveryError).toBe("watch notification delivery failed for: notify")
+    expect(shimInvocations().slice(invocationsBefore).map((argumentsList) => argumentsList.slice(0, 2))).toEqual([["session", "status"], ["session", "send"]])
+    const pending = watchStore().pending
+    expect(pending).toHaveLength(1)
 
     setSendMode(undefined)
     const clearing = await post("/watch/run", { slug: "sunrise", name: "notify" })
     expect(clearing.status).toBe(200)
+    expect(((await clearing.json()) as RunResponse).deliveryError).toBeUndefined()
+    expect(sendCalls().slice(sendsBefore)).toHaveLength(2)
+    expect(argumentValue(sendCalls().at(-1) ?? [], "--prompt")).toContain(`QUOTED ${JSON.stringify(pending[0]?.notification.message)}`)
+    expect(watchStore().pending).toEqual([])
+    expect(watchStore().delivered.some((note) => note.id === pending[0]?.id)).toBe(true)
     const afterClearing = (await (await get("/watches?slug=sunrise")).json()) as WatchesResponse
+    expect(afterClearing.watches.find((watch) => watch.name === "notify")?.deliveryError).toBeUndefined()
     expect(afterClearing.deliveryError).toBeUndefined()
   })
 
-  test("a deleted watch prunes its recorded error and the stale summary", async () => {
+  test("a deleted watch prunes its row error and summary without discarding its queued note or history", async () => {
     setSendMode("fail")
     const failing = await post("/watch/run", { slug: "sunrise", name: "notify" })
     expect(failing.status).toBe(200)
     const before = (await (await get("/watches?slug=sunrise")).json()) as WatchesResponse
     expect(before.deliveryError).toContain("notify")
+    const pending = watchStore().pending
+    expect(pending).toHaveLength(1)
+    const deliveredBefore = watchStore().delivered
 
     rmSync(path.join(projectHome, "watches", "notify"))
     const after = (await (await get("/watches?slug=sunrise")).json()) as WatchesResponse
     expect(after.watches.some((watch) => watch.name === "notify")).toBe(false)
     expect(after.deliveryError).toBeUndefined()
+    expect(watchStore().pending).toEqual(pending)
+    expect(watchStore().delivered).toEqual(deliveredBefore)
     setSendMode(undefined)
+
+    const retry = await post("/watch/run", { slug: "sunrise", name: "other" })
+    expect(retry.status).toBe(200)
+    expect(((await retry.json()) as RunResponse).deliveryError).toBeUndefined()
+    expect(argumentValue(sendCalls().at(-1) ?? [], "--prompt")).toContain(`QUOTED ${JSON.stringify(pending[0]?.notification.message)}`)
+    expect(watchStore().pending).toEqual([])
+    expect(watchStore().delivered.some((note) => note.id === pending[0]?.id)).toBe(true)
+    expect(watchStore().runs["project\nnotify"]?.lastOutcome).toBe("ok")
+  })
+
+  test("the next delivery tick retries a failed persisted note after restart without re-running the watch", async () => {
+    const sendsBefore = sendCalls().length
+    setSendMode("fail")
+    const response = await post("/watch/run", { slug: "sunrise", name: "other" })
+    expect(response.status).toBe(200)
+    expect(((await response.json()) as RunResponse).deliveryError).toContain("session send failed for the test")
+    const pending = watchStore().pending
+    expect(pending).toHaveLength(1)
+    const lastRun = watchStore().runs["project\nother"]
+
+    await stopService()
+    setSendMode(undefined)
+    servicePort = await startService(1000)
+    expect(watchStore().pending).toEqual(pending)
+    await waitFor(() => watchStore().pending.length === 0, "the restarted service's next tick to acknowledge the queued note")
+
+    expect(sendCalls().slice(sendsBefore)).toHaveLength(2)
+    const retry = sendCalls().at(-1) ?? []
+    expect(argumentValue(retry, "--dir")).toBe(projectHome)
+    expect(argumentValue(retry, "--session")).toBe("ses_coord_1")
+    expect(argumentValue(retry, "--prompt")).toContain(`QUOTED ${JSON.stringify(pending[0]?.notification.message)}`)
+    expect(watchStore().delivered.some((note) => note.id === pending[0]?.id)).toBe(true)
+    expect(watchStore().runs["project\nother"]).toEqual(lastRun)
   })
 })

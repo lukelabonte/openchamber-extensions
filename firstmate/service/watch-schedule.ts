@@ -23,9 +23,12 @@ export interface CronSchedule {
 // Five fields: minute, hour, day-of-month, month, day-of-week. Supported per
 // field: `*`, `*/n`, lists (`a,b`), ranges (`a-b`), and plain numbers, with an
 // optional `/n` step on any of them. When both day fields are restricted, a
-// day matches either one (standard crontab OR semantics).
+// day matches either one (standard crontab OR semantics). The hourly, daily,
+// and weekly aliases expand to these same five fields, in local time.
 export function parseCronExpression(expression: string): CronSchedule {
-  const fields = expression.trim().split(/\s+/)
+  const trimmed = expression.trim()
+  const expanded = trimmed === "@hourly" ? "0 * * * *" : trimmed === "@daily" ? "0 0 * * *" : trimmed === "@weekly" ? "0 0 * * 0" : trimmed
+  const fields = expanded.split(/\s+/)
   if (fields.length !== 5) {
     throw new ScheduleParseError(expression, "expected 5 fields (minute hour day-of-month month day-of-week)")
   }

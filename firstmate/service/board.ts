@@ -1,4 +1,4 @@
-import type { BacklogState, BacklogTask } from "./backlog"
+import type { BacklogState, BacklogTask, BacklogTaskAction, BacklogTaskKind } from "./backlog"
 import type { SessionLastAssistant, SessionStatus } from "./control-client"
 
 // Board-state mapping. The backlog entry's `state:` field is the
@@ -54,6 +54,12 @@ export interface WorkerObservation {
 export interface BoardWorker {
   title: string
   state: BacklogState
+  taskId?: string
+  kind?: BacklogTaskKind
+  blockedBy?: string
+  hold?: string
+  reviewHead?: string
+  actions?: BacklogTaskAction[]
   blockedReason?: BlockedReason
   lastWord?: string
   prUrl?: string
@@ -83,12 +89,23 @@ export function mapBoardState(input: { backlogState: BacklogState; live?: Sessio
   return { state: backlogState }
 }
 
-export function buildBoardWorker(task: BacklogTask, observation?: WorkerObservation): BoardWorker {
+// Dependencies remain unresolved unless the caller explicitly establishes
+// completion. This refines display only; it never dispatches or edits tasks.
+export function buildBoardWorker(task: BacklogTask, observation?: WorkerObservation, dependencyResolved = false): BoardWorker {
   const refined =
     task.sessionId === undefined ? { state: task.state, blockedReason: undefined } : mapBoardState({ backlogState: task.state, live: observation?.status })
+  const terminal = refined.state === "Done" || refined.state === "Failed"
+  const taskBlocked = task.hold !== undefined || task.kind === "captain" || (task.blockedBy !== undefined && !dependencyResolved)
+  const working = refined.state === "Working" && (observation?.status.activity === "running" || observation?.status.activity === "retrying") && task.kind !== "captain" && (task.blockedBy === undefined || dependencyResolved)
   const worker: BoardWorker = {
     title: task.title,
-    state: refined.state,
+    state: !terminal && !working && taskBlocked ? "Blocked" : refined.state,
+    ...(task.id !== undefined ? { taskId: task.id } : {}),
+    ...(task.kind !== undefined ? { kind: task.kind } : {}),
+    ...(task.blockedBy !== undefined ? { blockedBy: task.blockedBy } : {}),
+    ...(task.hold !== undefined ? { hold: task.hold } : {}),
+    ...(task.reviewHead !== undefined ? { reviewHead: task.reviewHead } : {}),
+    ...(task.actions !== undefined ? { actions: task.actions.map(({ label, text }) => ({ label, text })) } : {}),
     ...(refined.blockedReason !== undefined ? { blockedReason: refined.blockedReason } : {}),
     ...(task.prUrl !== undefined ? { prUrl: task.prUrl } : {}),
     ...(task.sessionId !== undefined ? { sessionId: task.sessionId } : {}),

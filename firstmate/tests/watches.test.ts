@@ -54,8 +54,7 @@ type WatchExecStubResult = { stdout: string; exitCode: number | null; timedOut?:
 const noopFetcher: HttpFetcher = async () => ({ status: 200 })
 const noopResolveSupport = async (): Promise<InterruptSupport> => ({ kind: "unsupported", reason: "test" })
 
-// Records the captain-notification POSTs a firing watch makes, always
-// answering 200 (mirrors poller.test.ts's recordingFetcher).
+// Records any unexpected delivery POSTs; watch delivery belongs to the service.
 interface RecordedEmitCall {
   url: string
   init: { method: string; body?: string }
@@ -289,7 +288,7 @@ describe("createWatchRunner tick", () => {
     expect(calls[0].scriptPath).toBe(`${homeRoot}/shared/watches/pr-watch`)
   })
 
-  test("oversized output is tail-kept with a truncation marker for message and card", async () => {
+  test("notes preserve report detail while the card keeps a bounded tail preview", async () => {
     const filesystem = new InMemoryFileSystem()
     seedRegistry(filesystem)
     filesystem.seedExecutableFile(`${projectHome}/watches/nightly`, "#!/bin/sh\n# schedule: * * * * *\n")
@@ -302,9 +301,9 @@ describe("createWatchRunner tick", () => {
     clock.advance(dueAdvanceMs)
     const round = await runner.tick()
 
-    // 2504 chars of output, last 2000 kept, 504 dropped — the tail survives.
-    expect(round.notifications[0].message).toContain("…[truncated 504 chars]")
-    expect(round.notifications[0].message).toContain("tail")
+    expect(round.notifications[0].message).toBe(`FirstMate (${slug}) watch nightly:\n${longOutput}`)
+    expect((await runner.pendingNotifications(slug)).notes[0].notification.message).toBe(round.notifications[0].message)
+    // The 2504-character report retains a compact, 2000-character tail preview.
     const watches = await runner.listWatches(slug)
     expect(watches[0].lastOutput).toBe(`…[truncated 504 chars]\n${"x".repeat(1996)}tail`)
   })
@@ -407,7 +406,7 @@ describe("createWatchRunner setEnabled", () => {
   })
 })
 
-describe("createWatchRunner nextRun and captain notifications", () => {
+describe("createWatchRunner nextRun and queued notifications", () => {
   test("enabled watches carry their next scheduled run; disabled watches carry none", async () => {
     const filesystem = new InMemoryFileSystem()
     seedRegistry(filesystem)
@@ -430,7 +429,7 @@ describe("createWatchRunner nextRun and captain notifications", () => {
     expect(watches[0].nextRun).toBeNull()
   })
 
-  test("a firing watch notifies the captain once with the 500-character output cap", async () => {
+  test("a firing watch queues its output without delivering a captain notification", async () => {
     const filesystem = new InMemoryFileSystem()
     seedRegistry(filesystem)
     filesystem.seedExecutableFile(`${projectHome}/watches/nightly`, "#!/bin/sh\n# schedule: * * * * *\n")
@@ -450,13 +449,8 @@ describe("createWatchRunner nextRun and captain notifications", () => {
     clock.advance(dueAdvanceMs)
     await runner.tick()
 
-    expect(calls).toHaveLength(1)
-    expect(calls[0].url).toBe("http://127.0.0.1:4096/api/notifications/emit")
-    expect(calls[0].init.method).toBe("POST")
-    expect(JSON.parse(calls[0].init.body ?? "")).toEqual({
-      title: "FirstMate — nightly fired",
-      body: "x".repeat(500),
-    })
+    expect(calls).toEqual([])
+    expect((await runner.pendingNotifications(slug)).notes[0].notification.message).toBe(`FirstMate (sunrise) watch nightly:\n${"x".repeat(600)}`)
   })
 
   test("a watch that prints nothing makes no captain-notification call", async () => {

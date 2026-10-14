@@ -34,6 +34,26 @@ function failingExec(error: Error): { exec: ExecRunner; calls: ExecCall[] } {
   return { exec, calls }
 }
 
+describe("createSession", () => {
+  test("passes optional opening prompt, provider/model and variant atomically on create", async () => {
+    const { exec, calls } = fakeExec('{"sessionId":"ses_new"}')
+    expect(await createSession(exec, { directory: "/home/project", title: "FirstMate", prompt: "Captain's opening\nKeep this verbatim.", model: "provider/model", variant: "high" })).toBe("ses_new")
+    expect(calls[0].args).toEqual(["session", "create", "--dir", "/home/project", "--title", "FirstMate", "--prompt", "Captain's opening\nKeep this verbatim.", "--model", "provider/model", "--variant", "high", "--json"])
+  })
+
+  test("does not add unspecified optional flags", async () => {
+    const { exec, calls } = fakeExec('{"sessionID":"ses_new"}')
+    await createSession(exec, { directory: "/home/project", title: "FirstMate" })
+    expect(calls[0].args).toEqual(["session", "create", "--dir", "/home/project", "--title", "FirstMate", "--json"])
+  })
+
+  test("refuses malformed and error-envelope create responses", async () => {
+    for (const output of ["not JSON", "{}", '{"status":"error","sessionId":"ses_not_created"}']) {
+      await expect(createSession(fakeExec(output).exec, { directory: "/home/project", title: "FirstMate" })).rejects.toThrow()
+    }
+  })
+})
+
 describe("sessionStatus", () => {
   test("runs openchamber session status scoped to the directory and parses the activity type", async () => {
     const { exec, calls } = fakeExec('{"type":"running"}')
@@ -82,6 +102,19 @@ describe("sessionStatus", () => {
       activity: "unknown",
       outcome: null,
     })
+  })
+
+  test("does not let a fallback idle field override an unrecognized authoritative status", async () => {
+    for (const sessionStatusValue of [{ type: "future-activity" }, {}, null]) {
+      const { exec } = fakeExec(JSON.stringify({ sessionStatus: sessionStatusValue, activity: "idle" }))
+      expect((await sessionStatus(exec, { sessionId: "s", directory: "/d" })).activity).toBe("unknown")
+    }
+  })
+
+  test("refuses status error envelopes and mismatched session identities", async () => {
+    for (const output of ['{"status":"error","sessionStatus":{"type":"idle"}}', '{"sessionId":"other","type":"idle"}']) {
+      await expect(sessionStatus(fakeExec(output).exec, { sessionId: "s", directory: "/d" })).rejects.toThrow()
+    }
   })
 
   test("fails when the output is not JSON and translates a missing CLI into MissingCliError", async () => {
@@ -151,6 +184,30 @@ describe("sessionSend", () => {
 })
 
 describe("sessionList", () => {
+  test("exposes archive and directory evidence and supports including archived sessions", async () => {
+    const { exec, calls } = fakeExec(JSON.stringify({ sessions: [
+      { id: "ses_archived", directory: "/home/project", time: { archived: 42 }, sessionStatus: { type: "idle" } },
+      { id: "ses_active", archivedAt: null, sessionStatus: { type: "idle" } },
+    ] }))
+    expect(await sessionList(exec, { directory: "/home/project", all: true })).toEqual([
+      { sessionId: "ses_archived", directory: "/home/project", archived: true, status: { activity: "idle", outcome: null } },
+      { sessionId: "ses_active", archived: false, status: { activity: "idle", outcome: null } },
+    ])
+    expect(calls[0].args).toEqual(["session", "list", "--dir", "/home/project", "--with-status", "--all", "--json"])
+  })
+
+  test("refuses valid JSON without a list or with an error envelope", async () => {
+    for (const output of ['{}', '{"status":"error","sessions":[]}', 'null']) {
+      await expect(sessionList(fakeExec(output).exec, { directory: "/home/project" })).rejects.toThrow()
+    }
+  })
+
+  test("refuses malformed ownership or archive evidence rather than silently discarding it", async () => {
+    for (const entry of [{ id: "s", directory: 42 }, { id: "s", directory: "" }, { id: "s", archived: "false" }, { id: "s", time: "unknown" }]) {
+      await expect(sessionList(fakeExec(JSON.stringify([entry])).exec, { directory: "/d" })).rejects.toThrow()
+    }
+  })
+
   test("runs openchamber session list directory-scoped with status and returns the sessions", async () => {
     const { exec, calls } = fakeExec(
       JSON.stringify({ sessions: [{ sessionID: "ses_a", type: "running" }, { sessionID: "ses_b", type: "idle", outcome: "completed" }] }),

@@ -1,6 +1,7 @@
 import { connectHost } from "@openchamber/sdk"
 import { applyHostReady, mountBadge, type Tone } from "@openchamber/sdk/ui"
 import { parseBoardWorkers, parseSupervision, type BoardCard, type BoardColumn, type SupervisionHealth } from "./board"
+import { moveColumn, parseColumnOrder } from "./column-order"
 import { parseShipping, shippingBadgeLabel, type LandingRow, type ShippingInfo } from "./shipping"
 import { parseSuggestions, type SuggestionRow } from "./suggestions"
 import { initialPanelState, reducePanelState, type Board, type PanelEvent, type PanelState, type RegistrationInfo } from "./state"
@@ -9,23 +10,59 @@ import { formatLastRun, formatSchedule, nextRunLabel, nextRunTitle, parseWatches
 const host = connectHost()
 
 const boardFetchDebounceMs = 1_000
-const boardRefreshIntervalMs = 30_000
+const defaultBoardRefreshIntervalMs = 30_000
+let boardRefreshIntervalMs = defaultBoardRefreshIntervalMs
 
 let state: PanelState = initialPanelState()
 let currentDirectory: string | null = null
+let launchDirectory: string | null = null
 let hasReceivedReady = false
 let activeRegistration: RegistrationInfo | null = null
 let unsubscribeSessions: (() => void) | null = null
-let sessionsAttachInFlight = false
+let sessionsAttachInFlight: RegistrationInfo | null = null
 let boardRefreshTimer: number | null = null
 let boardFetchTimer: number | null = null
 let refreshLabelTimer: number | null = null
 let manualRefreshInFlight = false
 let lastRefreshedAt: number | null = null
 let refreshFailed = false
+let contextGeneration = 0
+let currentSessionId: string | null = null
+
+interface ProjectSettings {
+  coordinatorModel: string
+  coordinatorVariant: string
+  workerModel: string
+  workerVariant: string
+  refreshSeconds: number
+}
+type SettingsDraft = Omit<ProjectSettings, "refreshSeconds"> & { refreshSeconds: string; dirty: boolean; pending: boolean; feedback?: string }
+type UpgradeName = "charter" | "pr-watch"
+type Upgrade = { name: UpgradeName; edited: boolean; outdated: boolean }
+type UpgradeComparison = { pending: boolean; contents?: string; feedback?: string }
+type WatchNotes = { notes: Array<{ id: string; createdAt: string; notification: { message: string; watchName?: string } }>; pendingCount: number; dropped: number }
+type MessageDraft = { text: string; pending: boolean; feedback?: string }
+
+const optionalCapabilities = new Set<string>()
+const optionalErrors = new Map<string, string>()
+const optionalRequests = new Map<string, number>()
+let settingsRevision = 0
+let settingsDraft: SettingsDraft | undefined
+let upgrades: Upgrade[] | undefined
+let watchNotes: WatchNotes | undefined
+const upgradeComparisons = new Map<UpgradeName, UpgradeComparison>()
+const messageDrafts = new Map<string, MessageDraft>()
+const endConfirmations = new Set<string>()
+const expandedDetails = new Set<string>()
+let lifecycleConfirmation: "release" | "restart" | null = null
+let lifecyclePending = false
+let lifecycleFeedback: string | undefined
+let adoptSessionId = ""
 
 host.onReady((ctx) => {
   applyHostReady(ctx, document.documentElement)
+  // Older host mocks omit session; omission must not erase a later session push.
+  if (ctx.session !== undefined) setSessionContext(ctx.session?.id ?? null)
   // The host replays ready with an unchanged directory (iframe loads,
   // payload changes): the theme above reapplies every time, but the flow
   // only starts on the first ready — even a null-directory one, which a
@@ -42,9 +79,21 @@ host.onDirectory((directory) => {
   resetTo(directory)
 })
 
+if (typeof host.onSession === "function") {
+  host.onSession((session) => setSessionContext(session?.id ?? null))
+}
+
+function setSessionContext(sessionId: string | null): void {
+  if (sessionId === currentSessionId) return
+  currentSessionId = sessionId
+  render(state)
+}
+
 function resetTo(directory: string | null): void {
+  contextGeneration += 1
   stopBoardFlow()
   currentDirectory = directory
+  launchDirectory = directory
   state = initialPanelState()
   dispatch({ type: "directory-context", directory })
   if (directory !== null) {
@@ -53,11 +102,12 @@ function resetTo(directory: string | null): void {
 }
 
 async function lookup(directory: string): Promise<void> {
+  const generation = contextGeneration
   try {
     const result = await host.serviceRequest({ method: "GET", path: "/lookup", query: { directory } })
     // The captain may have switched projects while the lookup was in flight;
     // a stale answer must not start a board flow for the wrong directory.
-    if (currentDirectory !== directory) return
+    if (currentDirectory !== directory || contextGeneration !== generation) return
     if (result.status !== 200) {
       dispatch({ type: "lookup-failed", message: `Looking up the first mate failed (status ${result.status}).` })
       return
@@ -72,12 +122,13 @@ async function lookup(directory: string): Promise<void> {
     dispatch({ type: "lookup-succeeded", registration: body.registration ?? null })
     if (state.kind === "registered") startBoardFlow(state.registration)
   } catch {
-    if (currentDirectory !== directory) return
+    if (currentDirectory !== directory || contextGeneration !== generation) return
     dispatch({ type: "lookup-failed", message: "Looking up the first mate failed: the service is unreachable." })
   }
 }
 
 async function launch(projectDirectory: string): Promise<void> {
+  const generation = contextGeneration
   dispatch({ type: "launch-started" })
   try {
     const result = await host.serviceRequest({
@@ -85,7 +136,7 @@ async function launch(projectDirectory: string): Promise<void> {
       path: "/launch",
       body: JSON.stringify({ projectDirectory }),
     })
-    if (currentDirectory !== projectDirectory) return
+    if (launchDirectory !== projectDirectory || contextGeneration !== generation) return
     let body: { error?: string; code?: string } = {}
     try {
       body = JSON.parse(result.body) as { error?: string; code?: string }
@@ -103,7 +154,7 @@ async function launch(projectDirectory: string): Promise<void> {
     dispatch({ type: "launch-succeeded", registration: JSON.parse(result.body) as RegistrationInfo })
     if (state.kind === "registered") startBoardFlow(state.registration)
   } catch {
-    if (currentDirectory !== projectDirectory) return
+    if (launchDirectory !== projectDirectory || contextGeneration !== generation) return
     dispatch({ type: "launch-failed", cliMissing: false, message: "Launching the first mate failed." })
   }
 }
@@ -122,20 +173,36 @@ function startBoardFlow(registration: RegistrationInfo): void {
   activeRegistration = registration
   void runFullRefresh(true)
   void ensureSessionsSubscription(registration)
+  scheduleBoardRefresh(registration)
+  // Keeps the header's relative freshness label current between ticks.
+  refreshLabelTimer = window.setInterval(updateRefreshControl, defaultBoardRefreshIntervalMs)
+}
+
+function scheduleBoardRefresh(registration: RegistrationInfo): void {
+  if (boardRefreshTimer !== null) window.clearInterval(boardRefreshTimer)
   boardRefreshTimer = window.setInterval(() => {
-    runFullRefresh(false)
-    // While the live subscription is unattached (transient host failures),
-    // every refresh tick is also a re-attach attempt.
+    if (activeRegistration !== registration) return
+    void runFullRefresh(false)
     void ensureSessionsSubscription(registration)
   }, boardRefreshIntervalMs)
-  // Keeps the header's relative freshness label current between ticks.
-  refreshLabelTimer = window.setInterval(updateRefreshControl, boardRefreshIntervalMs)
+}
+
+function applySettings(settings: ProjectSettings, registration: RegistrationInfo): void {
+  if (settingsDraft === undefined || !settingsDraft.dirty) {
+    settingsDraft = { ...settings, refreshSeconds: String(settings.refreshSeconds), dirty: false, pending: false }
+  }
+  const interval = settings.refreshSeconds * 1_000
+  if (boardRefreshIntervalMs !== interval) {
+    boardRefreshIntervalMs = interval
+    scheduleBoardRefresh(registration)
+  }
 }
 
 function stopBoardFlow(): void {
   activeRegistration = null
   unsubscribeSessions?.()
   unsubscribeSessions = null
+  sessionsAttachInFlight = null
   if (boardRefreshTimer !== null) window.clearInterval(boardRefreshTimer)
   boardRefreshTimer = null
   if (boardFetchTimer !== null) window.clearTimeout(boardFetchTimer)
@@ -145,6 +212,22 @@ function stopBoardFlow(): void {
   manualRefreshInFlight = false
   lastRefreshedAt = null
   refreshFailed = false
+  boardRefreshIntervalMs = defaultBoardRefreshIntervalMs
+  optionalCapabilities.clear()
+  optionalErrors.clear()
+  optionalRequests.clear()
+  settingsRevision = 0
+  settingsDraft = undefined
+  upgrades = undefined
+  watchNotes = undefined
+  upgradeComparisons.clear()
+  messageDrafts.clear()
+  endConfirmations.clear()
+  expandedDetails.clear()
+  lifecycleConfirmation = null
+  lifecyclePending = false
+  lifecycleFeedback = undefined
+  adoptSessionId = ""
   // A directory change (or re-registration) closes any open watch editor or
   // creation form; its drafts belonged to the previous project. Run-now
   // in-flight markers and per-watch feedback belong to it too.
@@ -159,8 +242,8 @@ function stopBoardFlow(): void {
 // directory that is not an OpenChamber project has no session activity to
 // mirror and stays a quiet no-op.
 async function ensureSessionsSubscription(registration: RegistrationInfo): Promise<void> {
-  if (unsubscribeSessions !== null || sessionsAttachInFlight || activeRegistration !== registration) return
-  sessionsAttachInFlight = true
+  if (unsubscribeSessions !== null || sessionsAttachInFlight === registration || activeRegistration !== registration) return
+  sessionsAttachInFlight = registration
   try {
     const projects = await host.listProjects()
     if (activeRegistration !== registration) return
@@ -172,6 +255,7 @@ async function ensureSessionsSubscription(registration: RegistrationInfo): Promi
       projects.projects.find((candidate) => candidate.directory === registration.projectDirectory)
     if (project === undefined) return
     const unsubscribe = await host.onSessions(project.id, (snapshot) => {
+      if (activeRegistration !== registration) return
       if (snapshot.state !== "ready") return
       const coordinator = snapshot.sessions.find((session) => session.id === registration.coordinatorSessionId)
       dispatch({ type: "sessions-changed", coordinatorTitle: coordinator?.title })
@@ -186,7 +270,7 @@ async function ensureSessionsSubscription(registration: RegistrationInfo): Promi
   } catch {
     // Retried on the next refresh tick while unattached.
   } finally {
-    sessionsAttachInFlight = false
+    if (sessionsAttachInFlight === registration) sessionsAttachInFlight = null
   }
 }
 
@@ -209,6 +293,9 @@ function scheduleBoardFetch(): void {
 async function runFullRefresh(markRefreshed: boolean): Promise<void> {
   const registration = activeRegistration
   if (registration === null) return
+  // Version-skewed services may omit all three extras. They never decide the
+  // core board's freshness or keep a manual refresh waiting for an extension.
+  void fetchExtensions(registration)
   const outcomes = await Promise.all([fetchBoard(), fetchWatches(), fetchShipping(), fetchSuggestions()])
   // The captain may have switched projects while the cycle ran; a
   // superseded cycle's completion must not mark the new flow's age or
@@ -412,6 +499,350 @@ async function fetchSuggestions(): Promise<boolean> {
   }
 }
 
+function record(value: unknown): Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) throw new Error("The service sent a malformed answer.")
+  return value as Record<string, unknown>
+}
+
+function parseSettings(value: unknown): ProjectSettings {
+  const settings = record(value)
+  for (const name of ["coordinatorModel", "coordinatorVariant", "workerModel", "workerVariant"]) {
+    if (typeof settings[name] !== "string") throw new Error("The service sent malformed settings.")
+  }
+  if (!Number.isInteger(settings.refreshSeconds) || Number(settings.refreshSeconds) < 5 || Number(settings.refreshSeconds) > 3600) {
+    throw new Error("Refresh seconds must be an integer from 5 to 3600.")
+  }
+  return settings as unknown as ProjectSettings
+}
+
+// Capability detection is per registration. An unknown endpoint is quiet;
+// once it answers, later failures are visible beside its last good data.
+async function readOptional(path: string, label: string, registration: RegistrationInfo, apply: (body: Record<string, unknown>) => void): Promise<void> {
+  const requestId = (optionalRequests.get(path) ?? 0) + 1
+  optionalRequests.set(path, requestId)
+  const isCurrent = () => activeRegistration === registration && optionalRequests.get(path) === requestId
+  try {
+    const result = await host.serviceRequest({ method: "GET", path, query: { slug: registration.slug } })
+    if (!isCurrent()) return
+    if (result.status !== 200) {
+      if (!optionalCapabilities.has(path)) return
+      throw new Error(`status ${result.status}`)
+    }
+    optionalCapabilities.add(path)
+    apply(record(JSON.parse(result.body)))
+    optionalErrors.delete(path)
+  } catch (error) {
+    if (!isCurrent() || !optionalCapabilities.has(path)) return
+    optionalErrors.set(path, `Reading the ${label} failed: ${error instanceof Error ? error.message : "the service is unreachable."}`)
+  }
+  if (isCurrent()) render(state)
+}
+
+async function fetchExtensions(registration: RegistrationInfo): Promise<void> {
+  const revision = settingsRevision
+  await Promise.all([
+    readOptional("/settings", "settings", registration, (body) => {
+      if (settingsRevision === revision) applySettings(parseSettings(body.settings), registration)
+    }),
+    readOptional("/upgrades", "upgrades", registration, (body) => {
+      if (!Array.isArray(body.upgrades)) throw new Error("The service sent malformed upgrades.")
+      upgrades = body.upgrades.map((value) => {
+        const upgrade = record(value)
+        if ((upgrade.name !== "charter" && upgrade.name !== "pr-watch") || typeof upgrade.edited !== "boolean" || typeof upgrade.outdated !== "boolean") {
+          throw new Error("The service sent malformed upgrades.")
+        }
+        return { name: upgrade.name, edited: upgrade.edited, outdated: upgrade.outdated }
+      })
+    }),
+    readOptional("/watchnotes", "watch notes", registration, (body) => {
+      if (!Array.isArray(body.notes) || !Number.isInteger(body.pendingCount) || Number(body.pendingCount) < 0 || !Number.isInteger(body.dropped) || Number(body.dropped) < 0) {
+        throw new Error("The service sent malformed watch notes.")
+      }
+      const notes = body.notes.slice(-50).map((value) => {
+        const note = record(value)
+        const notification = record(note.notification)
+        if (typeof note.id !== "string" || typeof note.createdAt !== "string" || typeof notification.message !== "string" || (notification.watchName !== undefined && typeof notification.watchName !== "string")) {
+          throw new Error("The service sent malformed watch notes.")
+        }
+        return { id: note.id, createdAt: note.createdAt, notification: { message: notification.message, ...(typeof notification.watchName === "string" ? { watchName: notification.watchName } : {}) } }
+      })
+      watchNotes = { notes, pendingCount: Number(body.pendingCount), dropped: Number(body.dropped) }
+    }),
+  ])
+}
+
+async function post(path: string, body: Record<string, unknown>): Promise<Record<string, unknown>> {
+  const result = await host.serviceRequest({ method: "POST", path, body: JSON.stringify(body) })
+  let answer: Record<string, unknown> = {}
+  try { answer = record(JSON.parse(result.body)) } catch { /* Empty successes need no answer. */ }
+  if (result.status !== 200) throw new Error(typeof answer.error === "string" ? answer.error : `The action failed (status ${result.status}).`)
+  return answer
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : "The service is unreachable."
+}
+
+function button(label: string, action: () => void, disabled = false): HTMLButtonElement {
+  const element = document.createElement("button")
+  element.className = "fm-button"
+  element.textContent = label
+  element.disabled = disabled
+  element.addEventListener("click", () => { if (!element.disabled) action() })
+  return element
+}
+
+function labeledInput(label: string, value: string, change: (value: string) => void, disabled = false): HTMLElement {
+  const field = document.createElement("label")
+  field.className = "fm-field"
+  const input = document.createElement("input")
+  input.type = "text"
+  input.value = value
+  input.disabled = disabled
+  input.setAttribute("aria-label", label)
+  input.addEventListener("input", () => change(input.value))
+  field.append(document.createTextNode(label), input)
+  return field
+}
+
+function expandableText(id: string, label: string, contents: string, className: string): HTMLDetailsElement {
+  const registration = activeRegistration
+  const details = document.createElement("details")
+  details.className = className
+  details.open = expandedDetails.has(id)
+  details.addEventListener("toggle", () => {
+    if (activeRegistration !== registration) return
+    if (details.open) expandedDetails.add(id)
+    else expandedDetails.delete(id)
+  })
+  const summary = document.createElement("summary")
+  summary.textContent = label
+  const body = document.createElement("pre")
+  body.className = "fm-expanded-text"
+  body.textContent = contents
+  details.append(summary, body)
+  return details
+}
+
+function settingsSection(): HTMLElement {
+  const section = document.createElement("section")
+  section.append(collapsibleHeading("settings", "Settings"))
+  if (collapsedSections.has("settings")) return section
+  const error = optionalErrors.get("/settings")
+  if (error !== undefined) section.append(warningCallout(error))
+  const draft = settingsDraft
+  if (draft !== undefined) {
+    section.append(mutedNote("Use full provider/model IDs (for example openai/gpt-example). Blank models use OpenChamber defaults; blank variants apply no override. Model and variant changes apply to new sessions. Refresh defaults to 30 seconds."))
+    const fields = [
+      ["Coordinator model", "coordinatorModel"], ["Coordinator variant", "coordinatorVariant"],
+      ["Worker model", "workerModel"], ["Worker variant", "workerVariant"], ["Refresh seconds", "refreshSeconds"],
+    ] as const
+    const form = document.createElement("div")
+    form.className = "fm-watch-editor"
+    for (const [label, name] of fields) {
+      form.append(labeledInput(label, draft[name], (value) => { draft[name] = value; draft.dirty = true }, draft.pending))
+    }
+    form.append(button("Save settings", () => { void saveSettings(draft) }, draft.pending))
+    if (draft.feedback !== undefined) form.append(mutedNote(draft.feedback))
+    section.append(form)
+  } else {
+    section.append(mutedNote("Project settings are unavailable until the service supports them. The board refreshes every 30 seconds by default."))
+  }
+  section.append(labeledInput("Session to adopt", adoptSessionId, (value) => { adoptSessionId = value }, lifecyclePending))
+  section.append(mutedNote("Adopt an existing session in this project's FirstMate home. The server verifies its placement and idle state; unrelated chats are never adopted automatically."))
+  section.append(button("Adopt session", () => { void coordinatorAction("adopt", adoptSessionId.trim()) }, lifecyclePending))
+  return section
+}
+
+async function saveSettings(draft: SettingsDraft): Promise<void> {
+  const registration = activeRegistration
+  if (registration === null || draft.pending || settingsDraft !== draft) return
+  const refreshSeconds = Number(draft.refreshSeconds)
+  if (draft.refreshSeconds.trim() === "" || !Number.isInteger(refreshSeconds) || refreshSeconds < 5 || refreshSeconds > 3600) {
+    draft.feedback = "Refresh seconds must be an integer from 5 to 3600."
+    render(state)
+    return
+  }
+  const settings = {
+    coordinatorModel: draft.coordinatorModel.trim(), coordinatorVariant: draft.coordinatorVariant.trim(),
+    workerModel: draft.workerModel.trim(), workerVariant: draft.workerVariant.trim(), refreshSeconds,
+  }
+  draft.pending = true
+  draft.dirty = true
+  draft.feedback = undefined
+  settingsRevision += 1
+  render(state)
+  try {
+    const answer = await post("/settings", { slug: registration.slug, settings })
+    if (activeRegistration !== registration || settingsDraft !== draft) return
+    const saved = parseSettings(answer.settings)
+    draft.dirty = false
+    applySettings(saved, registration)
+    settingsDraft!.feedback = "Settings saved."
+    optionalCapabilities.add("/settings")
+    optionalErrors.delete("/settings")
+  } catch (error) {
+    if (activeRegistration !== registration || settingsDraft !== draft) return
+    draft.feedback = errorMessage(error)
+  } finally {
+    if (activeRegistration === registration) {
+      settingsRevision += 1
+      draft.pending = false
+      render(state)
+    }
+  }
+}
+
+function lifecycleControls(): HTMLElement {
+  const controls = document.createElement("div")
+  controls.className = "fm-actions"
+  for (const action of ["restart", "release"] as const) {
+    const label = action === "restart" ? "Restart in fresh session" : "Release first mate"
+    const confirmedLabel = action === "restart" ? "Confirm restart in fresh session" : "Confirm release"
+    controls.append(button(lifecycleConfirmation === action ? confirmedLabel : label, () => {
+      if (lifecyclePending) return
+      if (lifecycleConfirmation !== action) { lifecycleConfirmation = action; render(state); return }
+      void coordinatorAction(action)
+    }, lifecyclePending))
+  }
+  if (lifecycleConfirmation !== null) {
+    controls.append(button("Cancel", () => { lifecycleConfirmation = null; render(state) }, lifecyclePending))
+    controls.append(mutedNote(lifecycleConfirmation === "restart"
+      ? "Restart creates a fresh session: the old chat is preserved; backlog and workers continue. Context reset and same-thread restart are unavailable."
+      : "Release removes the registration only: the session and worktree are preserved."))
+  }
+  if (lifecycleFeedback !== undefined) controls.append(warningCallout(lifecycleFeedback))
+  return controls
+}
+
+async function coordinatorAction(action: "release" | "restart" | "adopt", sessionId?: string): Promise<void> {
+  const registration = activeRegistration
+  if (registration === null || lifecyclePending) return
+  if (action === "adopt" && !sessionId) {
+    lifecycleFeedback = "Enter the session ID to adopt."
+    render(state)
+    return
+  }
+  lifecyclePending = true
+  lifecycleFeedback = undefined
+  render(state)
+  try {
+    const answer = await post(`/coordinator/${action}`, { slug: registration.slug, ...(sessionId === undefined ? {} : { sessionId }) })
+    if (activeRegistration !== registration) return
+    if (action === "release") {
+      resetTo(currentDirectory)
+      // A captain may release from the preserved home chat. A later launch
+      // still targets the project, never turns the home into a new project.
+      launchDirectory = registration.projectDirectory
+      return
+    }
+    if (answer.registration === undefined) {
+      resetTo(currentDirectory)
+      return
+    }
+    const replacement = record(answer.registration)
+    for (const field of ["slug", "projectDirectory", "homeDirectory", "coordinatorSessionId", "createdAt"]) {
+      if (typeof replacement[field] !== "string") throw new Error("The service sent a malformed registration.")
+    }
+    contextGeneration += 1
+    stopBoardFlow()
+    state = initialPanelState()
+    dispatch({ type: "lookup-succeeded", registration: replacement as unknown as RegistrationInfo })
+    if (state.kind === "registered") startBoardFlow(state.registration)
+  } catch (error) {
+    if (activeRegistration !== registration) return
+    lifecycleFeedback = errorMessage(error)
+  } finally {
+    if (activeRegistration === registration) {
+      lifecyclePending = false
+      lifecycleConfirmation = null
+      render(state)
+    }
+  }
+}
+
+function upgradesSection(): HTMLElement | null {
+  const error = optionalErrors.get("/upgrades")
+  if (upgrades === undefined && error === undefined) return null
+  const section = document.createElement("section")
+  section.append(collapsibleHeading("upgrades", "Home upgrades"))
+  if (collapsedSections.has("upgrades")) return section
+  section.append(mutedNote("Compare upstream changes with personal words. Acknowledge marks the comparison reviewed; it does not overwrite your files."))
+  if (error !== undefined) section.append(warningCallout(error))
+  for (const upgrade of upgrades ?? []) {
+    const row = document.createElement("article")
+    row.className = "fm-card"
+    row.append(text(`${upgrade.name} — ${upgrade.edited ? "personally edited" : "unedited"}; ${upgrade.outdated ? "upstream update available" : "up to date"}`))
+    const comparison = upgradeComparisons.get(upgrade.name)
+    row.append(button(`Compare ${upgrade.name}`, () => { void upgradeAction(upgrade.name, "compare") }, comparison?.pending === true))
+    if (comparison?.contents !== undefined) {
+      const contents = document.createElement("pre")
+      contents.className = "fm-upgrade-comparison"
+      contents.textContent = comparison.contents
+      row.append(contents)
+      row.append(button(`Acknowledge ${upgrade.name}`, () => { void upgradeAction(upgrade.name, "ack") }, comparison.pending))
+    }
+    if (comparison?.feedback !== undefined) row.append(mutedNote(comparison.feedback))
+    section.append(row)
+  }
+  return section
+}
+
+async function upgradeAction(name: UpgradeName, action: "compare" | "ack"): Promise<void> {
+  const registration = activeRegistration
+  if (registration === null || upgradeComparisons.get(name)?.pending) return
+  const comparison = upgradeComparisons.get(name) ?? { pending: false }
+  comparison.pending = true
+  comparison.feedback = undefined
+  upgradeComparisons.set(name, comparison)
+  render(state)
+  try {
+    if (action === "compare") {
+      const result = await host.serviceRequest({ method: "GET", path: "/upgrades/compare", query: { slug: registration.slug, name } })
+      if (activeRegistration !== registration) return
+      if (result.status !== 200) throw new Error(`Comparison failed (status ${result.status}).`)
+      const answer = record(JSON.parse(result.body))
+      if (typeof answer.contents !== "string") throw new Error("The service sent a malformed comparison.")
+      comparison.contents = answer.contents
+    } else {
+      await post("/upgrades/ack", { slug: registration.slug, name })
+      if (activeRegistration !== registration) return
+      comparison.feedback = "Acknowledged; personal words are unchanged."
+      void fetchExtensions(registration)
+    }
+  } catch (error) {
+    if (activeRegistration !== registration) return
+    comparison.feedback = errorMessage(error)
+  } finally {
+    if (activeRegistration === registration) { comparison.pending = false; render(state) }
+  }
+}
+
+function watchNotesHistory(): HTMLElement | null {
+  const error = optionalErrors.get("/watchnotes")
+  if (watchNotes === undefined && error === undefined) return null
+  const history = document.createElement("div")
+  if (error !== undefined) history.append(warningCallout(error))
+  if (watchNotes === undefined) return history
+  history.append(mutedNote(`Pending delivery: ${watchNotes.pendingCount}. Dropped: ${watchNotes.dropped}. Retained history is separate from pending delivery.`))
+  const details = document.createElement("details")
+  const registration = activeRegistration
+  details.open = expandedDetails.has("watchnotes")
+  details.addEventListener("toggle", () => {
+    if (activeRegistration !== registration) return
+    if (details.open) expandedDetails.add("watchnotes")
+    else expandedDetails.delete("watchnotes")
+  })
+  const summary = document.createElement("summary")
+  summary.textContent = `Retained watch notes (${watchNotes.notes.length}; latest 50 maximum)`
+  details.append(summary)
+  for (const note of watchNotes.notes) {
+    details.append(expandableText(`watchnote:${note.id}`, `${note.createdAt}${note.notification.watchName === undefined ? "" : ` — ${note.notification.watchName}`}`, note.notification.message, "fm-watch-note"))
+  }
+  history.append(details)
+  return history
+}
+
 function dispatch(event: PanelEvent): void {
   state = reducePanelState(state, event)
   render(state)
@@ -437,11 +868,22 @@ function render(state: PanelState): void {
       root.append(text("Launching the first mate…"))
       break
     case "registered":
+      if (state.board.kind === "ready") {
+        const worker = state.board.columns.flatMap((column) => column.cards).find((card) => card.sessionId !== undefined && card.sessionId === currentSessionId)
+        if (worker !== undefined) {
+          root.append(button("Open first mate", () => { void host.openSession(state.registration.coordinatorSessionId).catch(() => {}) }))
+          root.append(workerPanel(worker, state.registration))
+          break
+        }
+      }
       root.append(coordinatorRow(state.registration, state.coordinatorTitle, state.shipping))
       if (state.shipping !== undefined) root.append(landingsSection(state.shipping, state.board))
       root.append(suggestionsSection(state))
       root.append(boardView(state.board))
       root.append(watchesCard(state))
+      root.append(settingsSection())
+      const homeUpgrades = upgradesSection()
+      if (homeUpgrades !== null) root.append(homeUpgrades)
       break
     case "cli-missing":
       root.append(text("The openchamber CLI is required. Install it with: npm i -g @openchamber/web"))
@@ -476,8 +918,8 @@ function launchButton(): HTMLElement {
   button.className = "fm-button fm-button-primary"
   button.textContent = "Launch first mate"
   button.addEventListener("click", () => {
-    if (currentDirectory !== null) {
-      void launch(currentDirectory)
+    if (launchDirectory !== null) {
+      void launch(launchDirectory)
     }
   })
   return button
@@ -555,7 +997,7 @@ function coordinatorRow(
     ahoyButton(registration),
     saveToFile.element,
   )
-  header.append(name, project, actions)
+  header.append(name, project, actions, lifecycleControls())
   return header
 }
 
@@ -670,6 +1112,32 @@ function openChatButton(sessionId: string): HTMLElement {
 const collapsedSectionsStorageKey = "firstmate-collapsed-sections"
 
 const collapsedSections = loadCollapsedSections()
+const columnOrderStorageKey = "firstmate-column-order"
+let columnOrder = loadColumnOrder()
+
+function loadColumnOrder(): ReturnType<typeof parseColumnOrder> {
+  try {
+    return parseColumnOrder(JSON.parse(window.localStorage.getItem(columnOrderStorageKey) ?? "null"))
+  } catch {
+    return parseColumnOrder(null)
+  }
+}
+
+function orderedColumns(columns: BoardColumn[]): BoardColumn[] {
+  return [...columns].sort((left, right) => columnOrder.indexOf(left.id) - columnOrder.indexOf(right.id))
+}
+
+function reorderColumn(id: BoardColumn["id"], direction: "up" | "down"): void {
+  if (state.kind !== "registered" || state.board.kind !== "ready") return
+  const visible = orderedColumns(state.board.columns)
+  const index = visible.findIndex((column) => column.id === id)
+  const neighbor = visible[index + (direction === "up" ? -1 : 1)]
+  if (index < 0 || neighbor === undefined) return
+  const target = columnOrder.indexOf(neighbor.id)
+  while (columnOrder.indexOf(id) !== target) columnOrder = moveColumn(columnOrder, id, direction)
+  try { window.localStorage.setItem(columnOrderStorageKey, JSON.stringify(columnOrder)) } catch { /* Session-only order when storage is denied. */ }
+  render(state)
+}
 
 function loadCollapsedSections(): Set<string> {
   try {
@@ -964,16 +1432,30 @@ function boardView(board: Board): HTMLElement {
       if (board.columns.length === 0) {
         container.append(text("The board is empty."))
       } else {
-        for (const column of board.columns) container.append(boardColumn(column))
+        const columns = orderedColumns(board.columns)
+        for (const [index, column] of columns.entries()) container.append(boardColumn(column, index, columns.length))
       }
       break
   }
   return container
 }
 
-function boardColumn(column: BoardColumn): HTMLElement {
+function boardColumn(column: BoardColumn, index: number, count: number): HTMLElement {
   const section = document.createElement("section")
-  section.append(collapsibleHeading(`column:${column.id}`, column.id))
+  section.setAttribute("data-column", column.id)
+  const header = document.createElement("div")
+  header.className = "fm-watch-header"
+  header.append(collapsibleHeading(`column:${column.id}`, column.id))
+  const controls = document.createElement("div")
+  controls.className = "fm-actions"
+  for (const direction of ["up", "down"] as const) {
+    const move = button(direction === "up" ? "↑" : "↓", () => reorderColumn(column.id, direction), direction === "up" ? index === 0 : index === count - 1)
+    move.setAttribute("aria-label", `Move ${column.id} ${direction}`)
+    move.title = `Move ${column.id} ${direction}`
+    controls.append(move)
+  }
+  header.append(controls)
+  section.append(header)
   if (collapsedSections.has(`column:${column.id}`)) return section
   if (column.id === "Done") {
     // Done cards confuse the eye: they look finished but keep live actions.
@@ -997,27 +1479,120 @@ const badgeTones: Record<BoardCard["state"], Tone> = {
   Idle: "neutral",
 }
 
-function boardCard(card: BoardCard): HTMLElement {
+function boardCard(card: BoardCard, workerContext = false): HTMLElement {
   const article = document.createElement("article")
   article.className = "fm-card"
   const title = document.createElement("strong")
   title.textContent = card.title
   article.append(title, stateBadge(card))
+  if (card.taskId !== undefined) article.append(metaPiece("task", metaValue(card.taskId)))
+  if (card.kind !== undefined) article.append(metaPiece("kind", metaValue(card.kind)))
+  if (card.blockedBy !== undefined) article.append(mutedNote(`Blocked by: ${card.blockedBy}`))
+  if (card.hold !== undefined) article.append(warningCallout(`Hold: ${card.hold}`))
+  if (card.reviewHead !== undefined) article.append(metaPiece("review head", commitChip(card.reviewHead)))
   if (card.blockedReason !== undefined) article.append(blockedNote(card.blockedReason))
   if (card.warning !== undefined) article.append(warningBadge(card.warning))
   if (isUnfinished(card.state) && card.possiblyStalledSince !== undefined) article.append(stallNote())
   if (card.branch !== undefined) article.append(branchMeta(card.branch, card.worktree))
   if (card.lastWord !== undefined) article.append(lastWordLine(card.lastWord))
   if (card.prUrl !== undefined) article.append(prLink(card))
+  if (workerContext) return article
+  if (card.taskId !== undefined) article.append(decisionControls(card))
   if (card.sessionId === undefined) {
-    // A card with no session (e.g. a task landed by direct PR merge) has
-    // nothing for the action row to act on; a muted note says why instead of
-    // a row of buttons disabled with no explanation.
-    article.append(mutedNote("Merged directly — no worker session to act on."))
+    article.append(mutedNote(card.kind === "captain" ? "Captain task — no worker session required." : "No worker session to act on."))
   } else {
     article.append(cardActions(card))
   }
   return article
+}
+
+function messageDraft(key: string): MessageDraft {
+  let draft = messageDrafts.get(key)
+  if (draft === undefined) { draft = { text: "", pending: false }; messageDrafts.set(key, draft) }
+  return draft
+}
+
+function messageControl(draft: MessageDraft, label: string, sendLabel: string, send: (text: string) => void): HTMLElement {
+  const row = document.createElement("div")
+  row.className = "fm-steer"
+  const input = document.createElement("input")
+  input.type = "text"
+  input.placeholder = label
+  input.setAttribute("aria-label", label)
+  input.value = draft.text
+  input.disabled = draft.pending
+  const submit = button(sendLabel, () => {
+    if (draft.pending || draft.text.trim() === "") return
+    send(draft.text.trim())
+  }, draft.pending || draft.text.trim() === "")
+  input.addEventListener("input", () => { draft.text = input.value; submit.disabled = draft.pending || draft.text.trim() === "" })
+  row.append(input, submit)
+  return row
+}
+
+function decisionControls(card: BoardCard): HTMLElement {
+  const row = document.createElement("div")
+  row.className = "fm-actions"
+  const taskId = card.taskId!
+  const draft = messageDraft(`decision:${taskId}`)
+  for (const action of card.actions ?? []) {
+    const choice = button(action.label, () => { void sendDecision(taskId, draft, { label: action.label, expectedText: action.text }) }, draft.pending)
+    choice.title = action.text
+    row.append(choice)
+  }
+  row.append(messageControl(draft, `Answer for ${taskId}`, "Answer", (answer) => { void sendDecision(taskId, draft, { text: answer }) }))
+  row.append(mutedNote("Replies go to the first mate, not the worker; holds and landing authorization are unchanged until the backlog records a change."))
+  if (draft.feedback !== undefined) row.append(mutedNote(draft.feedback))
+  return row
+}
+
+async function sendDecision(taskId: string, draft: MessageDraft, answer: { label: string; expectedText: string } | { text: string }): Promise<void> {
+  const registration = activeRegistration
+  if (registration === null || draft.pending || messageDrafts.get(`decision:${taskId}`) !== draft) return
+  draft.pending = true
+  draft.feedback = undefined
+  render(state)
+  try {
+    const result = await post("/decision", { slug: registration.slug, taskId, ...answer })
+    if (activeRegistration !== registration) return
+    draft.feedback = typeof result.warning === "string" ? result.warning : "Sent to first mate; holds and task state are unchanged by this reply."
+    if ("text" in answer) draft.text = ""
+  } catch (error) {
+    if (activeRegistration !== registration) return
+    draft.feedback = errorMessage(error)
+  } finally {
+    if (activeRegistration === registration) { draft.pending = false; render(state); void fetchBoard() }
+  }
+}
+
+function workerPanel(card: BoardCard, registration: RegistrationInfo): HTMLElement {
+  const section = document.createElement("section")
+  section.append(boardCard(card, true))
+  section.append(mutedNote("This worker's task. Notes go to the first mate with this session as their origin; they do not steer the worker or release a captain hold."))
+  const draft = messageDraft(`handoff:${card.sessionId}`)
+  section.append(messageControl(draft, "Note for first mate", "Send note to first mate", (message) => {
+    void sendHandoff(registration, card.sessionId!, draft, message)
+  }))
+  if (draft.feedback !== undefined) section.append(mutedNote(draft.feedback))
+  return section
+}
+
+async function sendHandoff(registration: RegistrationInfo, sessionId: string, draft: MessageDraft, message: string): Promise<void> {
+  if (activeRegistration !== registration || draft.pending) return
+  draft.pending = true
+  draft.feedback = undefined
+  render(state)
+  try {
+    const result = await post("/handoff", { directory: registration.projectDirectory, sessionId, text: message })
+    if (activeRegistration !== registration) return
+    draft.feedback = typeof result.warning === "string" ? result.warning : "Note sent to first mate; the worker and captain hold are unchanged."
+    draft.text = ""
+  } catch (error) {
+    if (activeRegistration !== registration) return
+    draft.feedback = errorMessage(error)
+  } finally {
+    if (activeRegistration === registration) { draft.pending = false; render(state) }
+  }
 }
 
 // Muted branch line; the worktree the branch was checked out in rides on hover.
@@ -1119,25 +1694,41 @@ function prLink(card: BoardCard): HTMLElement {
 // Relaunch relay through the service (the coordinator owns the backlog and
 // the relaunch itself); Interrupt asks the service to stop the worker's
 // current turn; End archives the card in extension state — the session and
-// worktree are left exactly as they are. Feedback stays local to the card;
-// the board refetch after the request settles carries any state change.
-type ActionFeedback = (message: string) => void
+// worktree are left exactly as they are. Drafts, pending requests and feedback
+// survive card rebuilds; the board refetch carries authoritative state changes.
+type WorkerActionPath = "/steer" | "/relaunch" | "/interrupt" | "/end"
 
-function actionFeedback(): { element: HTMLElement; say: ActionFeedback } {
-  const element = document.createElement("span")
-  element.className = "fm-feedback"
-  return { element, say: (message) => { element.textContent = message } }
+function workerActionKey(registration: RegistrationInfo, sessionId: string, pathname: WorkerActionPath): string {
+  return `worker:${registration.slug}\n${registration.coordinatorSessionId}\n${sessionId}\n${pathname}`
 }
 
-async function runCardAction(pathname: string, body: Record<string, string>, say: ActionFeedback, successMessage: string): Promise<{ status: number }> {
+function workerActionDraft(card: BoardCard, pathname: WorkerActionPath): MessageDraft {
+  return messageDraft(workerActionKey(activeRegistration!, card.sessionId!, pathname))
+}
+
+function actionFeedback(card: BoardCard): HTMLElement {
+  const element = document.createElement("span")
+  element.className = "fm-feedback"
+  element.textContent = (["/interrupt", "/steer", "/relaunch", "/end"] as const)
+    .map((pathname) => workerActionDraft(card, pathname).feedback)
+    .filter((message): message is string => message !== undefined)
+    .join(" ")
+  return element
+}
+
+async function runCardAction(pathname: WorkerActionPath, body: Record<string, string>, draft: MessageDraft, successMessage: string): Promise<{ status: number }> {
   const registration = activeRegistration
-  if (registration === null) return { status: 0 }
+  if (registration === null || draft.pending || messageDrafts.get(workerActionKey(registration, body.sessionId, pathname)) !== draft) return { status: 0 }
+  draft.pending = true
+  draft.feedback = undefined
+  render(state)
   try {
     const result = await host.serviceRequest({
       method: "POST",
       path: pathname,
       body: JSON.stringify({ slug: registration.slug, ...body }),
     })
+    if (activeRegistration !== registration) return { status: 0 }
     let parsed: { error?: string; warning?: string } = {}
     try {
       parsed = JSON.parse(result.body) as { error?: string; warning?: string }
@@ -1145,57 +1736,56 @@ async function runCardAction(pathname: string, body: Record<string, string>, say
       // A non-JSON body only matters through the generic message below.
     }
     if (result.status !== 200) {
-      say(parsed.error ?? `The action failed (status ${result.status}).`)
+      if (pathname === "/interrupt" && result.status === 501) {
+        interruptUnsupportedSessions.add(body.sessionId)
+        draft.feedback = "Interrupt is not exposed by OpenChamber's extension contract, and this host did not offer the fallback path."
+      } else {
+        draft.feedback = parsed.error ?? `The action failed (status ${result.status}).`
+      }
       return { status: result.status }
     }
     // A 200 with a warning still succeeded (e.g. the steer reached the worker
     // but the coordinator could not be told); the captain sees the caveat.
-    say(parsed.warning ?? successMessage)
+    draft.feedback = parsed.warning ?? successMessage
+    draft.text = ""
     return { status: result.status }
   } catch {
-    say("The service is unreachable.")
+    if (activeRegistration === registration) draft.feedback = "The service is unreachable."
     return { status: 0 }
   } finally {
-    void fetchBoard()
+    if (activeRegistration === registration) {
+      draft.pending = false
+      render(state)
+      void fetchBoard()
+    }
   }
 }
 
 function cardActions(card: BoardCard): HTMLElement {
   const row = document.createElement("div")
   row.className = "fm-actions"
-  const { element, say } = actionFeedback()
-  row.append(watchButton(card), interruptButton(card, say), steerControl(card, say), relaunchControl(card, say), endButton(card, say), element)
+  row.append(watchButton(card), interruptButton(card), steerControl(card), relaunchControl(card), endButton(card), actionFeedback(card))
   return row
 }
 
 // Interrupt rides a private-surface workaround (the managed opencode
 // server's own abort call); hosts that do not offer it answer 501. Those
 // session ids are remembered here so Interrupt stays disabled for the rest
-// of the panel session — local DOM state on purpose: host capability is not
+// of the panel session — module state on purpose: host capability is not
 // board state, and the reducer does not model it.
 const interruptUnsupportedSessions = new Set<string>()
 
-function interruptButton(card: BoardCard, say: ActionFeedback): HTMLElement {
+function interruptButton(card: BoardCard): HTMLElement {
+  const draft = workerActionDraft(card, "/interrupt")
   const button = document.createElement("button")
   button.className = "fm-button"
   button.textContent = "Interrupt"
   button.title = "Stop the worker's current turn."
-  button.disabled = card.sessionId === undefined || interruptUnsupportedSessions.has(card.sessionId)
+  button.disabled = card.sessionId === undefined || draft.pending || interruptUnsupportedSessions.has(card.sessionId)
   button.addEventListener("click", () => {
     const sessionId = card.sessionId
-    if (sessionId === undefined) return
-    button.disabled = true
-    void runCardAction("/interrupt", { sessionId }, say, "Interrupt sent.").then((result) => {
-      if (result.status === 501) {
-        // Plain copy, no weaker substitute dressed up as equivalent: the
-        // extension contract does not expose interrupt and this host
-        // offered no fallback path.
-        interruptUnsupportedSessions.add(sessionId)
-        say("Interrupt is not exposed by OpenChamber's extension contract, and this host did not offer the fallback path.")
-        return
-      }
-      button.disabled = false
-    })
+    if (sessionId === undefined || draft.pending || interruptUnsupportedSessions.has(sessionId)) return
+    void runCardAction("/interrupt", { sessionId }, draft, "Interrupt sent.")
   })
   return button
 }
@@ -1213,10 +1803,13 @@ function watchButton(card: BoardCard): HTMLElement {
   return button
 }
 
-function steerControl(card: BoardCard, say: ActionFeedback): HTMLElement {
+function steerControl(card: BoardCard): HTMLElement {
+  const draft = workerActionDraft(card, "/steer")
   const input = document.createElement("input")
   input.type = "text"
   input.placeholder = "Steer the worker…"
+  input.value = draft.text
+  input.disabled = draft.pending
   const send = document.createElement("button")
   send.className = "fm-button"
   send.textContent = "Steer"
@@ -1224,22 +1817,17 @@ function steerControl(card: BoardCard, say: ActionFeedback): HTMLElement {
   // Send stays disabled until the captain has typed something, and the
   // tooltip names the Done state instead of leaving the disabled button mute.
   const updateSend = (): void => {
-    send.disabled = input.value.trim() === "" || card.sessionId === undefined || card.state === "Done"
+    send.disabled = draft.pending || input.value.trim() === "" || card.sessionId === undefined || card.state === "Done"
     send.title = card.state === "Done"
       ? "This task is Done — relaunch the worker to continue."
       : "Send this message to the worker."
   }
   updateSend()
-  input.addEventListener("input", updateSend)
+  input.addEventListener("input", () => { draft.text = input.value; updateSend() })
   send.addEventListener("click", () => {
     const steerText = input.value.trim()
-    if (card.sessionId === undefined || steerText === "") return
-    input.disabled = true
-    send.disabled = true
-    void runCardAction("/steer", { sessionId: card.sessionId, text: steerText }, say, "Steered.").finally(() => {
-      input.disabled = false
-      updateSend()
-    })
+    if (card.sessionId === undefined || draft.pending || card.state === "Done" || steerText === "") return
+    void runCardAction("/steer", { sessionId: card.sessionId, text: steerText }, draft, "Steered.")
   })
   const control = document.createElement("span")
   control.className = "fm-steer"
@@ -1247,10 +1835,13 @@ function steerControl(card: BoardCard, say: ActionFeedback): HTMLElement {
   return control
 }
 
-function relaunchControl(card: BoardCard, say: ActionFeedback): HTMLElement {
+function relaunchControl(card: BoardCard): HTMLElement {
+  const draft = workerActionDraft(card, "/relaunch")
   const input = document.createElement("input")
   input.type = "text"
   input.placeholder = "Note for the relaunch…"
+  input.value = draft.text
+  input.disabled = draft.pending
   const send = document.createElement("button")
   send.className = "fm-button"
   send.textContent = "Relaunch"
@@ -1260,47 +1851,39 @@ function relaunchControl(card: BoardCard, say: ActionFeedback): HTMLElement {
   // identifies the backlog entry to supersede. Send stays disabled until the
   // captain has typed a note.
   const updateSend = (): void => {
-    send.disabled = input.value.trim() === "" || card.sessionId === undefined || card.worktree === undefined
+    send.disabled = draft.pending || input.value.trim() === "" || card.sessionId === undefined || card.worktree === undefined
   }
   updateSend()
-  input.addEventListener("input", updateSend)
+  input.addEventListener("input", () => { draft.text = input.value; updateSend() })
   send.addEventListener("click", () => {
     const note = input.value.trim()
-    if (card.sessionId === undefined || card.worktree === undefined || note === "") return
-    input.disabled = true
-    send.disabled = true
-    void runCardAction("/relaunch", { sessionId: card.sessionId, note }, say, "Relaunch requested.").finally(() => {
-      input.disabled = false
-      updateSend()
-    })
+    if (card.sessionId === undefined || card.worktree === undefined || draft.pending || note === "") return
+    void runCardAction("/relaunch", { sessionId: card.sessionId, note }, draft, "Relaunch requested.")
   })
   const control = document.createElement("span")
   control.append(input, send)
   return control
 }
 
-function endButton(card: BoardCard, say: ActionFeedback): HTMLElement {
+function endButton(card: BoardCard): HTMLElement {
+  const draft = workerActionDraft(card, "/end")
+  const key = workerActionKey(activeRegistration!, card.sessionId!, "/end")
   const button = document.createElement("button")
   button.className = "fm-button"
-  button.textContent = "End"
+  button.textContent = endConfirmations.has(key) ? "Really end?" : "End"
   button.title = "Archive this card; the session and worktree are left as they are."
-  button.disabled = card.sessionId === undefined
+  button.disabled = card.sessionId === undefined || draft.pending
   // Two-click confirm instead of window.confirm: a sandboxed iframe without
   // allow-modals swallows dialogs silently.
-  let armed = false
   button.addEventListener("click", () => {
-    if (card.sessionId === undefined) return
-    if (!armed) {
-      armed = true
-      button.textContent = "Really end?"
+    if (card.sessionId === undefined || draft.pending || messageDrafts.get(key) !== draft) return
+    if (!endConfirmations.has(key)) {
+      endConfirmations.add(key)
+      render(state)
       return
     }
-    armed = false
-    button.textContent = "End"
-    button.disabled = true
-    void runCardAction("/end", { sessionId: card.sessionId }, say, "Archived.").finally(() => {
-      button.disabled = card.sessionId === undefined
-    })
+    endConfirmations.delete(key)
+    void runCardAction("/end", { sessionId: card.sessionId }, draft, "Archived.")
   })
   return button
 }
@@ -1349,7 +1932,7 @@ function suggestionRow(suggestion: SuggestionRow, actionPending: boolean): HTMLE
   const label = document.createElement("span")
   label.className = "fm-suggestion-label"
   label.textContent = suggestion.label
-  // The full suggestion text is longer than the label; it stays on hover.
+  // Hover remains a preview; the full text is also keyboard-accessible below.
   label.title = suggestion.text
   const actions = document.createElement("div")
   actions.className = "fm-suggestion-actions"
@@ -1377,7 +1960,15 @@ function suggestionRow(suggestion: SuggestionRow, actionPending: boolean): HTMLE
     void runSuggestionAction("/suggestion/dismiss", suggestion.label)
   })
   actions.append(send, dismiss)
-  row.append(label, actions)
+  const details = expandableText(`suggestion:${suggestion.label}`, "Read suggestion", suggestion.text, "fm-suggestion-details")
+  const copyFeedback = text("")
+  const copy = button("Copy suggestion", () => {
+    if (typeof host.writeClipboard !== "function") return
+    void host.writeClipboard(suggestion.text).then(() => { copyFeedback.textContent = "Copied." }).catch(() => { copyFeedback.textContent = "Copy failed; select and copy the text above." })
+  }, typeof host.writeClipboard !== "function")
+  copy.title = typeof host.writeClipboard === "function" ? "Copy the full suggestion text." : "Clipboard is unavailable; select and copy the expanded text."
+  details.append(copy, copyFeedback)
+  row.append(label, actions, details)
   return row
 }
 
@@ -1464,6 +2055,8 @@ function watchesCard(state: PanelState & { kind: "registered" }): HTMLElement {
       "Watches run only while OpenChamber is running. A run whose time passed while the machine was asleep fires once, late; runs missed while OpenChamber was closed are never made up.",
     ),
   )
+  const history = watchNotesHistory()
+  if (history !== null) section.append(history)
   const formState = watchFormState
   if (formState.kind === "create") section.append(watchCreateForm(formState))
   if (state.watchesError !== undefined) {

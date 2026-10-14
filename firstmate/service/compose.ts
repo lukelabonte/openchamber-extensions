@@ -1,4 +1,6 @@
 import type { FileSystemPort } from "./file-system"
+import { randomUUID } from "node:crypto"
+import { loadProjectSettings } from "./settings"
 
 interface ComposeInstructionsInput {
   filesystem: FileSystemPort
@@ -41,7 +43,16 @@ ${headerLines.join("\n")}
     .map((layer) => `<!-- layer: ${layer.relativePath} -->\n\n${layer.contents}`)
     .join("\n\n")
 
-  const composed = `${header}\n\n${body}\n`
-  await filesystem.writeFile(`${homeRoot}/projects/${slug}/AGENTS.md`, composed)
+  const settings = await loadProjectSettings(filesystem, `${homeRoot}/projects/${slug}`)
+  const workerDefaults = [
+    settings.workerModel === "" ? "" : `Use model ${JSON.stringify(settings.workerModel)} for new workers (session.create model; CLI --model), unless the captain explicitly chooses another.`,
+    settings.workerVariant === "" ? "" : `Use variant ${JSON.stringify(settings.workerVariant)} for new workers (session.create variant; CLI --variant), unless the captain explicitly chooses another.`,
+  ].filter(Boolean)
+  const defaultsSection = workerDefaults.length === 0 ? "" : `\n\n## Configured worker defaults\n\n${workerDefaults.join("\n")}\n`
+  const composed = `${header}\n\n${body}${defaultsSection}\n`
+  const filePath = `${homeRoot}/projects/${slug}/AGENTS.md`
+  const temporaryPath = `${filePath}.${randomUUID()}.tmp`
+  await filesystem.writeFile(temporaryPath, composed)
+  await filesystem.rename(temporaryPath, filePath)
   return composed
 }

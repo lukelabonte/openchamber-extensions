@@ -191,14 +191,13 @@ describe("createWatchRunner runNow resolution", () => {
         },
       ],
     })
-    // The runner execs (same path as the scheduler) and tells the captain,
-    // but never delivers the coordinator notification itself.
+    // The runner execs and durably queues the notification, but delivery to
+    // both the first mate and captain belongs to the service.
     expect(calls).toHaveLength(1)
     expect(calls[0].cwd).toBe(projectHome)
     expect(calls[0].env.FIRSTMATE_WATCH_STATE).toBe(`${projectHome}/watch-state/nightly`)
-    expect(emitCalls).toHaveLength(1)
-    expect(emitCalls[0].url).toBe("http://127.0.0.1:4096/api/notifications/emit")
-    expect(emitCalls[0].init.method).toBe("POST")
+    expect(emitCalls).toEqual([])
+    expect((await runner.pendingNotifications(slug)).notes[0].notification).toEqual(result.kind === "ran" ? result.notifications[0] : undefined)
   })
 })
 
@@ -290,7 +289,7 @@ describe("createWatchRunner runNow shares the scheduler's lock", () => {
 })
 
 describe("createWatchRunner runNow failure streak and lastError", () => {
-  test("the first failure of a streak notifies coordinator and captain once; repeats stay silent", async () => {
+  test("the first failure of a streak queues one notification; repeats stay silent", async () => {
     const filesystem = new InMemoryFileSystem()
     seedRegistry(filesystem)
     seedNightly(filesystem)
@@ -317,12 +316,8 @@ describe("createWatchRunner runNow failure streak and lastError", () => {
         },
       ])
     }
-    expect(emitCalls).toHaveLength(1)
-    expect(emitCalls[0].url).toBe("http://127.0.0.1:4096/api/notifications/emit")
-    expect(JSON.parse(emitCalls[0].init.body ?? "")).toEqual({
-      title: "FirstMate — nightly failed",
-      body: "exited with code 1",
-    })
+    expect(emitCalls).toEqual([])
+    expect((await runner.pendingNotifications(slug)).notes).toHaveLength(1)
     const watches = await runner.listWatches(slug)
     expect(watches[0]).toMatchObject({ lastOutcome: "failed", lastError: "exited with code 1" })
 
@@ -332,7 +327,8 @@ describe("createWatchRunner runNow failure streak and lastError", () => {
       expect(repeatFailure.lastOutcome).toBe("failed")
       expect(repeatFailure.notifications).toEqual([])
     }
-    expect(emitCalls).toHaveLength(1) // the captain is not told twice in a streak
+    expect(emitCalls).toEqual([])
+    expect((await runner.pendingNotifications(slug)).notes).toHaveLength(1)
   })
 
   test("a success — empty output included — resets the streak and clears lastError", async () => {
@@ -366,8 +362,9 @@ describe("createWatchRunner runNow failure streak and lastError", () => {
       expect(refailure.notifications).toHaveLength(1)
       expect(refailure.notifications[0].message).toContain("watch nightly failed: exited with code 1")
     }
-    // Two streaks, two captain calls; the empty success made none.
-    expect(emitCalls).toHaveLength(2)
+    // Two streaks, two queued notes; the empty success queued none.
+    expect(emitCalls).toEqual([])
+    expect((await runner.pendingNotifications(slug)).notes).toHaveLength(2)
     const reopened = await runner.listWatches(slug)
     expect(reopened[0]).toMatchObject({ lastOutcome: "failed", lastError: "exited with code 1" })
   })

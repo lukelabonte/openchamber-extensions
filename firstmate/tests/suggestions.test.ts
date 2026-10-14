@@ -46,6 +46,22 @@ describe("parseSuggestions", () => {
       { label: "Twice", text: "second copy" },
     ])
   })
+
+  test("filters dismissed text across renamed labels and whitespace, not changed prompts", () => {
+    expect(
+      parseSuggestions(
+        [
+          "- New label ::   refresh\t the   PR description",
+          "- Original label :: refresh the PR description with tests",
+          "- refresh the PR description :: unrelated prompt",
+        ].join("\n"),
+        new Set(["refresh the PR description"]),
+      ),
+    ).toEqual([
+      { label: "Original label", text: "refresh the PR description with tests" },
+      { label: "refresh the PR description", text: "unrelated prompt" },
+    ])
+  })
 })
 
 describe("loadSuggestions", () => {

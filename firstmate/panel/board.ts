@@ -2,11 +2,19 @@
 // GET /board?slug=… . The service's poller is the authority on worker state;
 // the panel only reshapes the payload for display and never execs anything.
 
+import { isReviewHead, isTaskActions, isTaskId, isTaskKind, type BacklogTaskAction, type BacklogTaskKind } from "../service/backlog"
+
 export type BoardWorkerState = "Queued" | "Working" | "Blocked" | "Parked" | "Done" | "Failed" | "Idle"
 
 export interface BoardWorker {
   title: string
   state: BoardWorkerState
+  taskId?: string
+  kind?: BacklogTaskKind
+  blockedBy?: string
+  hold?: string
+  reviewHead?: string
+  actions?: BacklogTaskAction[]
   blockedReason?: "question" | "permission"
   lastWord?: string
   prUrl?: string
@@ -21,6 +29,12 @@ export interface BoardWorker {
 export interface BoardCard {
   title: string
   state: BoardWorkerState
+  taskId?: string
+  kind?: BacklogTaskKind
+  blockedBy?: string
+  hold?: string
+  reviewHead?: string
+  actions?: BacklogTaskAction[]
   blockedReason?: "question" | "permission"
   lastWord?: string
   prUrl?: string
@@ -73,6 +87,7 @@ function parseBoardWorker(value: unknown): BoardWorker | undefined {
   if (typeof value !== "object" || value === null) return undefined
   const record = value as Record<string, unknown>
   const { title, state, blockedReason, lastWord, prUrl, sessionId, worktree, branch, lastPollError, possiblyStalledSince } = record
+  const { taskId, kind, blockedBy, hold, reviewHead, actions } = record
   if (typeof title !== "string") return undefined
   if (typeof state !== "string" || !boardColumnOrder.includes(state as BoardWorkerState)) return undefined
   if (
@@ -88,9 +103,35 @@ function parseBoardWorker(value: unknown): BoardWorker | undefined {
     return undefined
   }
   if (blockedReason !== undefined && blockedReason !== "question" && blockedReason !== "permission") return undefined
+  const taskFields: Pick<BoardWorker, "taskId" | "kind" | "blockedBy" | "hold" | "reviewHead" | "actions"> = {}
+  if (taskId !== undefined) {
+    if (!isTaskId(taskId)) return undefined
+    taskFields.taskId = taskId
+  }
+  if (kind !== undefined) {
+    if (!isTaskKind(kind)) return undefined
+    taskFields.kind = kind
+  }
+  if (blockedBy !== undefined) {
+    if (!isTaskId(blockedBy)) return undefined
+    taskFields.blockedBy = blockedBy
+  }
+  if (hold !== undefined) {
+    if (typeof hold !== "string" || hold.trim() === "") return undefined
+    taskFields.hold = hold
+  }
+  if (reviewHead !== undefined) {
+    if (!isReviewHead(reviewHead)) return undefined
+    taskFields.reviewHead = reviewHead
+  }
+  if (actions !== undefined) {
+    if (!isTaskActions(actions)) return undefined
+    taskFields.actions = actions.map(({ label, text }) => ({ label, text }))
+  }
   return {
     title,
     state: state as BoardWorkerState,
+    ...taskFields,
     ...(blockedReason !== undefined ? { blockedReason: blockedReason as BoardWorker["blockedReason"] } : {}),
     ...(lastWord !== undefined ? { lastWord } : {}),
     ...(prUrl !== undefined ? { prUrl } : {}),
@@ -117,6 +158,12 @@ export function toBoardCard(worker: BoardWorker): BoardCard {
   const card: BoardCard = {
     title: trimmedTitle === "" ? "(untitled)" : trimmedTitle,
     state: worker.state,
+    ...(worker.taskId !== undefined ? { taskId: worker.taskId } : {}),
+    ...(worker.kind !== undefined ? { kind: worker.kind } : {}),
+    ...(worker.blockedBy !== undefined ? { blockedBy: worker.blockedBy } : {}),
+    ...(worker.hold !== undefined ? { hold: worker.hold } : {}),
+    ...(worker.reviewHead !== undefined ? { reviewHead: worker.reviewHead } : {}),
+    ...(worker.actions !== undefined ? { actions: worker.actions.map(({ label, text }) => ({ label, text })) } : {}),
     ...(worker.blockedReason !== undefined ? { blockedReason: worker.blockedReason } : {}),
   }
   const lastWord = optionalText(worker.lastWord)

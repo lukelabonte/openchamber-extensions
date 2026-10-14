@@ -12,6 +12,17 @@ function expectParseError(expression: string): void {
 }
 
 describe("parseCronExpression", () => {
+  test("accepts hourly, daily, and weekly aliases with ordinary cron local-time semantics", () => {
+    expect(parseCronExpression(" @hourly ")).toEqual(parseCronExpression("0 * * * *"))
+    expect(parseCronExpression("@daily")).toEqual(parseCronExpression("0 0 * * *"))
+    expect(parseCronExpression("@weekly")).toEqual(parseCronExpression("0 0 * * 0"))
+    expect(computeNextRun(parseCronExpression("@hourly"), local(2026, 10, 1, 9, 0))).toEqual(local(2026, 10, 1, 10, 0))
+    expect(computeNextRun(parseCronExpression("@daily"), local(2026, 10, 1, 9, 0))).toEqual(local(2026, 10, 2, 0, 0))
+    expect(computeNextRun(parseCronExpression("@weekly"), local(2026, 10, 1, 9, 0))).toEqual(local(2026, 10, 4, 0, 0))
+    expectParseError("@monthly")
+    expectParseError("@hourly extra")
+  })
+
   test("accepts the documented forms", () => {
     const everyMinute = parseCronExpression("* * * * *")
     expect(everyMinute.minutes.size).toBe(60)

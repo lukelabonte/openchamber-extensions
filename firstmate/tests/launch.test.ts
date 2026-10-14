@@ -78,6 +78,75 @@ function registryFileContents(filesystem: InMemoryFileSystem): string {
 }
 
 describe("launchFirstMate", () => {
+  test("creates with the captain-edited opening and persisted coordinator model without a separate send", async () => {
+    const filesystem = new InMemoryFileSystem()
+    filesystem.seedDirectory("/home/firstmate/projects/sunrise")
+    filesystem.seedFile("/home/firstmate/projects/sunrise/settings.json", JSON.stringify({ projectDirectory, coordinatorModel: "provider/coordinator", coordinatorVariant: "high", workerModel: "provider/worker", custom: { retained: true } }))
+    filesystem.seedFile("/home/firstmate/projects/sunrise/opening.md", "Captain-edited opening\nRead this verbatim.\n")
+    const fake = fakeExec()
+    await launchFirstMate(makeInput({ filesystem: filesystem.port, exec: fake.exec }))
+    expect(fake.calls).toHaveLength(1)
+    expect(fake.calls[0].args).toContain("--prompt")
+    expect(fake.calls[0].args[fake.calls[0].args.indexOf("--prompt") + 1]).toBe("Captain-edited opening\nRead this verbatim.\n")
+    expect(fake.calls[0].args[fake.calls[0].args.indexOf("--model") + 1]).toBe("provider/coordinator")
+    expect(fake.calls[0].args[fake.calls[0].args.indexOf("--variant") + 1]).toBe("high")
+    expect(JSON.parse(filesystem.fileContents("/home/firstmate/projects/sunrise/settings.json"))).toMatchObject({ projectDirectory, custom: { retained: true }, workerModel: "provider/worker", coordinatorSessionId: "ses_coord_1" })
+    expect(filesystem.renamedFrom("/home/firstmate/projects/sunrise/settings.json")).toContain(".tmp")
+  })
+
+  test("empty openings and blank model settings do not add create flags", async () => {
+    const filesystem = new InMemoryFileSystem()
+    filesystem.seedDirectory("/home/firstmate/projects/sunrise")
+    filesystem.seedFile("/home/firstmate/projects/sunrise/settings.json", JSON.stringify({ projectDirectory, coordinatorModel: "", coordinatorVariant: "" }))
+    filesystem.seedFile("/home/firstmate/projects/sunrise/opening.md", " \n")
+    const fake = fakeExec()
+    await launchFirstMate(makeInput({ filesystem: filesystem.port, exec: fake.exec }))
+    for (const flag of ["--prompt", "--model", "--variant"]) expect(fake.calls[0].args).not.toContain(flag)
+  })
+
+  test("recomposes available home layers on adoption without extra CLI calls", async () => {
+    const filesystem = new InMemoryFileSystem()
+    const fake = fakeExec()
+    await launchFirstMate(makeInput({ filesystem: filesystem.port, exec: fake.exec }))
+    filesystem.seedFile("/home/firstmate/projects/sunrise/captain.md", "CAPTAIN EDIT")
+    await launchFirstMate(makeInput({ filesystem: filesystem.port, exec: fake.exec }))
+    expect(filesystem.fileContents("/home/firstmate/projects/sunrise/AGENTS.md")).toContain("CAPTAIN EDIT")
+    expect(fake.calls).toHaveLength(1)
+  })
+
+  test("recomposes shared-only layers when the registered home exists", async () => {
+    const filesystem = new InMemoryFileSystem()
+    const fake = fakeExec()
+    filesystem.seedDirectory("/home/firstmate/projects/sunrise")
+    filesystem.seedFile("/home/firstmate/shared/captain.md", "EDITED SHARED CAPTAIN")
+    filesystem.seedFile("/home/firstmate/registry.json", JSON.stringify({ sunrise: { slug: "sunrise", projectDirectory, homeDirectory: "/home/firstmate/projects/sunrise", coordinatorSessionId: "ses_existing", createdAt: "2026-01-01T00:00:00.000Z" } }))
+    await launchFirstMate(makeInput({ filesystem: filesystem.port, exec: fake.exec }))
+    expect(filesystem.fileContents("/home/firstmate/projects/sunrise/AGENTS.md")).toContain("EDITED SHARED CAPTAIN")
+    expect(fake.calls).toHaveLength(0)
+  })
+
+  test("does not adopt a stale registry ID after a persisted release", async () => {
+    const filesystem = new InMemoryFileSystem()
+    const fake = fakeExec()
+    await launchFirstMate(makeInput({ filesystem: filesystem.port, exec: fake.exec }))
+    filesystem.seedFile("/home/firstmate/projects/sunrise/settings.json", JSON.stringify({ projectDirectory, coordinatorReleased: true, coordinatorSessionId: "ses_coord_1" }))
+    const fresh = fakeExec('{"sessionId":"ses_fresh"}')
+    const result = await launchFirstMate(makeInput({ filesystem: filesystem.port, exec: fresh.exec }))
+    expect(result.adopted).toBe(false)
+    expect(result.registration.coordinatorSessionId).toBe("ses_fresh")
+    expect(fresh.calls).toHaveLength(1)
+  })
+
+  test("refuses corrupt existing settings rather than adopting or overwriting", async () => {
+    const filesystem = new InMemoryFileSystem()
+    const fake = fakeExec()
+    await launchFirstMate(makeInput({ filesystem: filesystem.port, exec: fake.exec }))
+    filesystem.seedFile("/home/firstmate/projects/sunrise/settings.json", "not JSON")
+    await expect(launchFirstMate(makeInput({ filesystem: filesystem.port, exec: fake.exec }))).rejects.toThrow("settings")
+    expect(filesystem.fileContents("/home/firstmate/projects/sunrise/settings.json")).toBe("not JSON")
+    expect(fake.calls).toHaveLength(1)
+  })
+
   test("provisions the home, creates the coordinator session rooted at the home, and records the registration", async () => {
     const filesystem = new InMemoryFileSystem()
     const fake = fakeExec()

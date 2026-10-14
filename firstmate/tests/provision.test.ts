@@ -11,6 +11,8 @@ const templateContents: Record<string, string> = {
   "settings.json": "{}\n",
   "watches-README.md": "WATCHES README TEMPLATE",
   "pr-watch": "PR WATCH TEMPLATE",
+  "opening-note.md": "OPENING TEMPLATE",
+  "learnings.md": "LEARNINGS TEMPLATE",
 }
 
 function templateReaderFor(contents: Record<string, string>) {
@@ -47,6 +49,8 @@ describe("provisionProject", () => {
     expect(filesystem.fileContents("/home/firstmate/projects/sunrise/captain.md")).toBe("CAPTAIN ORDERS TEMPLATE")
     expect(filesystem.fileContents("/home/firstmate/projects/sunrise/backlog.md")).toBe("BACKLOG TEMPLATE")
     expect(filesystem.fileContents("/home/firstmate/projects/sunrise/projects.md")).toBe("PROJECTS TEMPLATE")
+    expect(filesystem.fileContents("/home/firstmate/projects/sunrise/opening.md")).toBe("OPENING TEMPLATE")
+    expect(filesystem.fileContents("/home/firstmate/projects/sunrise/learnings.md")).toBe("LEARNINGS TEMPLATE")
     expect(JSON.parse(filesystem.fileContents("/home/firstmate/projects/sunrise/settings.json"))).toEqual({
       projectDirectory: "/repos/sunrise",
     })
@@ -70,6 +74,30 @@ describe("provisionProject", () => {
     expect(filesystem.fileContents("/home/firstmate/shared/charter.md")).toBe("CAPTAIN EDIT")
     expect(filesystem.fileContents("/home/firstmate/shared/watches/pr-watch")).toBe("CAPTAIN EDIT")
     expect(filesystem.fileContents("/home/firstmate/projects/sunrise/backlog.md")).toBe("CAPTAIN EDIT")
+    expect(filesystem.fileContents("/home/firstmate/shared/charter.md.new")).toBe("SHARED CHARTER TEMPLATE")
+    expect(filesystem.fileContents("/home/firstmate/shared/watches/pr-watch.new")).toBe("PR WATCH TEMPLATE")
+  })
+
+  test("upgrades only untouched shared defaults and restores the watch exec bit", async () => {
+    const filesystem = new InMemoryFileSystem()
+    const input = { filesystem: filesystem.port, homeRoot: "/home/firstmate", projectDirectory: "/repos/sunrise" }
+    await provisionProject({ ...input, templateReader: templateReaderFor(templateContents) })
+    for (const path of ["/home/firstmate/shared/captain.md", "/home/firstmate/projects/sunrise/captain.md", "/home/firstmate/projects/sunrise/charter.md", "/home/firstmate/projects/sunrise/opening.md", "/home/firstmate/projects/sunrise/learnings.md"]) {
+      filesystem.seedFile(path, "CAPTAIN EDIT")
+    }
+    let executableCalls = 0
+    const reprovisionFilesystem = { ...filesystem.port, setExecutable: async (path: string) => { executableCalls += 1; await filesystem.port.setExecutable(path) } }
+    const upgraded = { ...templateContents, "charter.md": "NEW CHARTER", "pr-watch": "NEW WATCH" }
+    await provisionProject({ ...input, filesystem: reprovisionFilesystem, templateReader: templateReaderFor(upgraded) })
+    expect(filesystem.fileContents("/home/firstmate/shared/charter.md")).toBe("NEW CHARTER")
+    expect(filesystem.fileContents("/home/firstmate/shared/watches/pr-watch")).toBe("NEW WATCH")
+    expect(executableCalls).toBe(1)
+    for (const path of ["/home/firstmate/shared/captain.md", "/home/firstmate/projects/sunrise/captain.md", "/home/firstmate/projects/sunrise/charter.md", "/home/firstmate/projects/sunrise/opening.md", "/home/firstmate/projects/sunrise/learnings.md"]) {
+      expect(filesystem.fileContents(path)).toBe("CAPTAIN EDIT")
+    }
+    await provisionProject({ ...input, projectDirectory: "/repos/moonrise", templateReader: templateReaderFor(upgraded) })
+    expect(filesystem.fileContents("/home/firstmate/projects/moonrise/opening.md")).toBe("OPENING TEMPLATE")
+    expect(filesystem.fileContents("/home/firstmate/projects/sunrise/opening.md")).toBe("CAPTAIN EDIT")
   })
 
   test("derives a suffixed slug when another project home already uses the base name", async () => {

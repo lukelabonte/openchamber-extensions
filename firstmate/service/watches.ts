@@ -1,8 +1,8 @@
 import type { FileSystemPort } from "./file-system"
 import type { HttpFetcher, InterruptSupport } from "./interrupt"
-import { notifyCaptain } from "./notifications"
 import { loadRegistry, type Registration } from "./registry"
 import { computeNextRun, extractScheduleComment, parseCronExpression, scheduleLinePattern } from "./watch-schedule"
+import { createWatchStore, watchRunKey, type StoredWatchRun } from "./watch-store"
 
 // Watches: executable scripts in a home's shared/watches/ (available to every
 // project, executed in each project's context) and projects/<slug>/watches/,
@@ -45,8 +45,15 @@ export interface WatchNotification {
   source?: WatchSource
 }
 
+export interface QueuedWatchNote {
+  id: string
+  createdAt: string
+  notification: WatchNotification
+}
+
 export interface WatchExecution {
   stdout: string
+  stderr?: string
   exitCode: number | null
   timedOut: boolean
 }
@@ -80,7 +87,7 @@ export type RunNowResult =
     }
 
 export interface WatchRunner {
-  /** One scheduling round over every registered project. Never throws. */
+  /** One scheduling round. Newly queued notifications retain the legacy return shape; delivery reads the durable queue. Never throws. */
   tick(): Promise<{ notifications: WatchNotification[] }>
   /**
    * Runs the named watch immediately through the scheduler's own execution
@@ -91,6 +98,12 @@ export interface WatchRunner {
    * delivers: the returned notifications are main's to deliver.
    */
   runNow(slug: string, source: WatchSource | undefined, name: string): Promise<RunNowResult>
+  /** Latest 20 undelivered notes, oldest first, and the unacknowledged overflow count. */
+  pendingNotifications(slug: string): Promise<{ notes: QueuedWatchNote[]; dropped: number }>
+  /** Pass the delivered batch's dropped count explicitly; omitted means no drops acknowledged. */
+  acknowledgeNotifications(slug: string, ids: readonly string[], droppedCount?: number): Promise<void>
+  /** Latest 50 acknowledged notes, in acknowledgement order. */
+  deliveredNotes(slug: string): Promise<QueuedWatchNote[]>
   listWatches(slug: string): Promise<WatchInfo[]>
   setEnabled(
     slug: string,
@@ -120,13 +133,6 @@ export class WatchSettingsError extends Error {
 
 interface RunState {
   nextRunAtMs: number
-  lastRunAt?: string
-  lastOutcome?: WatchOutcome
-  lastOutput?: string
-  /** The timeout/exit/exception reason of the last failed run; cleared by the next success. */
-  lastError?: string
-  /** Set while a failure has been reported; reset by the next success. */
-  reportedFailure?: boolean
 }
 
 // What one execution of a watch produced: the outcome the run state and
@@ -137,7 +143,8 @@ interface WatchRunResult {
 }
 
 const lastOutputMaxLength = 2000
-export const watchTimeoutMs = 60_000
+const watchNoteMaxLength = 16_000
+export const watchTimeoutMs = 120_000
 
 interface DiscoveredWatch {
   name: string
@@ -154,17 +161,15 @@ export function createWatchRunner(input: {
   clock: { nowMs(): number }
   homeRoot: string
   fetcher: HttpFetcher
-  // Support is resolved lazily at emit time, like the poller's: a host that
-  // gains or loses the desktop proxy between service start and a later run
-  // must not be frozen out by a boot-time answer.
+  // Retained for existing callers. Delivery belongs to the service, not the runner.
   resolveSupport: () => Promise<InterruptSupport>
   timeoutMs?: number
 }): WatchRunner {
-  const { filesystem, exec, clock, homeRoot, fetcher, resolveSupport } = input
+  const { filesystem, exec, clock, homeRoot } = input
   const timeoutMs = input.timeoutMs ?? watchTimeoutMs
-  // Run state is in-memory like every other supervision state: a service
-  // restart re-derives "next run after now" and the card loses last-run
-  // details. The enabled switch is the only persisted piece (settings.json).
+  const store = createWatchStore(filesystem)
+  // Only scheduling deadlines are in memory: restarts re-derive "next run
+  // after now" instead of replaying missed runs. Outcomes and notes are durable.
   const runStates = new Map<string, RunState>()
   // Watches whose execution is in flight right now, scheduled or manual,
   // keyed like the run state. The check-and-set happens before the first
@@ -253,7 +258,12 @@ export function createWatchRunner(input: {
         if (nowMs < runState.nextRunAtMs) continue
         // A manual run in flight holds this watch's lock and consumes the due
         // slot itself when it finishes; the tick simply moves on.
-        await executeWatch(registration, watch, runState, notifications)
+        try {
+          await executeWatch(registration, watch, runState, notifications)
+        } catch {
+          // A store failure must not claim a completed run or a deliverable
+          // notification. Manual runs and queue reads surface the named error.
+        }
       }
     }
     return { notifications }
@@ -290,7 +300,7 @@ export function createWatchRunner(input: {
     if (inFlightWatches.has(key)) return undefined
     inFlightWatches.add(key)
     try {
-      const result = await runWatch(registration, watch, runState, notifications)
+      const result = await runWatch(registration, watch, notifications)
       const following = computeNextRun(parseCronExpression(watch.schedule), new Date(clock.nowMs()))
       runState.nextRunAtMs = following === null ? Number.POSITIVE_INFINITY : following.getTime()
       return result
@@ -302,12 +312,15 @@ export function createWatchRunner(input: {
   async function runWatch(
     registration: Registration,
     watch: DiscoveredWatch,
-    runState: RunState,
     notifications: WatchNotification[],
   ): Promise<WatchRunResult> {
     const { slug, homeDirectory, coordinatorSessionId } = registration
     const stateDirectory = `${homeDirectory}/watch-state/${watch.name}`
-    runState.lastRunAt = new Date(clock.nowMs()).toISOString()
+    const key = watchRunKey(watch.source, watch.name)
+    // Validate the store before invoking a user-owned script. Corruption or a
+    // failed read never starts a run that would overwrite existing records.
+    const previous = (await store.read(homeDirectory)).runs[key]
+    const lastRunAt = new Date(clock.nowMs()).toISOString()
     let execution: WatchExecution | undefined
     let execError: string | undefined
     try {
@@ -320,6 +333,7 @@ export function createWatchRunner(input: {
         env: {
           FIRSTMATE_HOME: homeDirectory,
           FIRSTMATE_BACKLOG: `${homeDirectory}/backlog.md`,
+          FIRSTMATE_WATCH_NAME: watch.name,
           FIRSTMATE_WATCH_STATE: stateDirectory,
         },
         timeoutMs,
@@ -330,75 +344,58 @@ export function createWatchRunner(input: {
 
     const failed = execError !== undefined || execution === undefined || execution.timedOut || execution.exitCode !== 0
     if (failed) {
-      const reason =
+      const reason = boundedWatchText(
         execError ??
         (execution?.timedOut === true
           ? `timed out after ${timeoutMs} ms`
           : execution?.exitCode === null
             ? "was killed without an exit code"
-            : `exited with code ${execution?.exitCode}`)
-      runState.lastOutcome = "failed"
-      runState.lastOutput = execution === undefined ? "" : presentOutput(execution.stdout.trim())
-      runState.lastError = reason
-      // Reported to the coordinator and the captain's desktop once per
-      // failure streak; the next successful run — empty stdout included —
-      // resets the streak, so neither repeats on every failed run.
-      if (runState.reportedFailure !== true) {
-        runState.reportedFailure = true
-        notifications.push({
-          slug,
-          coordinatorSessionId,
-          homeDirectory,
-          message: `FirstMate (${slug}) watch ${watch.name} failed: ${reason}`,
-          watchName: watch.name,
-          source: watch.source,
-        })
-        const captain = captainWatchNotification(watch.name, "failed", reason)
-        try {
-          await notifyCaptain({ fetcher, support: await resolveSupport(), title: captain.title, body: captain.body })
-        } catch {
-          // Best effort: never throws into the run.
-        }
+            : `exited with code ${execution?.exitCode}`) + (execution?.stderr?.trim() ? `\n${execution.stderr.trim()}` : ""),
+      )
+      const run: StoredWatchRun = {
+        lastRunAt,
+        lastOutcome: "failed",
+        lastOutput: execution === undefined ? "" : presentOutput(execution.stdout.trim()),
+        lastError: reason,
+        reportedFailure: true,
       }
+      // Queued once per failure streak; an empty success also resets it.
+      const notification = previous?.reportedFailure === true ? undefined : {
+        slug,
+        coordinatorSessionId,
+        homeDirectory,
+        message: boundedWatchText(`FirstMate (${slug}) watch ${watch.name} failed: ${reason}`),
+        watchName: watch.name,
+        source: watch.source,
+      }
+      await store.recordRun(homeDirectory, key, run, notification)
+      if (notification !== undefined) notifications.push(notification)
       return { outcome: "failed", lastError: reason }
     }
-    runState.reportedFailure = false
-    runState.lastError = undefined
-    const output = presentOutput(execution.stdout.trim())
-    if (output === "") {
-      runState.lastOutcome = "empty"
-      runState.lastOutput = ""
-      return { outcome: "empty" }
-    }
-    runState.lastOutcome = "ok"
-    runState.lastOutput = output
-    notifications.push({
+    const rawOutput = execution.stdout.trim()
+    const output = presentOutput(rawOutput)
+    const outcome = output === "" ? "empty" : "ok"
+    const notification = output === "" ? undefined : {
       slug,
       coordinatorSessionId,
       homeDirectory,
-      message: `FirstMate (${slug}) watch ${watch.name}:\n${output}`,
+      message: boundedWatchText(`FirstMate (${slug}) watch ${watch.name}:\n${rawOutput}`),
       watchName: watch.name,
       source: watch.source,
-    })
-    // The captain hears a firing watch on the desktop too, with the same
-    // output capped to the host's limits. Best effort — like the emit
-    // route itself, a failed or rate-limited notification never fails
-    // the run.
-    const captain = captainWatchNotification(watch.name, "fired", output)
-    try {
-      await notifyCaptain({ fetcher, support: await resolveSupport(), title: captain.title, body: captain.body })
-    } catch {
-      // Best effort: never throws into the run.
     }
-    return { outcome: "ok" }
+    await store.recordRun(homeDirectory, key, { lastRunAt, lastOutcome: outcome, lastOutput: output, reportedFailure: false }, notification)
+    if (notification !== undefined) notifications.push(notification)
+    return { outcome }
   }
 
   async function listWatches(slug: string): Promise<WatchInfo[]> {
     const watches = await discoverWatches(slug)
     const enabledOverrides = await loadEnabledOverrides(slug)
+    const registration = (await loadRegistry(filesystem, homeRoot))[slug]
+    const storedRuns = registration === undefined ? {} : (await store.read(registration.homeDirectory)).runs
     const now = new Date(clock.nowMs())
     return watches.map((watch) => {
-      const runState = runStates.get(stateKey(slug, watch.source, watch.name))
+      const runState = storedRuns[watchRunKey(watch.source, watch.name)]
       const enabled = isEnabled(enabledOverrides, watch.source, watch.name)
       return {
         name: watch.name,
@@ -545,7 +542,26 @@ export function createWatchRunner(input: {
     }
   }
 
-  return { tick, runNow, listWatches, setEnabled, setSchedule, createWatch }
+  async function pendingNotifications(slug: string): Promise<{ notes: QueuedWatchNote[]; dropped: number }> {
+    const registration = (await loadRegistry(filesystem, homeRoot))[slug]
+    if (registration === undefined) return { notes: [], dropped: 0 }
+    const state = await store.read(registration.homeDirectory)
+    return { notes: state.pending, dropped: state.dropped }
+  }
+
+  async function acknowledgeNotifications(slug: string, ids: readonly string[], droppedCount?: number): Promise<void> {
+    const registration = (await loadRegistry(filesystem, homeRoot))[slug]
+    if (registration === undefined) return
+    await store.acknowledge(registration.homeDirectory, ids, droppedCount)
+  }
+
+  async function deliveredNotes(slug: string): Promise<QueuedWatchNote[]> {
+    const registration = (await loadRegistry(filesystem, homeRoot))[slug]
+    if (registration === undefined) return []
+    return (await store.read(registration.homeDirectory)).delivered
+  }
+
+  return { tick, runNow, pendingNotifications, acknowledgeNotifications, deliveredNotes, listWatches, setEnabled, setSchedule, createWatch }
 }
 
 type EnabledOverrides = Partial<Record<WatchSource, Record<string, unknown>>>
@@ -560,25 +576,16 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
 }
 
 // Latest log lines matter most: when output exceeds the cap, keep the tail
-// and say how much was dropped. Applies to the coordinator message and the
-// card's last output alike.
+// and say how much was dropped. The card uses this compact preview; queued
+// notes retain the fuller report under their separate 16,000-character cap.
 function presentOutput(text: string): string {
   if (text.length <= lastOutputMaxLength) return text
   const dropped = text.length - lastOutputMaxLength
   return `…[truncated ${dropped} chars]\n${text.slice(-lastOutputMaxLength)}`
 }
 
-// The desktop emit route carries only so much: the 500-character body limit
-// the firing notification has always honored, and a title cap that binds
-// only for absurdly long watch names (created names max out at 40 plus
-// ".sh"). Both captain notifications a watch produces — fired and failed —
-// go through this one helper, so neither can exceed the host's limits.
-const captainTitleMaxLength = 100
-const captainBodyMaxLength = 500
-
-function captainWatchNotification(watchName: string, event: "fired" | "failed", body: string): { title: string; body: string } {
-  return {
-    title: `FirstMate — ${watchName} ${event}`.slice(0, captainTitleMaxLength),
-    body: body.slice(0, captainBodyMaxLength),
-  }
+function boundedWatchText(text: string): string {
+  if (text.length <= watchNoteMaxLength) return text
+  const marker = "…[truncated]\n"
+  return `${marker}${text.slice(-(watchNoteMaxLength - marker.length))}`
 }

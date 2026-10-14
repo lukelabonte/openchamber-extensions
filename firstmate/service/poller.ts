@@ -94,7 +94,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 // what this process's rounds have observed.
 export interface SupervisionPoller {
   poll(): Promise<PollRound>
-  getBoardWorkers(slug: string, tasks: BacklogTask[]): BoardWorker[]
+  getBoardWorkers(slug: string, tasks: BacklogTask[], completedTaskIds?: ReadonlySet<string>): BoardWorker[]
   /** The project's supervision-health record; a fresh clone per call, the initial unknown record for a never-polled slug. */
   getSupervisionHealth(slug: string): SupervisionHealth
   getDeliveryError(slug: string): string | undefined
@@ -478,13 +478,13 @@ export function createSupervisionPoller(input: {
     })
   }
 
-  function getBoardWorkers(slug: string, tasks: BacklogTask[]): BoardWorker[] {
+  function getBoardWorkers(slug: string, tasks: BacklogTask[], completedTaskIds: ReadonlySet<string> = new Set(tasks.filter((task) => task.state === "Done" && task.id !== undefined).map((task) => task.id))): BoardWorker[] {
     return tasks.map((task) => {
       const observation = task.sessionId === undefined ? undefined : observations.get(observationKey(slug, task.sessionId))
       const error = task.sessionId === undefined ? undefined : pollErrors.get(observationKey(slug, task.sessionId))
       const merged: WorkerObservation | undefined =
         observation === undefined && error === undefined ? undefined : { ...(observation ?? { status: { activity: "unknown", outcome: null } }), ...(error !== undefined ? { error } : {}) }
-      return buildBoardWorker(task, merged)
+      return buildBoardWorker(task, merged, task.blockedBy === undefined || completedTaskIds.has(task.blockedBy))
     })
   }
 

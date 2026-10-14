@@ -32,7 +32,7 @@ beforeAll(async () => {
   mkdirSync(emptyPathDirectory)
   writeFileSync(
     path.join(shimDirectory, "openchamber"),
-    `#!/bin/sh\nprintf '%s\\n' "$*" >> "$FIRSTMATE_SHIM_LOG"\necho '{"sessionID":"ses_coord_1"}'\n`,
+    `#!${process.execPath}\nimport { appendFileSync } from "node:fs"\nappendFileSync(process.env.FIRSTMATE_SHIM_LOG, JSON.stringify(process.argv.slice(2)) + "\\n")\nconsole.log('{"sessionID":"ses_coord_1"}')\n`,
   )
   chmodSync(path.join(shimDirectory, "openchamber"), 0o755)
 
@@ -126,10 +126,11 @@ describe("POST /launch and the registry endpoints", () => {
     })
     expect(typeof registration.createdAt).toBe("string")
 
-    const shimCalls = readFileSync(shimLogPath, "utf8").trim().split("\n")
+    const shimCalls = readFileSync(shimLogPath, "utf8").trim().split("\n").map((line) => JSON.parse(line) as string[])
     expect(shimCalls).toHaveLength(1)
-    expect(shimCalls[0]).toContain(`session create --dir ${homeDirectory}`)
+    expect(shimCalls[0].slice(0, 4)).toEqual(["session", "create", "--dir", homeDirectory])
     expect(shimCalls[0]).not.toContain(projectDirectory)
+    expect(shimCalls[0][shimCalls[0].indexOf("--prompt") + 1]).toBe(readFileSync(path.join(homeDirectory, "opening.md"), "utf8"))
 
     const persisted = JSON.parse(readFileSync(path.join(tempHome, "registry.json"), "utf8")) as Record<string, unknown>
     expect(persisted[slug]).toEqual(registration)

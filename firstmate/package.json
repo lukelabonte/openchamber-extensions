@@ -21,6 +21,17 @@
     },
     "contributes": {
       "capabilities": ["sessions"],
+      "background": { "entry": "panel/background.html" },
+      "commands": [
+        { "name": "fm", "description": "Hand this request to this project's first mate" },
+        { "name": "fm-bearings", "description": "Request FirstMate bearings; add file to save a report" },
+        { "name": "fm-open", "description": "Open this project's first mate" }
+      ],
+      "actions": [
+        { "id": "firstmate-open", "label": "Open FirstMate", "where": "session", "mode": "background" },
+        { "id": "firstmate-bearings", "label": "FirstMate bearings", "where": "session", "mode": "background" },
+        { "id": "firstmate-handoff", "label": "Hand to FirstMate", "where": "message", "roles": ["user"], "mode": "background" }
+      ],
       "panel": {
         "id": "firstmate",
         "name": "FirstMate",
@@ -31,7 +42,7 @@
         "entry": "service/main.js",
         "runtime": "host",
         "permissions": {
-          "exec": ["openchamber", "git", "gh", "sh"]
+          "exec": ["openchamber", "git", "gh", "sh", "node"]
         }
       }
     }

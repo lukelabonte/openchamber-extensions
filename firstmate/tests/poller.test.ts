@@ -124,7 +124,8 @@ describe("createSupervisionPoller", () => {
 
     // Guard, in the style of the control-client argv tests: the first status
     // call must use the attested CLI form (scriptExec records the args array).
-    expect(calls[0]).toEqual(["session", "status", "--session", "ses_11bb", "--dir", projectDirectory, "--json"])
+    expect(calls[0]).toEqual(["session", "list", "--dir", projectDirectory, "--with-status", "--all", "--limit", "1000", "--json"])
+    expect(calls.find((args) => subcommand(args) === "status")).toEqual(["session", "status", "--session", "ses_11bb", "--dir", projectDirectory, "--json"])
     const statusCalls = calls.filter((args) => subcommand(args) === "status")
     expect(statusCalls).toHaveLength(2)
     expect(statusCalls.map((args) => sessionArg(args))).toEqual(["ses_11bb", "ses_22cc"])

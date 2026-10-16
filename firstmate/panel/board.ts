@@ -3,6 +3,7 @@
 // the panel only reshapes the payload for display and never execs anything.
 
 import { isReviewHead, isTaskActions, isTaskId, isTaskKind, type BacklogTaskAction, type BacklogTaskKind } from "../service/backlog"
+import { isMessageLinkIdentifier } from "../service/message-links"
 
 export type BoardWorkerState = "Queued" | "Working" | "Blocked" | "Parked" | "Done" | "Failed" | "Idle"
 
@@ -17,6 +18,7 @@ export interface BoardWorker {
   actions?: BacklogTaskAction[]
   blockedReason?: "question" | "permission"
   lastWord?: string
+  lastMessageId?: string
   prUrl?: string
   sessionId?: string
   worktree?: string
@@ -37,6 +39,7 @@ export interface BoardCard {
   actions?: BacklogTaskAction[]
   blockedReason?: "question" | "permission"
   lastWord?: string
+  lastMessageId?: string
   prUrl?: string
   /** True when the PR link is an http(s) URL the host can open. */
   prOpenable?: boolean
@@ -134,6 +137,7 @@ function parseBoardWorker(value: unknown): BoardWorker | undefined {
     ...taskFields,
     ...(blockedReason !== undefined ? { blockedReason: blockedReason as BoardWorker["blockedReason"] } : {}),
     ...(lastWord !== undefined ? { lastWord } : {}),
+    ...(isMessageLinkIdentifier(record.lastMessageId) ? { lastMessageId: record.lastMessageId } : {}),
     ...(prUrl !== undefined ? { prUrl } : {}),
     ...(sessionId !== undefined ? { sessionId } : {}),
     ...(worktree !== undefined ? { worktree } : {}),
@@ -168,6 +172,7 @@ export function toBoardCard(worker: BoardWorker): BoardCard {
   }
   const lastWord = optionalText(worker.lastWord)
   if (lastWord !== undefined) card.lastWord = lastWord
+  if (worker.lastMessageId !== undefined) card.lastMessageId = worker.lastMessageId
   const prUrl = worker.prUrl?.trim()
   if (prUrl !== undefined && prUrl !== "") {
     // A non-openable link stays on the card; the button renders disabled

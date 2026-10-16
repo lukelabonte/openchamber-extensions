@@ -2,6 +2,7 @@ import { connectHost } from "@openchamber/sdk"
 import { applyHostReady, mountBadge, type Tone } from "@openchamber/sdk/ui"
 import { parseBoardWorkers, parseSupervision, type BoardCard, type BoardColumn, type SupervisionHealth } from "./board"
 import { moveColumn, parseColumnOrder } from "./column-order"
+import { workerMessageLink } from "../service/message-links"
 import { parseShipping, shippingBadgeLabel, type LandingRow, type ShippingInfo } from "./shipping"
 import { parseSuggestions, type SuggestionRow } from "./suggestions"
 import { initialPanelState, reducePanelState, type Board, type PanelEvent, type PanelState, type RegistrationInfo } from "./state"
@@ -592,12 +593,13 @@ function button(label: string, action: () => void, disabled = false): HTMLButton
   return element
 }
 
-function labeledInput(label: string, value: string, change: (value: string) => void, disabled = false): HTMLElement {
+function labeledInput(label: string, value: string, change: (value: string) => void, disabled = false, placeholder = ""): HTMLElement {
   const field = document.createElement("label")
   field.className = "fm-field"
   const input = document.createElement("input")
   input.type = "text"
   input.value = value
+  input.placeholder = placeholder
   input.disabled = disabled
   input.setAttribute("aria-label", label)
   input.addEventListener("input", () => change(input.value))
@@ -632,7 +634,7 @@ function settingsSection(): HTMLElement {
   if (error !== undefined) section.append(warningCallout(error))
   const draft = settingsDraft
   if (draft !== undefined) {
-    section.append(mutedNote("Use full provider/model IDs (for example openai/gpt-example). Blank models use OpenChamber defaults; blank variants apply no override. Model and variant changes apply to new sessions. Refresh defaults to 30 seconds."))
+    section.append(mutedNote("Use full provider/model IDs (for example openai/gpt-example) and the provider's exact reasoning/variant IDs, not a fixed list of effort levels. Blank models use OpenChamber defaults; a blank coordinator variant uses the host default, while a blank worker variant leaves the choice to the first mate. Model and variant changes apply to new sessions. Refresh defaults to 30 seconds."))
     const fields = [
       ["Coordinator model", "coordinatorModel"], ["Coordinator variant", "coordinatorVariant"],
       ["Worker model", "workerModel"], ["Worker variant", "workerVariant"], ["Refresh seconds", "refreshSeconds"],
@@ -640,7 +642,8 @@ function settingsSection(): HTMLElement {
     const form = document.createElement("div")
     form.className = "fm-watch-editor"
     for (const [label, name] of fields) {
-      form.append(labeledInput(label, draft[name], (value) => { draft[name] = value; draft.dirty = true }, draft.pending))
+      const placeholder = name === "workerVariant" ? "Leave it to the first mate" : name === "coordinatorVariant" ? "OpenChamber default" : ""
+      form.append(labeledInput(label, draft[name], (value) => { draft[name] = value; draft.dirty = true }, draft.pending, placeholder))
     }
     form.append(button("Save settings", () => { void saveSettings(draft) }, draft.pending))
     if (draft.feedback !== undefined) form.append(mutedNote(draft.feedback))
@@ -1495,6 +1498,8 @@ function boardCard(card: BoardCard, workerContext = false): HTMLElement {
   if (isUnfinished(card.state) && card.possiblyStalledSince !== undefined) article.append(stallNote())
   if (card.branch !== undefined) article.append(branchMeta(card.branch, card.worktree))
   if (card.lastWord !== undefined) article.append(lastWordLine(card.lastWord))
+  const messageLink = messageLinkControl(card)
+  if (messageLink !== undefined) article.append(messageLink)
   if (card.prUrl !== undefined) article.append(prLink(card))
   if (workerContext) return article
   if (card.taskId !== undefined) article.append(decisionControls(card))
@@ -1504,6 +1509,27 @@ function boardCard(card: BoardCard, workerContext = false): HTMLElement {
     article.append(cardActions(card))
   }
   return article
+}
+
+function messageLinkControl(card: BoardCard): HTMLElement | undefined {
+  const link = workerMessageLink(card.sessionId, card.lastMessageId)
+  if (link === undefined) return undefined
+  const registration = activeRegistration
+  const row = document.createElement("div")
+  row.className = "fm-actions"
+  const feedback = document.createElement("span")
+  feedback.className = "fm-feedback"
+  const copy = button("Copy message link", () => {
+    if (typeof host.writeClipboard !== "function" || activeRegistration !== registration) return
+    void host.writeClipboard(link).then(() => {
+      if (activeRegistration === registration) feedback.textContent = "Message link copied. Paste in OpenChamber chat to open this exact message."
+    }).catch(() => {
+      if (activeRegistration === registration) feedback.textContent = "Copy failed."
+    })
+  }, typeof host.writeClipboard !== "function")
+  copy.title = `${link}\nThe SDK opens whole sessions only. This link targets the observed message in OpenChamber chat.`
+  row.append(copy, feedback)
+  return row
 }
 
 function messageDraft(key: string): MessageDraft {

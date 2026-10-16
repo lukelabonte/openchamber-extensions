@@ -23,6 +23,7 @@ export async function runPortScenario(name: string): Promise<Record<string, unkn
   let ready: (context: { directory: string; session?: { id: string } | null }) => void = () => {}
   let directoryChanged: (directory: string) => void = () => {}
   let sessionChanged: (session: { id: string } | null) => void = () => {}
+  let sessionsChanged: (snapshot: any) => void = () => {}
   const calls: Array<{ method: string; path: string; query?: Record<string, string>; body?: string }> = []
   const held = new Map<string, Array<(result: { status: number; body: string }) => void>>()
   const holds = new Set<string>()
@@ -34,7 +35,7 @@ export async function runPortScenario(name: string): Promise<Record<string, unkn
   const suggestionText = `<img src=x onerror=alert(1)> ${"full suggestion words ".repeat(30)}`
   const workers = [
     decision,
-    { title: "Worker A", state: "Working", sessionId: "ses-worker-a", worktree: "/trees/a", hold: "captain approval" },
+    { title: "Worker A", state: "Working", sessionId: "ses-worker-a", worktree: "/trees/a", hold: "captain approval", ...(name.startsWith("message-") && name !== "message-legacy" ? { lastWord: "The verified report", lastMessageId: "msg_report" } : {}) },
     { title: "Worker B", state: "Working", sessionId: "ses-worker-b", worktree: "/trees/b" },
   ]
   const auxiliaryPaths = ["/settings", "/upgrades", "/watchnotes"]
@@ -43,7 +44,7 @@ export async function runPortScenario(name: string): Promise<Record<string, unkn
     onDirectory: (callback: typeof directoryChanged) => { directoryChanged = callback; return () => {} },
     onSession: (callback: typeof sessionChanged) => { sessionChanged = callback; return () => {} },
     listProjects: async () => ({ projects: [{ id: "p-a", directory: "/repos/a" }, { id: "p-b", directory: "/repos/b" }] }),
-    onSessions: async () => () => {},
+    onSessions: async (_projectId: string, callback: typeof sessionsChanged) => { sessionsChanged = callback; return () => {} },
     openSession: async (sessionId: string) => { opened.push(sessionId) },
     openUrl: async () => {},
     writeClipboard: async (contents: string) => { copied.push(contents) },
@@ -145,6 +146,48 @@ export async function runPortScenario(name: string): Promise<Record<string, unkn
   let extra: Record<string, unknown> = {}
 
   switch (name) {
+    case "message-link": {
+      workerButton("Copy message link").click()
+      await flush()
+      extra = { copied, opened }
+      break
+    }
+    case "message-legacy":
+      extra = { hasMessageLink: findByText(workerCard(), "button", "Copy message link") !== null }
+      break
+    case "variant-labels": {
+      const workerDefault = field("Worker variant").placeholder
+      const coordinatorDefault = field("Coordinator variant").placeholder
+      button("Save settings").click()
+      await flush()
+      type("Worker variant", "provider:adaptive/extended")
+      type("Coordinator variant", "thinking/extended:custom")
+      button("Save settings").click()
+      await flush()
+      extra = { workerDefault, coordinatorDefault }
+      break
+    }
+    case "parent-refresh": {
+      const baseline = boardCalls()
+      for (const state of ["loading", "error"]) {
+        sessionsChanged({ state, sessions: [] })
+        fake.advanceClock(1000)
+        await flush()
+      }
+      const afterIncomplete = boardCalls()
+      const counts: number[] = []
+      for (const [parentId, directory] of [["ses-a", "/trees/a"], ["ses-other", "/trees/a"], ["ses-other", "/trees/moved"]]) {
+        sessionsChanged({ state: "ready", projectId: "p-a", coverage: [{ directory, state: "ready" }], sessions: [{ id: "ses-worker-a", parentId, directory, activity: "running" }] })
+        fake.advanceClock(1000)
+        await flush()
+        counts.push(boardCalls())
+      }
+      sessionsChanged({ state: "ready", sessions: [] })
+      fake.advanceClock(1000)
+      await flush()
+      extra = { baseline, afterIncomplete, counts, afterRemoval: boardCalls() }
+      break
+    }
     case "worker-steer-failure":
     case "worker-relaunch-failure": {
       const action = name.includes("-steer-") ? "steer" : "relaunch"

@@ -24,7 +24,7 @@ function validateSetting(name: string, value: unknown): void {
   if (value === "") return
   if (name.endsWith("Model")) {
     if (value.length > 200 || !/^[A-Za-z0-9_.-]+\/[^\s]+$/.test(value)) throw new Error(`${name} must be a provider/model id`)
-  } else if (!/^[A-Za-z0-9_.-]{1,80}$/.test(value)) {
+  } else if (value.length > 200 || value.trim() === "" || /[\u0000-\u001f\u007f-\u009f]/.test(value)) {
     throw new Error(`${name} must be a model variant id`)
   }
 }

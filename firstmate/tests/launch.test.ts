@@ -104,6 +104,35 @@ describe("launchFirstMate", () => {
     for (const flag of ["--prompt", "--model", "--variant"]) expect(fake.calls[0].args).not.toContain(flag)
   })
 
+  test.each(["provider:adaptive/extended", '推論 mode "深い" \\ route', "v".repeat(200), "default", "  provider:adaptive/extended  "])("passes the saved coordinator variant to the actual create path verbatim: %j", async (variant) => {
+    const filesystem = new InMemoryFileSystem()
+    const settingsPath = "/home/firstmate/projects/sunrise/settings.json"
+    filesystem.seedDirectory("/home/firstmate/projects/sunrise")
+    filesystem.seedFile(settingsPath, JSON.stringify({ projectDirectory, coordinatorVariant: variant, workerVariant: "worker:separate/variant", custom: true }))
+    const fake = fakeExec()
+
+    await launchFirstMate(makeInput({ filesystem: filesystem.port, exec: fake.exec }))
+
+    expect(fake.calls).toHaveLength(1)
+    expect(fake.calls[0].command).toBe("openchamber")
+    expect(fake.calls[0].args).toEqual(["session", "create", "--dir", "/home/firstmate/projects/sunrise", "--title", "FirstMate — sunrise", "--variant", variant, "--json"])
+    expect(JSON.parse(filesystem.fileContents(settingsPath))).toMatchObject({ coordinatorVariant: variant, workerVariant: "worker:separate/variant", custom: true })
+    expect(filesystem.fileContents("/home/firstmate/projects/sunrise/AGENTS.md")).toContain('Use variant "worker:separate/variant" for new workers')
+  })
+
+  test("a blank coordinator variant stays omitted when a worker variant is configured", async () => {
+    const filesystem = new InMemoryFileSystem()
+    filesystem.seedDirectory("/home/firstmate/projects/sunrise")
+    filesystem.seedFile("/home/firstmate/projects/sunrise/settings.json", JSON.stringify({ projectDirectory, coordinatorVariant: "", workerVariant: "default" }))
+    const fake = fakeExec()
+
+    await launchFirstMate(makeInput({ filesystem: filesystem.port, exec: fake.exec }))
+
+    expect(fake.calls).toHaveLength(1)
+    expect(fake.calls[0].args).not.toContain("--variant")
+    expect(filesystem.fileContents("/home/firstmate/projects/sunrise/AGENTS.md")).toContain('Use variant "default" for new workers')
+  })
+
   test("recomposes available home layers on adoption without extra CLI calls", async () => {
     const filesystem = new InMemoryFileSystem()
     const fake = fakeExec()

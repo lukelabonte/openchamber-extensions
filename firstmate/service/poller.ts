@@ -1,7 +1,7 @@
 import { loadBacklog, type BacklogTask } from "./backlog"
 import { loadArchivedSessionIds } from "./archive"
 import { buildBoardWorker, type BoardWorker, type WorkerObservation } from "./board"
-import { sessionLastAssistant, sessionStatus, type ExecRunner, type SessionActivity, type SessionLastAssistant, type SessionOutcome } from "./control-client"
+import { sessionLastAssistant, sessionList, sessionStatus, type ExecRunner, type SessionActivity, type SessionLastAssistant, type SessionListEntry, type SessionOutcome } from "./control-client"
 import { callDesktopProxy } from "./desktop-proxy"
 import type { FileSystemPort } from "./file-system"
 import type { HttpFetcher, InterruptSupport } from "./interrupt"
@@ -9,6 +9,8 @@ import { notifyCaptain } from "./notifications"
 import { setSessionPermissionAuto } from "./permissions"
 import { loadRegistry, type Registration } from "./registry"
 import { fetchSessionInfo, type SessionInfo } from "./session-observation"
+import { normalizeProjectDirectory } from "./slug"
+import { workerMessageLink } from "./message-links"
 
 export type WorkerEventKind = "finished" | "failed" | "waiting-question" | "waiting-permission" | "steered-answer"
 
@@ -16,6 +18,7 @@ export interface WorkerEvent {
   taskTitle: string
   sessionId: string
   kind: WorkerEventKind
+  messageId?: string
   /** The worker's new last word, for kind "steered-answer". */
   answer?: string
   /** The worker's own directory (its worktree when one is recorded) — the click context for the captain notification. */
@@ -225,6 +228,24 @@ export function createSupervisionPoller(input: {
     } catch {
       return events
     }
+    // This project's status snapshot is fresh each round. The list is bounded;
+    // an absent row is not evidence of absence, so individual reads fill gaps.
+    const activeSessionIds = new Set(backlog.tasks.flatMap((task) =>
+      task.sessionId === undefined || archivedSessionIds.has(task.sessionId) ? [] : [task.sessionId],
+    ))
+    const listedSessions = new Map<string, SessionListEntry | null>()
+    if (activeSessionIds.size > 1) {
+      try {
+        const sessions = await sessionList(exec, { directory: registration.projectDirectory, all: true, limit: 1000 })
+        for (const session of sessions) {
+          if (activeSessionIds.has(session.sessionId)) {
+            listedSessions.set(session.sessionId, listedSessions.has(session.sessionId) ? null : session)
+          }
+        }
+      } catch {
+        // Older hosts and malformed responses retain the individual path.
+      }
+    }
     // Health inputs for this project's round: every active worker's CLI
     // observation must succeed, and — when the desktop proxy is resolved —
     // every authoritative session-info read must come back well-shaped. A
@@ -258,7 +279,13 @@ export function createSupervisionPoller(input: {
             autoAcceptedSessions.add(task.sessionId)
           }
         }
-        const status = await sessionStatus(exec, { sessionId: task.sessionId, directory })
+        const listed = listedSessions.get(task.sessionId)
+        const listedDirectoryMatches = listed?.directory === undefined ||
+          normalizeProjectDirectory(listed.directory) === normalizeProjectDirectory(directory) ||
+          (task.worktreeDirectory !== undefined && normalizeProjectDirectory(listed.directory) === normalizeProjectDirectory(task.worktreeDirectory))
+        const status = listed !== undefined && listed !== null && listed.status.activity !== "unknown" && listedDirectoryMatches
+          ? listed.status
+          : await sessionStatus(exec, { sessionId: task.sessionId, directory })
         // One CLI call per worker per round: the richer extraction (id,
         // timestamps, full text) rides the same `--last-assistant` command
         // the plain text reader used, and lastWord stays the text.
@@ -317,6 +344,7 @@ export function createSupervisionPoller(input: {
             taskTitle: task.title,
             sessionId: task.sessionId,
             kind: "steered-answer",
+            ...(current.last?.text !== undefined ? { messageId: current.last.id } : {}),
             answer: current.lastWord,
           })
         }
@@ -358,6 +386,7 @@ export function createSupervisionPoller(input: {
         taskTitle: task.title,
         sessionId: task.sessionId as string,
         kind,
+        ...(current.last?.text !== undefined ? { messageId: current.last.id } : {}),
         // The worker's own directory (its worktree when recorded) rides the
         // event as the captain notification's click context.
         ...(task.worktreeDirectory !== undefined ? { directory: task.worktreeDirectory } : {}),
@@ -639,7 +668,10 @@ function initialSupervisionHealth(): SupervisionHealth {
 }
 
 function composeNotification(registration: Registration, events: WorkerEvent[]): ProjectNotification {
-  const lines = events.map((event) => `- "${event.taskTitle}" (${event.sessionId}): ${describeEvent(event)}`)
+  const lines = events.map((event) => {
+    const link = workerMessageLink(event.sessionId, event.messageId)
+    return `- "${event.taskTitle}" (${event.sessionId}): ${describeEvent(event)}${link === undefined ? "" : ` [Read worker message](${link})`}`
+  })
   return {
     slug: registration.slug,
     coordinatorSessionId: registration.coordinatorSessionId,

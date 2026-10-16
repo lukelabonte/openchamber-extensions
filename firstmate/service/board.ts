@@ -1,5 +1,6 @@
 import type { BacklogState, BacklogTask, BacklogTaskAction, BacklogTaskKind } from "./backlog"
 import type { SessionLastAssistant, SessionStatus } from "./control-client"
+import { workerMessageLink } from "./message-links"
 
 // Board-state mapping. The backlog entry's `state:` field is the
 // human/coordinator-owned record; the live session signals from polling only
@@ -63,6 +64,7 @@ export interface BoardWorker {
   blockedReason?: BlockedReason
   lastWord?: string
   prUrl?: string
+  lastMessageId?: string
   sessionId?: string
   worktree?: string
   branch?: string
@@ -114,6 +116,7 @@ export function buildBoardWorker(task: BacklogTask, observation?: WorkerObservat
   }
   const lastWord = observation?.lastWord
   if (lastWord !== undefined) worker.lastWord = truncateLastWord(lastWord)
+  if (observation?.last?.text !== undefined && workerMessageLink(task.sessionId, observation.last.id) !== undefined) worker.lastMessageId = observation.last.id
   if (observation?.error !== undefined) worker.lastPollError = observation.error
   if (observation?.possiblyStalledSince !== undefined) worker.possiblyStalledSince = observation.possiblyStalledSince
   return worker

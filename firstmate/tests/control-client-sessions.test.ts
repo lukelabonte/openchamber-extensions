@@ -47,6 +47,19 @@ describe("createSession", () => {
     expect(calls[0].args).toEqual(["session", "create", "--dir", "/home/project", "--title", "FirstMate", "--json"])
   })
 
+  test.each(["provider:adaptive/extended", '推論 mode "深い" \\ route', "v".repeat(200), "default", "  provider:adaptive/extended  "])("passes opaque provider variants as one unchanged CLI argument: %j", async (variant) => {
+    const { exec, calls } = fakeExec('{"sessionId":"ses_new"}')
+
+    expect(await createSession(exec, { directory: "/home/project", title: "FirstMate", variant })).toBe("ses_new")
+    expect(calls).toEqual([{ command: "openchamber", args: ["session", "create", "--dir", "/home/project", "--title", "FirstMate", "--variant", variant, "--json"] }])
+  })
+
+  test("propagates the CLI's unsupported provider-variant error", async () => {
+    const { exec, calls } = failingExec(new Error("model does not support variant provider:adaptive/extended"))
+    await expect(createSession(exec, { directory: "/home/project", title: "FirstMate", variant: "provider:adaptive/extended" })).rejects.toThrow("model does not support variant provider:adaptive/extended")
+    expect(calls[0].args).toContain("provider:adaptive/extended")
+  })
+
   test("refuses malformed and error-envelope create responses", async () => {
     for (const output of ["not JSON", "{}", '{"status":"error","sessionId":"ses_not_created"}']) {
       await expect(createSession(fakeExec(output).exec, { directory: "/home/project", title: "FirstMate" })).rejects.toThrow()
@@ -184,6 +197,62 @@ describe("sessionSend", () => {
 })
 
 describe("sessionList", () => {
+  test("parses the source-verified installed list status object independently of legacy activity fields", async () => {
+    // Installed @openchamber/web server/lib/openchamber-control/service.js:850-859
+    // emits status.type; bin/lib/commands-session.js:81 reads it. Source-verified, not a runtime capture.
+    const { exec } = fakeExec(JSON.stringify({ sessions: [
+      { id: "ses_busy", directory: "/home/project", status: { type: "busy" }, activity: "idle", sessionStatus: { type: "idle" } },
+      { id: "ses_idle", directory: "/home/project", status: { type: "idle" } },
+      { id: "ses_unknown", directory: "/home/project", status: { type: "unknown" } },
+    ] }))
+    expect(await sessionList(exec, { directory: "/home/project" })).toEqual([
+      { sessionId: "ses_busy", directory: "/home/project", status: { activity: "running", outcome: null } },
+      { sessionId: "ses_idle", directory: "/home/project", status: { activity: "idle", outcome: null } },
+      { sessionId: "ses_unknown", directory: "/home/project", status: { activity: "unknown", outcome: null } },
+    ])
+  })
+
+  test("unknown or malformed authoritative list statuses cannot fall through to legacy idle fields", async () => {
+    for (const status of [{ type: "unknown" }, { type: "future-activity" }, {}, { type: 42 }, null, [], 42, false]) {
+      const { exec } = fakeExec(JSON.stringify({ sessions: [{ id: "ses_a", status, activity: "idle", type: "idle", sessionStatus: { type: "idle" } }] }))
+      expect(await sessionList(exec, { directory: "/home/project" })).toEqual([
+        { sessionId: "ses_a", status: { activity: "unknown", outcome: null } },
+      ])
+    }
+  })
+
+  test("retains legacy activity formats in both list envelopes", async () => {
+    const entries = [
+      { id: "ses_nested", sessionStatus: { type: "busy" } },
+      { id: "ses_activity", activity: "retrying" },
+      { id: "ses_type", type: "waiting-question" },
+      { id: "ses_string", status: "idle" },
+      { id: "ses_envelope", status: "ok", activity: "waiting-permission" },
+    ]
+    for (const output of [entries, { status: "ok", sessions: entries }]) {
+      expect(await sessionList(fakeExec(JSON.stringify(output)).exec, { directory: "/home/project" })).toEqual([
+        { sessionId: "ses_nested", status: { activity: "running", outcome: null } },
+        { sessionId: "ses_activity", status: { activity: "retrying", outcome: null } },
+        { sessionId: "ses_type", status: { activity: "waiting-question", outcome: null } },
+        { sessionId: "ses_string", status: { activity: "idle", outcome: null } },
+        { sessionId: "ses_envelope", status: { activity: "waiting-permission", outcome: null } },
+      ])
+    }
+  })
+
+  test("passes an explicit bounded limit and rejects invalid limits before executing", async () => {
+    for (const limit of [1, 1000]) {
+      const { exec, calls } = fakeExec('{"sessions":[]}')
+      await sessionList(exec, { directory: "/home/project", all: true, limit })
+      expect(calls[0].args).toEqual(["session", "list", "--dir", "/home/project", "--with-status", "--all", "--limit", String(limit), "--json"])
+    }
+    for (const limit of [0, -1, 1.5, 1001, NaN, Infinity]) {
+      const { exec, calls } = fakeExec('{"sessions":[]}')
+      await expect(sessionList(exec, { directory: "/home/project", limit })).rejects.toThrow("limit")
+      expect(calls).toEqual([])
+    }
+  })
+
   test("exposes archive and directory evidence and supports including archived sessions", async () => {
     const { exec, calls } = fakeExec(JSON.stringify({ sessions: [
       { id: "ses_archived", directory: "/home/project", time: { archived: 42 }, sessionStatus: { type: "idle" } },

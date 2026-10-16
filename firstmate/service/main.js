@@ -45,6 +45,15 @@ async function sessionStatus(exec, input) {
 async function sessionLastAssistant(exec, input) {
   const output = await runControlCommand(exec, ["session", "messages", "--session", input.sessionId, "--dir", input.directory, "--last-assistant", "--json"]);
   const parsed = parseJsonOutput(output);
+  if (isRecord(parsed)) {
+    for (const key of ["sessionId", "sessionID"]) {
+      if (parsed[key] !== undefined && parsed[key] !== input.sessionId)
+        throw new Error("openchamber session messages returned a different session id");
+    }
+    const first = Array.isArray(parsed.messages) && isRecord(parsed.messages[0]) ? parsed.messages[0] : undefined;
+    if (first?.role !== undefined && first.role !== "assistant")
+      throw new Error("openchamber session messages returned a non-assistant message");
+  }
   return extractLastAssistant(parsed);
 }
 async function sessionSend(exec, input) {
@@ -58,9 +67,14 @@ async function sessionSend(exec, input) {
   }
 }
 async function sessionList(exec, input) {
+  if (input.limit !== undefined && (!Number.isInteger(input.limit) || input.limit < 1 || input.limit > 1000)) {
+    throw new Error("openchamber session list limit must be a positive integer no greater than 1000");
+  }
   const args = ["session", "list", "--dir", input.directory, "--with-status"];
   if (input.all === true)
     args.push("--all");
+  if (input.limit !== undefined)
+    args.push("--limit", String(input.limit));
   args.push("--json");
   const output = await runControlCommand(exec, args);
   const parsed = parseJsonOutput(output);
@@ -76,9 +90,10 @@ async function sessionList(exec, input) {
       throw new Error("openchamber session list returned an invalid session directory");
     }
     const archived = extractArchived(entry);
+    const activitySource = isRecord(entry) && "status" in entry && typeof entry.status !== "string" ? { sessionStatus: entry.status } : entry;
     sessions.push({
       sessionId,
-      status: { activity: extractActivity(entry), outcome: extractOutcome(entry) },
+      status: { activity: extractActivity(activitySource), outcome: extractOutcome(entry) },
       ...isRecord(entry) && typeof entry.directory === "string" ? { directory: entry.directory } : {},
       ...archived !== undefined ? { archived } : {}
     });
@@ -172,7 +187,7 @@ function extractLastAssistant(parsed) {
     return {};
   const first = Array.isArray(parsed.messages) && isRecord(parsed.messages[0]) ? parsed.messages[0] : undefined;
   const text = first !== undefined && typeof first.text === "string" && first.text !== "" ? first.text : ["text", "content", "message"].map((key) => parsed[key]).find((value) => typeof value === "string" && value !== "");
-  const id = first !== undefined && typeof first.id === "string" && first.id !== "" ? first.id : undefined;
+  const id = first !== undefined && typeof first.text === "string" && first.text !== "" && typeof first.id === "string" && first.id !== "" ? first.id : undefined;
   const createdAt = finiteTimestamp(first?.createdAt);
   const completedAt = finiteTimestamp(first?.completedAt);
   return {
@@ -505,7 +520,7 @@ function validateSetting(name, value) {
   if (name.endsWith("Model")) {
     if (value.length > 200 || !/^[A-Za-z0-9_.-]+\/[^\s]+$/.test(value))
       throw new Error(`${name} must be a provider/model id`);
-  } else if (!/^[A-Za-z0-9_.-]{1,80}$/.test(value)) {
+  } else if (value.length > 200 || value.trim() === "" || /[\u0000-\u001f\u007f-\u009f]/.test(value)) {
     throw new Error(`${name} must be a model variant id`);
   }
 }
@@ -1358,6 +1373,16 @@ async function persistCoordinator(input, context, registration) {
   await saveRegistry(input.filesystem, input.homeRoot, { ...context.registrations, [input.slug]: registration });
 }
 
+// service/message-links.ts
+function isMessageLinkIdentifier(value) {
+  return typeof value === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(value);
+}
+function workerMessageLink(sessionId, messageId) {
+  if (!isMessageLinkIdentifier(sessionId) || !isMessageLinkIdentifier(messageId))
+    return;
+  return `openchamber://session/${sessionId}?message=${messageId}`;
+}
+
 // service/board.ts
 var lastWordMaxLength = 280;
 function mapBoardState(input) {
@@ -1403,6 +1428,8 @@ function buildBoardWorker(task, observation, dependencyResolved = false) {
   const lastWord = observation?.lastWord;
   if (lastWord !== undefined)
     worker.lastWord = truncateLastWord(lastWord);
+  if (observation?.last?.text !== undefined && workerMessageLink(task.sessionId, observation.last.id) !== undefined)
+    worker.lastMessageId = observation.last.id;
   if (observation?.error !== undefined)
     worker.lastPollError = observation.error;
   if (observation?.possiblyStalledSince !== undefined)
@@ -1545,6 +1572,18 @@ ${sessionId}`;
     } catch {
       return events;
     }
+    const activeSessionIds = new Set(backlog.tasks.flatMap((task) => task.sessionId === undefined || archivedSessionIds.has(task.sessionId) ? [] : [task.sessionId]));
+    const listedSessions = new Map;
+    if (activeSessionIds.size > 1) {
+      try {
+        const sessions = await sessionList(exec, { directory: registration.projectDirectory, all: true, limit: 1000 });
+        for (const session of sessions) {
+          if (activeSessionIds.has(session.sessionId)) {
+            listedSessions.set(session.sessionId, listedSessions.has(session.sessionId) ? null : session);
+          }
+        }
+      } catch {}
+    }
     let workerObservationFailed = false;
     let infoDegradedReason;
     let infoUnavailableReason;
@@ -1569,7 +1608,9 @@ ${sessionId}`;
             autoAcceptedSessions.add(task.sessionId);
           }
         }
-        const status = await sessionStatus(exec, { sessionId: task.sessionId, directory });
+        const listed = listedSessions.get(task.sessionId);
+        const listedDirectoryMatches = listed?.directory === undefined || normalizeProjectDirectory(listed.directory) === normalizeProjectDirectory(directory) || task.worktreeDirectory !== undefined && normalizeProjectDirectory(listed.directory) === normalizeProjectDirectory(task.worktreeDirectory);
+        const status = listed !== undefined && listed !== null && listed.status.activity !== "unknown" && listedDirectoryMatches ? listed.status : await sessionStatus(exec, { sessionId: task.sessionId, directory });
         const last = await sessionLastAssistant(exec, { sessionId: task.sessionId, directory });
         const current = { status, ...last.text !== undefined ? { lastWord: last.text } : {}, last };
         const waiting = pending.kind === "ok" ? pendingActivity(pending.pending[task.sessionId]) : undefined;
@@ -1612,6 +1653,7 @@ ${sessionId}`;
             taskTitle: task.title,
             sessionId: task.sessionId,
             kind: "steered-answer",
+            ...current.last?.text !== undefined ? { messageId: current.last.id } : {},
             answer: current.lastWord
           });
         }
@@ -1641,6 +1683,7 @@ ${sessionId}`;
       taskTitle: task.title,
       sessionId: task.sessionId,
       kind,
+      ...current.last?.text !== undefined ? { messageId: current.last.id } : {},
       ...task.worktreeDirectory !== undefined ? { directory: task.worktreeDirectory } : {}
     });
     const activity = current.status.activity;
@@ -1797,7 +1840,10 @@ function initialSupervisionHealth() {
   };
 }
 function composeNotification(registration, events) {
-  const lines = events.map((event) => `- "${event.taskTitle}" (${event.sessionId}): ${describeEvent(event)}`);
+  const lines = events.map((event) => {
+    const link = workerMessageLink(event.sessionId, event.messageId);
+    return `- "${event.taskTitle}" (${event.sessionId}): ${describeEvent(event)}${link === undefined ? "" : ` [Read worker message](${link})`}`;
+  });
   return {
     slug: registration.slug,
     coordinatorSessionId: registration.coordinatorSessionId,

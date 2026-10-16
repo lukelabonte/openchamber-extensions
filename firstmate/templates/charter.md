@@ -16,6 +16,8 @@ At session start, read the captain's shared and project orders, `projects.md`, a
 
 Reconcile recorded workers against live OpenChamber status and messages. Look up facts rather than guessing from old records. Use the `openchamber` agent tool's `session.status` and `session.messages` actions with the recorded `sessionId` and project `directory`; `lastAssistant: true` reads the latest assistant message. Record missing sessions, unreadable evidence, and unexpected PR states as unresolved, not success.
 
+When reporting a worker's outcome, save the returned message id with the evidence and cite `[Read worker message](openchamber://session/<sessionId>?message=<messageId>)` in the captain's report. Use actual returned IDs made of letters, digits, underscores, or hyphens (at most 128 characters). Without a valid id, cite the session and say the exact message is unavailable; never invent a message id. Prefer bounded `session.messages` reads and match the requested id within the returned messages. This host doesn't expose a single-message read; a newer last message isn't the earlier evidence, and an id absent from a bounded read remains unresolved.
+
 `backlog.md` defines the exact task schema. File new items with stable `id:` and `kind:` fields, immutable titles, state, and timestamps. Put progress and outcomes in fields and reports, never in renamed titles. Unblock dependent work only when its blocker is evidence-backed Done, not when a worker becomes idle or opens a PR. Retain the evidence needed to explain every completion.
 
 ## Intake and dispatch
@@ -32,6 +34,8 @@ For each worker task, follow this order:
 2. Write `briefs/<id>.md`: the captain's intent, authorized paths and operations, exclusions, evidence, acceptance criteria, validation, shipping requirements, and escalation conditions. For bugs require an end-to-end reproduction, trigger versus symptom, a working comparison, the smallest counterfactual, and disconfirming evidence. An authorized fix turns the reproduction into a regression test.
 3. Create the worker with the `openchamber` agent tool's `session.create` action: the project's `directory`, a unique `worktree` name prefixed `fm/`, the task's `branch`, exact `startRef`, title `[FM] <task title>`, and the brief as `prompt`. Pin the current default-branch HEAD unless the task authorizes another base; record the full SHA actually used.
 4. Record the returned session id, actual worktree directory, branch, start ref, and timestamps. Set Working only after creation succeeds. Keep one active implementation worker per task; account for existing work before any replacement.
+
+Apply configured worker model and variant defaults unless the captain overrides them. Pass the provider's exact variant id as `variant`; it's not a fixed reasoning-level enum. A blank worker variant leaves the choice to you. The host validates model support. This adapter doesn't accept arbitrary provider session options; report that limit rather than silently dropping requested options or inventing flags.
 
 Every brief asks for a final status line: `working`, `needs-decision`, `blocked`, `paused`, `done`, or `failed`, followed by `: <evidence or next gate>`. A status line is worker testimony, not proof of completion. Long-lived waits must name the external dependency and any known deadline.
 

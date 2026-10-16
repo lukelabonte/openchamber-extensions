@@ -23,11 +23,23 @@ A handoff is a work request, not merge approval. The charter requires a durable 
 
 ## Settings and lifecycle
 
-The settings form stores coordinator and worker `provider/model` IDs, optional host model variants, and a board refresh interval from 5 to 3,600 seconds. Empty model and variant fields keep the host defaults. Coordinator selection applies to new sessions. Worker defaults become instructions for subsequent dispatches; unavailable model/variant combinations still fail at the host.
+The settings form stores coordinator and worker `provider/model` IDs, optional host model variants, and a board refresh interval from 5 to 3,600 seconds. Empty coordinator fields keep the host defaults. Empty worker fields leave selection to the first mate. Coordinator selection applies to new sessions. Worker defaults become instructions for subsequent dispatches; unavailable model/variant combinations still fail at the host.
+
+Variant IDs aren't limited to standard reasoning names. Provider-specific IDs such as `provider:adaptive/extended` pass through unchanged. Empty coordinator variants show “OpenChamber default”; empty worker variants show “Leave it to the first mate.” Those labels aren't saved as variant IDs. Arbitrary provider session options aren't supported by the OpenChamber adapter.
 
 **Adopt session** accepts an idle, unarchived session listed in this project's existing FirstMate home. **Release** forgets the coordinator without deleting its chat, workers, or worktrees. **Restart in fresh session** creates a new coordinator in the same home and reuses the backlog. The previous chat and existing workers remain intact. These operations refuse a busy or unknown coordinator.
 
 Compact, same-thread context reset, pinning, multi-machine dispatch, and a guaranteed host parent-child fleet aren't exposed by this port. An unrelated session isn't claimed as a worker because its title happens to start with `[FM]`.
+
+## Worker reads and message evidence
+
+Projects with multiple active workers use one bounded status-list request per supervision round. Omitted, unknown, ambiguous, or wrong-directory entries fall back to individual status reads. A partial list never means a worker was deleted or became idle. Worker messages and authoritative failure evidence still use separate reads.
+
+Worker updates include a link to the exact observed message when the host returns a usable message ID. Cards also offer **Copy message link**. Paste the link in OpenChamber chat to navigate to that message. **Open session** still opens the whole conversation; the extension SDK doesn't expose a message-specific open action. These links use OpenChamber's message-link handler and may not work on older hosts. A link isn't proof that the worker's claim is correct.
+
+The existing project-session subscription refreshes the board when parent or directory metadata changes, even if activity doesn't. The backlog still owns fleet membership. Moving a native parent doesn't silently adopt or drop a worker. There isn't an efficient single-message read in this adapter, so bounded history reads must match the requested message ID rather than substitute the latest reply.
+
+These changes address the portable parts of [upstream issue #37](https://github.com/gpambrozio/bb-plugins/issues/37), including its October 15 follow-up. No bb SDK upgrade or bb-specific event/option flags are needed.
 
 ## Durable watches and upgrades
 

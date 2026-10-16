@@ -35,4 +35,35 @@ describe("composeInstructions", () => {
     expect(composed).not.toContain("PROJECT CAPTAIN")
     expect(composed).toContain("skipped (missing)")
   })
+
+  test.each([
+    ["provider:adaptive/extended", '"provider:adaptive/extended"'],
+    ['推論 mode "深い" \\ route', '"推論 mode \\"深い\\" \\\\ route"'],
+    ["  provider:adaptive/extended  ", '"  provider:adaptive/extended  "'],
+    ["default", '"default"'],
+  ])("includes the configured worker variant as an exact JSON string: %j", async (variant, quotedVariant) => {
+    const filesystem = new InMemoryFileSystem()
+    filesystem.seedFile("/home/firstmate/projects/sunrise/settings.json", JSON.stringify({ workerVariant: variant }))
+
+    await composeInstructions({ filesystem: filesystem.port, homeRoot: "/home/firstmate", slug: "sunrise" })
+
+    const composed = filesystem.fileContents("/home/firstmate/projects/sunrise/AGENTS.md")
+    expect(composed).toContain("## Configured worker defaults")
+    expect(composed).toContain(`Use variant ${quotedVariant} for new workers (session.create variant; CLI --variant), unless the captain explicitly chooses another.`)
+  })
+
+  test("blank worker variants omit variant instructions without suppressing the worker model", async () => {
+    const filesystem = new InMemoryFileSystem()
+    const settingsPath = "/home/firstmate/projects/sunrise/settings.json"
+    filesystem.seedFile(settingsPath, JSON.stringify({ workerModel: "provider/worker", workerVariant: "" }))
+    const withModel = await composeInstructions({ filesystem: filesystem.port, homeRoot: "/home/firstmate", slug: "sunrise" })
+    expect(withModel).toContain('Use model "provider/worker" for new workers')
+    expect(withModel).not.toContain("Use variant")
+    expect(withModel).not.toContain("--variant")
+
+    filesystem.seedFile(settingsPath, JSON.stringify({ workerModel: "", workerVariant: "" }))
+    const withoutDefaults = await composeInstructions({ filesystem: filesystem.port, homeRoot: "/home/firstmate", slug: "sunrise" })
+    expect(withoutDefaults).not.toContain("Configured worker defaults")
+    expect(withoutDefaults).not.toContain("--variant")
+  })
 })

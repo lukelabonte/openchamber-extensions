@@ -66,6 +66,20 @@ describe("FirstMate charter workflows", () => {
     expect(charter).toContain("only with actual supporting evidence")
   })
 
+  test("cites returned message IDs and keeps reads within the host's supported message API", () => {
+    expect(charter).toContain("openchamber://session/<sessionId>?message=<messageId>")
+    expect(charter).toContain("returned message id")
+    expect(charter).toContain("bounded `session.messages` reads")
+    expect(charter).toContain("doesn't expose a single-message read")
+    expect(charter).toContain("never invent a message id")
+  })
+
+  test("keeps provider-specific variant IDs intact and names the unsupported session-option boundary", () => {
+    expect(charter).toContain("provider's exact variant id")
+    expect(charter).toContain("not a fixed reasoning-level enum")
+    expect(charter).toContain("doesn't accept arbitrary provider session options")
+  })
+
   test("states the host auto-accept boundary rather than promising a permission classifier", () => {
     expect(charter).toContain("Permission sensitivity belongs in every brief")
     expect(charter).toContain("auto-accept can approve every permission request")

@@ -74,6 +74,13 @@ export interface SessionLastAssistant {
 export async function sessionLastAssistant(exec: ExecRunner, input: { sessionId: string; directory: string }): Promise<SessionLastAssistant> {
   const output = await runControlCommand(exec, ["session", "messages", "--session", input.sessionId, "--dir", input.directory, "--last-assistant", "--json"])
   const parsed = parseJsonOutput(output)
+  if (isRecord(parsed)) {
+    for (const key of ["sessionId", "sessionID"]) {
+      if (parsed[key] !== undefined && parsed[key] !== input.sessionId) throw new Error("openchamber session messages returned a different session id")
+    }
+    const first = Array.isArray(parsed.messages) && isRecord(parsed.messages[0]) ? parsed.messages[0] : undefined
+    if (first?.role !== undefined && first.role !== "assistant") throw new Error("openchamber session messages returned a non-assistant message")
+  }
   return extractLastAssistant(parsed)
 }
 
@@ -92,9 +99,13 @@ export async function sessionSend(exec: ExecRunner, input: { sessionId: string; 
   }
 }
 
-export async function sessionList(exec: ExecRunner, input: { directory: string; all?: boolean }): Promise<SessionListEntry[]> {
+export async function sessionList(exec: ExecRunner, input: { directory: string; all?: boolean; limit?: number }): Promise<SessionListEntry[]> {
+  if (input.limit !== undefined && (!Number.isInteger(input.limit) || input.limit < 1 || input.limit > 1000)) {
+    throw new Error("openchamber session list limit must be a positive integer no greater than 1000")
+  }
   const args = ["session", "list", "--dir", input.directory, "--with-status"]
   if (input.all === true) args.push("--all")
+  if (input.limit !== undefined) args.push("--limit", String(input.limit))
   args.push("--json")
   const output = await runControlCommand(exec, args)
   const parsed = parseJsonOutput(output)
@@ -108,9 +119,15 @@ export async function sessionList(exec: ExecRunner, input: { directory: string; 
       throw new Error("openchamber session list returned an invalid session directory")
     }
     const archived = extractArchived(entry)
+    // Source-verified, not runtime-verified: installed @openchamber/web
+    // server/lib/openchamber-control/service.js:850-859 puts list activity in status.type.
+    // A present non-string status is authoritative, even when malformed.
+    const activitySource = isRecord(entry) && "status" in entry && typeof entry.status !== "string"
+      ? { sessionStatus: entry.status }
+      : entry
     sessions.push({
       sessionId,
-      status: { activity: extractActivity(entry), outcome: extractOutcome(entry) },
+      status: { activity: extractActivity(activitySource), outcome: extractOutcome(entry) },
       ...(isRecord(entry) && typeof entry.directory === "string" ? { directory: entry.directory } : {}),
       ...(archived !== undefined ? { archived } : {}),
     })
@@ -212,7 +229,7 @@ function extractLastAssistant(parsed: unknown): SessionLastAssistant {
     first !== undefined && typeof first.text === "string" && first.text !== ""
       ? first.text
       : (["text", "content", "message"] as const).map((key) => parsed[key]).find((value): value is string => typeof value === "string" && value !== "")
-  const id = first !== undefined && typeof first.id === "string" && first.id !== "" ? first.id : undefined
+  const id = first !== undefined && typeof first.text === "string" && first.text !== "" && typeof first.id === "string" && first.id !== "" ? first.id : undefined
   const createdAt = finiteTimestamp(first?.createdAt)
   const completedAt = finiteTimestamp(first?.completedAt)
   return {

@@ -27,6 +27,38 @@ if (probeScenario !== undefined) {
   }
 
   describe("FirstMate panel parity port", () => {
+    test("copies the precise worker message target without pretending the SDK can open it", async () => {
+      const result = await runScenario("message-link")
+      expect(result.copied).toEqual(["openchamber://session/ses-worker-a?message=msg_report"])
+      expect(result.opened).toEqual([])
+      expect(result.text).toContain("Message link copied")
+      expect(result.innerHtmlWrites).toBe(0)
+    })
+
+    test("legacy workers without observed message IDs don't get fabricated message targets", async () => {
+      expect((await runScenario("message-legacy")).hasMessageLink).toBe(false)
+    })
+
+    test("variant defaults have readable labels without changing provider-specific wire values", async () => {
+      const result = await runScenario("variant-labels")
+      expect(result.workerDefault).toBe("Leave it to the first mate")
+      expect(result.coordinatorDefault).toBe("OpenChamber default")
+      expect(result.posts[0].body.settings.workerVariant).toBe("")
+      expect(result.posts[0].body.settings.coordinatorVariant).toBe("")
+      expect(result.posts[1].body.settings.workerVariant).toBe("provider:adaptive/extended")
+      expect(result.posts[1].body.settings.coordinatorVariant).toBe("thinking/extended:custom")
+    })
+
+    test("parent and directory changes refresh the backlog-owned board even when activity is unchanged", async () => {
+      const result = await runScenario("parent-refresh")
+      expect(result.afterIncomplete).toBe(result.baseline)
+      expect(result.counts).toEqual([result.baseline + 1, result.baseline + 2, result.baseline + 3])
+      expect(result.afterRemoval).toBe(result.baseline + 4)
+      expect(result.text).toContain("Worker A")
+      expect(result.text).toContain("Worker B")
+      expect(result.posts).toEqual([])
+    })
+
     test("steer and relaunch drafts survive board and auxiliary renders and clear on project switch", async () => {
       const result = await runScenario("worker-action-drafts")
       expect(result.afterBoard).toEqual({ steer: "Keep this steer", relaunch: "Keep this relaunch" })

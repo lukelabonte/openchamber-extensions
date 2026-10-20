@@ -41,7 +41,7 @@ describe("dismissal text comparison", () => {
 })
 
 describe("persistent suggestion dismissals", () => {
-  test("persists a timestamped record before atomically removing the exact suggestion", async () => {
+  test("persists a timestamped record before removing the exact suggestion", async () => {
     const filesystem = new InMemoryFileSystem()
     const markdown = ["# Suggestions", "", `- ${target.label} :: ${target.text}`, "Human notes.", "- Keep :: another prompt", ""].join("\n")
     filesystem.seedFile(filePath, markdown)
@@ -115,6 +115,89 @@ describe("persistent suggestion dismissals", () => {
     expect(dismissed.size).toBe(50)
     expect(dismissed.has("prompt 0")).toBe(false)
     expect(dismissed.has("prompt 50")).toBe(true)
+  })
+
+  test.each([false, true])("retries a racing history append without losing records or CRLF prose (existing history: %s)", async (existingHistory) => {
+    const filesystem = new InMemoryFileSystem()
+    const records = Array.from({ length: 50 }, (_, index) => dismissalLine(`Label ${index}`, `prompt ${index}`))
+    const prose = "# Human heading\r\n\r\nA note.\r\n- {broken record}\r\n"
+    const original = existingHistory ? prose + records.join("\r\n") + "\r\n" : ""
+    if (existingHistory) filesystem.seedFile(dismissedPath, original)
+    const concurrent = `Edited human note.\r\n${dismissalLine("Other captain action", "another prompt")}\r\n`
+    filesystem.seedFile(filePath, `- ${target.label} :: ${target.text}\r\n- Keep :: wanted\r\n`)
+    let stageCount = 0
+    const racingPort: FileSystemPort = {
+      ...filesystem.port,
+      writeFile: async (path, contents) => {
+        await filesystem.port.writeFile(path, contents)
+        if (path.startsWith(`${dismissedPath}.`)) {
+          stageCount += 1
+          if (stageCount === 1) filesystem.seedFile(dismissedPath, original + concurrent)
+        }
+      },
+    }
+
+    await dismissSuggestion(racingPort, filePath, target, now)
+
+    const retained = existingHistory ? prose + records.slice(2).join("\r\n") + "\r\n" : ""
+    expect(filesystem.fileContents(dismissedPath)).toBe(`${retained}${concurrent}${dismissalLine(target.label, target.text)}\r\n`)
+    expect(parseDismissedSuggestions(filesystem.fileContents(dismissedPath)).size).toBe(existingHistory ? 50 : 2)
+    expect(filesystem.fileContents(filePath)).toBe("- Keep :: wanted\r\n")
+    expect(stageCount).toBe(2)
+    expect(filesystem.renames.map((entry) => entry.toPath)).toEqual([dismissedPath, filePath])
+  })
+
+  test("exhausted history retries preserve concurrent records and leave the suggestion untouched", async () => {
+    const filesystem = new InMemoryFileSystem()
+    const markdown = `- ${target.label} :: ${target.text}\r\n`
+    const prose = "Human notes.\r\n"
+    filesystem.seedFile(filePath, markdown)
+    filesystem.seedFile(dismissedPath, prose)
+    let stageCount = 0
+    const concurrentRecords: string[] = []
+    const racingPort: FileSystemPort = {
+      ...filesystem.port,
+      writeFile: async (path, contents) => {
+        await filesystem.port.writeFile(path, contents)
+        stageCount += 1
+        const record = dismissalLine(`Other ${stageCount}`, `other prompt ${stageCount}`)
+        concurrentRecords.push(record)
+        await filesystem.port.appendFile(dismissedPath, `${record}\r\n`)
+      },
+    }
+
+    await expect(dismissSuggestion(racingPort, filePath, target, now)).rejects.toThrow("after 3 conflicting edits")
+
+    expect(stageCount).toBe(3)
+    expect(filesystem.renames).toHaveLength(0)
+    expect(filesystem.fileContents(dismissedPath)).toBe(prose + concurrentRecords.join("\r\n") + "\r\n")
+    expect(filesystem.fileContents(filePath)).toBe(markdown)
+    expect(await loadSuggestions(filesystem.port, filePath)).toEqual([target])
+  })
+
+  test("exhausted removal retries retain durable dismissal and all intervening suggestion edits", async () => {
+    const filesystem = new InMemoryFileSystem()
+    const markdown = `- ${target.label} :: ${target.text}\r\n`
+    filesystem.seedFile(filePath, markdown)
+    let stageCount = 0
+    const racingPort: FileSystemPort = {
+      ...filesystem.port,
+      writeFile: async (path, contents) => {
+        await filesystem.port.writeFile(path, contents)
+        if (path.startsWith(`${filePath}.`)) {
+          stageCount += 1
+          filesystem.seedFile(filePath, `${markdown}Human edit ${stageCount}.\r\n`)
+        }
+      },
+    }
+
+    await expect(dismissSuggestion(racingPort, filePath, target, now)).rejects.toThrow("after 3 conflicting edits")
+
+    expect(stageCount).toBe(3)
+    expect(filesystem.fileContents(filePath)).toBe(`${markdown}Human edit 3.\r\n`)
+    expect(filesystem.fileContents(dismissedPath)).toBe(`${dismissalLine(target.label, target.text)}\n`)
+    expect(await loadSuggestions(filesystem.port, filePath)).toEqual([])
+    expect(filesystem.renames.map((entry) => entry.toPath)).toEqual([dismissedPath])
   })
 
   test("preserves a replacement prompt under the same label written before removal", async () => {

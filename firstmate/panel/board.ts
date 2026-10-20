@@ -4,6 +4,7 @@
 
 import { isReviewHead, isTaskActions, isTaskId, isTaskKind, type BacklogTaskAction, type BacklogTaskKind } from "../service/backlog"
 import { isMessageLinkIdentifier } from "../service/message-links"
+import { reportPullRequestUrl, workerReportStates, type WorkerReport } from "../service/worker-report"
 
 export type BoardWorkerState = "Queued" | "Working" | "Blocked" | "Parked" | "Done" | "Failed" | "Idle"
 
@@ -19,6 +20,8 @@ export interface BoardWorker {
   blockedReason?: "question" | "permission"
   lastWord?: string
   lastMessageId?: string
+  workerReport?: WorkerReport
+  reportPrUrl?: string
   prUrl?: string
   sessionId?: string
   worktree?: string
@@ -40,6 +43,8 @@ export interface BoardCard {
   blockedReason?: "question" | "permission"
   lastWord?: string
   lastMessageId?: string
+  workerReport?: WorkerReport
+  prSource?: "worker-report"
   prUrl?: string
   /** True when the PR link is an http(s) URL the host can open. */
   prOpenable?: boolean
@@ -131,6 +136,8 @@ function parseBoardWorker(value: unknown): BoardWorker | undefined {
     if (!isTaskActions(actions)) return undefined
     taskFields.actions = actions.map(({ label, text }) => ({ label, text }))
   }
+  const workerReport = parseReport(record.workerReport)
+  const reportPrUrl = typeof record.reportPrUrl === "string" && reportPullRequestUrl(record.reportPrUrl) === record.reportPrUrl ? record.reportPrUrl : undefined
   return {
     title,
     state: state as BoardWorkerState,
@@ -138,6 +145,8 @@ function parseBoardWorker(value: unknown): BoardWorker | undefined {
     ...(blockedReason !== undefined ? { blockedReason: blockedReason as BoardWorker["blockedReason"] } : {}),
     ...(lastWord !== undefined ? { lastWord } : {}),
     ...(isMessageLinkIdentifier(record.lastMessageId) ? { lastMessageId: record.lastMessageId } : {}),
+    ...(workerReport !== undefined ? { workerReport } : {}),
+    ...(workerReport !== undefined && reportPrUrl !== undefined ? { reportPrUrl } : {}),
     ...(prUrl !== undefined ? { prUrl } : {}),
     ...(sessionId !== undefined ? { sessionId } : {}),
     ...(worktree !== undefined ? { worktree } : {}),
@@ -147,6 +156,13 @@ function parseBoardWorker(value: unknown): BoardWorker | undefined {
     // rather than displayed as a number-shaped lie.
     ...(possiblyStalledSince !== undefined && hasFiniteDate(possiblyStalledSince) ? { possiblyStalledSince } : {}),
   }
+}
+
+function parseReport(value: unknown): WorkerReport | undefined {
+  if (typeof value !== "object" || value === null) return undefined
+  const report = value as Record<string, unknown>
+  if (typeof report.state !== "string" || !(workerReportStates as readonly string[]).includes(report.state) || typeof report.text !== "string") return undefined
+  return { state: report.state as WorkerReport["state"], text: report.text }
 }
 
 function hasFiniteDate(iso: string): boolean {
@@ -173,12 +189,14 @@ export function toBoardCard(worker: BoardWorker): BoardCard {
   const lastWord = optionalText(worker.lastWord)
   if (lastWord !== undefined) card.lastWord = lastWord
   if (worker.lastMessageId !== undefined) card.lastMessageId = worker.lastMessageId
-  const prUrl = worker.prUrl?.trim()
+  if (worker.workerReport !== undefined) card.workerReport = { ...worker.workerReport, text: truncate(worker.workerReport.text) }
+  const prUrl = worker.prUrl?.trim() || worker.reportPrUrl
   if (prUrl !== undefined && prUrl !== "") {
     // A non-openable link stays on the card; the button renders disabled
     // rather than the field disappearing silently.
     card.prUrl = prUrl
     if (isHttpUrl(prUrl)) card.prOpenable = true
+    if (!worker.prUrl?.trim() && worker.reportPrUrl !== undefined) card.prSource = "worker-report"
   }
   const warning = optionalText(worker.lastPollError)
   if (warning !== undefined) card.warning = warning

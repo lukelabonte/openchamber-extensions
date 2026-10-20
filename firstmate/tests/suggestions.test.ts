@@ -161,6 +161,28 @@ describe("sendSuggestion", () => {
     ])
   })
 
+  test.each([
+    "bump the CI timeout to 30 minutes",
+    "bump  the CI timeout to 20 minutes",
+  ])("preserves a same-label replacement authored while delivery is pending: %s", async (replacementText) => {
+    const filesystem = new InMemoryFileSystem()
+    const filePath = "/home/projects/sunrise/suggestions.md"
+    filesystem.seedFile(filePath, onDisk)
+    const sentTexts: string[] = []
+    let finishSend!: () => void
+    const pending = sendSuggestion(filesystem.port, filePath, target, async (text) => {
+      sentTexts.push(text)
+      await new Promise<void>((resolve) => { finishSend = resolve })
+    })
+    const replacement = `# Suggestions\r\n- ${target.label} :: ${replacementText}\r\n- Renamed :: ${target.text}\r\nHuman notes.\r\n`
+    filesystem.seedFile(filePath, replacement)
+    finishSend()
+
+    expect(await pending).toEqual({ sent: true })
+    expect(sentTexts).toEqual([target.text])
+    expect(filesystem.fileContents(filePath)).toBe(replacement)
+  })
+
   test("a failed removal after a successful send answers sent with a warning, never a retry claim", async () => {
     const filesystem = new InMemoryFileSystem()
     const filePath = "/home/projects/sunrise/suggestions.md"
@@ -187,6 +209,60 @@ describe("sendSuggestion", () => {
     expect(sendCount).toBe(1)
     // The line could not leave the file.
     expect(filesystem.fileContents(filePath)).toContain("Bump the CI timeout")
+  })
+
+  test.each([false, true])("preserves an edit after staging removal (replaced target: %s)", async (replaceTarget) => {
+    const filesystem = new InMemoryFileSystem()
+    const filePath = "/home/projects/sunrise/suggestions.md"
+    const original = `# Suggestions\r\n- ${target.label} :: ${target.text}\r\nHuman notes.\r\n`
+    const edited = `# Suggestions\r\n- ${target.label} :: ${replaceTarget ? "a new prompt" : target.text}\r\nHuman notes, edited.\r\n- Keep :: another prompt\r\n`
+    filesystem.seedFile(filePath, original)
+    let stageCount = 0
+    const racingPort: FileSystemPort = {
+      ...filesystem.port,
+      writeFile: async (path, contents) => {
+        await filesystem.port.writeFile(path, contents)
+        stageCount += 1
+        if (stageCount === 1) filesystem.seedFile(filePath, edited)
+      },
+    }
+    const sentTexts: string[] = []
+
+    const outcome = await sendSuggestion(racingPort, filePath, target, async (text) => { sentTexts.push(text) })
+
+    expect(outcome).toEqual({ sent: true })
+    expect(sentTexts).toEqual([target.text])
+    expect(filesystem.fileContents(filePath)).toBe(replaceTarget
+      ? edited
+      : "# Suggestions\r\nHuman notes, edited.\r\n- Keep :: another prompt\r\n")
+    expect(stageCount).toBe(replaceTarget ? 1 : 2)
+    expect(filesystem.renames).toHaveLength(replaceTarget ? 0 : 1)
+  })
+
+  test("exhausted edit retries preserve the latest file and warn without resending", async () => {
+    const filesystem = new InMemoryFileSystem()
+    const filePath = "/home/projects/sunrise/suggestions.md"
+    const original = `- ${target.label} :: ${target.text}\r\n`
+    filesystem.seedFile(filePath, original)
+    let stageCount = 0
+    let sendCount = 0
+    const racingPort: FileSystemPort = {
+      ...filesystem.port,
+      writeFile: async (path, contents) => {
+        await filesystem.port.writeFile(path, contents)
+        stageCount += 1
+        filesystem.seedFile(filePath, `${original}Human edit ${stageCount}.\r\n`)
+      },
+    }
+
+    const outcome = await sendSuggestion(racingPort, filePath, target, async () => { sendCount += 1 })
+
+    expect(outcome.sent).toBe(true)
+    expect(outcome.warning).toContain(filePath)
+    expect(sendCount).toBe(1)
+    expect(stageCount).toBe(3)
+    expect(filesystem.renames).toHaveLength(0)
+    expect(filesystem.fileContents(filePath)).toBe(`${original}Human edit 3.\r\n`)
   })
 })
 

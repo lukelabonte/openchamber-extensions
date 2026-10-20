@@ -27,6 +27,124 @@ if (probeScenario !== undefined) {
   }
 
   describe("FirstMate panel parity port", () => {
+    test.each(["shell-view", "shell-removal"])("worker commands are scoped and released on project change or card removal: %s", async (scenario) => {
+      const result = await runScenario(scenario)
+      expect(result.shellScopes).toEqual([{ kind: "session", sessionId: "ses-worker-a" }])
+      expect(result.shellReads).toEqual([{ id: "shell-own", options: { tailBytes: 16384 } }])
+      expect(result.workerText).toContain("bun test <literal>")
+      expect(result.workerText).toContain("<script>literal output</script>")
+      expect(result.workerText).toContain("Earlier output skipped")
+      expect(result.workerText).not.toContain("private unrelated command")
+      expect(result.shellUnsubscribes).toBe(1)
+      expect(result.settingsInputPreserved).toBe(true)
+      expect(result.text).not.toContain("stale private command")
+      expect(result.innerHtmlWrites).toBe(0)
+    })
+
+    test("closing reports are labeled as worker testimony and rendered as literal text", async () => {
+      const result = await runScenario("worker-report")
+      expect(result.workerText).toContain("Worker reported done: <script>worker testimony</script>")
+      expect(result.workerText).not.toContain("A long preamble")
+      expect(result.workerText).toContain("Idle")
+      expect(result.hasReportedPr).toBe(true)
+      expect(result.innerHtmlWrites).toBe(0)
+    })
+
+    test("an empty closing report explicitly says details weren't supplied", async () => {
+      expect((await runScenario("worker-report-empty")).workerText).toContain("Worker reported done: No details supplied.")
+    })
+
+    test("failed later board reads keep stale cards and their controls, then recover", async () => {
+      const result = await runScenario("board-last-good")
+      expect(result.staleText).toContain("Worker A")
+      expect(result.staleText).toContain("Board is stale")
+      expect(result.staleText).toContain("Reading the board failed (status 500)")
+      expect(result.staleRefresh).toContain("Refresh failed")
+      expect(result.interruptDisabled).toBe(false)
+      expect(result.workerText).toContain("Board is stale")
+      expect(result.workerText).toContain("Worker A")
+      expect(result.text).not.toContain("Board is stale")
+    })
+
+    test.each(["success", "failure", "reject", "malformed"])("an older board %s cannot overwrite a newer board result or freshness verdict", async (outcome) => {
+      const result = await runScenario(`board-old-${outcome}`)
+      expect(result.text).toContain("Newest worker")
+      expect(result.text).not.toContain("Old worker")
+      expect(result.text).not.toContain("Board is stale")
+      expect(result.refresh).toBe(result.labelBeforeOld)
+      expect(result.refresh).toBe("Refreshed 1m ago")
+    })
+
+    test("a newer board failure cannot be hidden by an older successful refresh", async () => {
+      const result = await runScenario("board-new-failure")
+      expect(result.text).toContain("Worker A")
+      expect(result.text).toContain("Board is stale")
+      expect(result.text).not.toContain("Old worker")
+      expect(result.refresh).toContain("Refresh failed")
+      expect(result.refresh).toContain("1m ago")
+    })
+
+    test("a superseded initial read never claims freshness or stays stuck refreshing after settlement", async () => {
+      const result = await runScenario("board-initial-superseded")
+      expect(result.supersededText).toContain("Newest worker")
+      expect(result.supersededText).not.toContain("Old worker")
+      expect(result.supersededRefresh).toBe("Not refreshed yet")
+      expect(result.refresh).toBe("Refreshed just now")
+    })
+
+    test("a delayed aggregate verdict cannot mark an earlier board read fresh after a newer failure", async () => {
+      const result = await runScenario("board-delayed-verdict")
+      expect(result.text).toContain("Worker A")
+      expect(result.text).toContain("Board is stale")
+      expect(result.refresh).toContain("Refresh failed")
+      expect(result.refresh).toContain("1m ago")
+    })
+
+    test.each(["bearings", "bearings-file", "ahoy"])("%s commands synchronously guard repeated and competing captain sends across renders", async (command) => {
+      const result = await runScenario(`command-pending-${command}`)
+      expect(result.whilePendingPosts).toHaveLength(1)
+      expect(result.whilePendingPosts[0]).toEqual({ path: "/command", body: { slug: "proj-a", command } })
+      expect(result.pendingDisabled).toEqual([true, true, true, true])
+      expect(result.noteDisabled).toBe(true)
+      expect(result.decisionDraft).toBe("Keep the decision draft")
+      expect(result.noteDraft).toBe("Keep the note draft")
+      expect(result.retryEnabled).toBe(true)
+      expect(result.posts).toHaveLength(2)
+    })
+
+    test.each(["http", "malformed", "unsent", "throw", "reject"])("command %s failures are visible, survive refresh, and release the send gate", async (failure) => {
+      const result = await runScenario(`command-failure-${failure}`)
+      expect(result.failureText).toContain(failure === "http" ? "coordinator unavailable" : failure === "throw" || failure === "reject" ? "bridge failed" : "malformed delivery answer")
+      expect(result.failureText).not.toContain("Requested")
+      expect(result.retryEnabled).toBe(true)
+      expect(result.posts).toHaveLength(2)
+    })
+
+    test.each(["suggestion", "decision", "note"])("a pending %s also guards report commands without losing drafts", async (source) => {
+      const result = await runScenario(`captain-gate-${source}`)
+      expect(result.pendingPosts).toHaveLength(1)
+      expect(result.reportDisabled).toBe(true)
+      expect(result.posts).toHaveLength(2)
+      expect(result.posts[1].path).toBe("/command")
+    })
+
+    test("a stale command response cannot publish feedback or unlock the next project's send", async () => {
+      const result = await runScenario("command-stale")
+      expect(result.afterStaleText).not.toContain("old command error")
+      expect(result.afterStaleDisabled).toBe(true)
+      expect(result.posts.map((post: any) => post.body.slug)).toEqual(["proj-a", "proj-b"])
+      expect(result.retryEnabled).toBe(true)
+    })
+
+    test("suggestion sends remain guarded and independent by registration when an old send settles", async () => {
+      const result = await runScenario("suggestion-stale-gate")
+      expect(result.pendingPosts.map((post: any) => post.body.slug)).toEqual(["proj-a", "proj-b"])
+      expect(result.afterOldDisabled).toBe(true)
+      expect(result.readsAfterOld).toBe(result.readsBeforeOld)
+      expect(result.retryEnabled).toBe(true)
+      expect(result.text).not.toContain("old suggestion error")
+    })
+
     test("copies the precise worker message target without pretending the SDK can open it", async () => {
       const result = await runScenario("message-link")
       expect(result.copied).toEqual(["openchamber://session/ses-worker-a?message=msg_report"])

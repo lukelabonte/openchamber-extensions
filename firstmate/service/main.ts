@@ -1091,8 +1091,8 @@ async function handleSuggestions(url: URL, response: ServerResponse): Promise<vo
 // refused with 409 instead of double-sending or racing the file rewrite.
 // Projects are independent, the map entry lives only for the action's flight,
 // and the guard only serializes this service's own actions — an external
-// writer (the coordinator) can still rewrite suggestions.md between the
-// service's read and its write, and no internal lock removes that race.
+// writer (the coordinator) can still race suggestions.md's final content
+// check and rename, despite the bounded edit-preserving rewrite checks.
 const busySuggestionProjects = new Set<string>()
 
 function acquireSuggestionProject(slug: string): boolean {

@@ -26,16 +26,22 @@ export async function runPortScenario(name: string): Promise<Record<string, unkn
   let sessionsChanged: (snapshot: any) => void = () => {}
   const calls: Array<{ method: string; path: string; query?: Record<string, string>; body?: string }> = []
   const held = new Map<string, Array<(result: { status: number; body: string }) => void>>()
+  const rejected = new Map<string, Array<(error: Error) => void>>()
+  let commandFailure: string | undefined
   const holds = new Set<string>()
   const failures = new Set<string>()
   const opened: string[] = []
   const copied: string[] = []
+  const shellScopes: Array<{ kind: string; sessionId: string }> = []
+  const shellReads: Array<{ id: string; options: unknown }> = []
+  let shellUnsubscribes = 0
+  let shellSnapshot: (snapshot: unknown) => void = () => {}
   let settings = { ...defaultSettings }
   let registration: typeof registrationA | null = registrationA
   const suggestionText = `<img src=x onerror=alert(1)> ${"full suggestion words ".repeat(30)}`
   const workers = [
     decision,
-    { title: "Worker A", state: "Working", sessionId: "ses-worker-a", worktree: "/trees/a", hold: "captain approval", ...(name.startsWith("message-") && name !== "message-legacy" ? { lastWord: "The verified report", lastMessageId: "msg_report" } : {}) },
+    { title: "Worker A", state: name.startsWith("worker-report") ? "Idle" : "Working", sessionId: "ses-worker-a", worktree: "/trees/a", hold: "captain approval", ...(name.startsWith("worker-report") ? { lastWord: "A long preamble", workerReport: { state: "done", text: name === "worker-report-empty" ? "" : "<script>worker testimony</script>" }, reportPrUrl: "https://github.com/example/repo/pull/42" } : {}), ...(name.startsWith("message-") && name !== "message-legacy" ? { lastWord: "The verified report", lastMessageId: "msg_report" } : {}) },
     { title: "Worker B", state: "Working", sessionId: "ses-worker-b", worktree: "/trees/b" },
   ]
   const auxiliaryPaths = ["/settings", "/upgrades", "/watchnotes"]
@@ -48,14 +54,37 @@ export async function runPortScenario(name: string): Promise<Record<string, unkn
     openSession: async (sessionId: string) => { opened.push(sessionId) },
     openUrl: async () => {},
     writeClipboard: async (contents: string) => { copied.push(contents) },
+    onRunningShells: name.startsWith("shell-") ? async (scope: { kind: string; sessionId: string }, listener: (snapshot: unknown) => void) => {
+      shellScopes.push(scope)
+      shellSnapshot = listener
+      listener({ kind: "shells", scope, shells: [
+        { id: "shell-own", sessionID: scope.sessionId, command: "bun test <literal>", startedAt: 1, background: false },
+        { id: "shell-foreign", sessionID: "unrelated-session", command: "private unrelated command", startedAt: 1, background: false },
+      ], ended: [] })
+      return () => { shellUnsubscribes += 1 }
+    } : undefined,
+    readShellOutput: name.startsWith("shell-") ? async (id: string, options: unknown) => {
+      shellReads.push({ id, options })
+      return { output: "<script>literal output</script>", cursor: 100, skipped: true }
+    } : undefined,
     serviceRequest: async (request: typeof calls[number]): Promise<{ status: number; body: string }> => {
       calls.push(request)
       const key = `${request.path}:${request.query?.slug ?? ""}`
-      if (holds.has(key)) return new Promise((resolve) => { held.set(key, [...(held.get(key) ?? []), resolve]) })
+      if (commandFailure === "reject" && request.path === "/command") throw new Error("bridge failed")
+      if (holds.has(key)) return new Promise((resolve, reject) => {
+        held.set(key, [...(held.get(key) ?? []), resolve])
+        rejected.set(key, [...(rejected.get(key) ?? []), reject])
+      })
       if (failures.has(request.path)) return { status: 500, body: "" }
       const answer = (body: unknown) => ({ status: 200, body: JSON.stringify(body) })
       if (request.method === "POST") {
         const body = JSON.parse(request.body ?? "{}")
+        if (request.path === "/command") {
+          if (commandFailure === "http") return { status: 409, body: JSON.stringify({ error: "coordinator unavailable" }) }
+          if (commandFailure === "malformed") return { status: 200, body: "not JSON" }
+          if (commandFailure === "unsent") return answer({ sent: false })
+          return answer({ sent: true })
+        }
         if (request.path === "/launch") { registration = registrationA; return answer(registration) }
         if (request.path === "/settings") { settings = body.settings; return answer({ settings }) }
         if (request.path === "/coordinator/restart") {
@@ -86,6 +115,14 @@ export async function runPortScenario(name: string): Promise<Record<string, unkn
       })
       return { status: 404, body: "" }
     },
+  }
+  const serviceRequest = host.serviceRequest
+  host.serviceRequest = (request) => {
+    if (commandFailure === "throw" && request.path === "/command") {
+      calls.push(request)
+      throw new Error("bridge failed")
+    }
+    return serviceRequest(request)
   }
   mock.module("@openchamber/sdk", () => ({ connectHost: () => host }))
   mock.module("@openchamber/sdk/ui", () => ({ applyHostReady: () => {}, mountBadge: (element: FakeElement, options: { label: string }) => { element.textContent = options.label } }))
@@ -141,11 +178,219 @@ export async function runPortScenario(name: string): Promise<Record<string, unkn
   }
   if (name === "stale-settings") holds.add("/settings:proj-a")
   if (name === "stale-lookup") holds.add("/lookup:")
+  if (name === "board-initial-superseded") holds.add("/board:proj-a")
   ready({ directory: name === "worker" ? "/trees/a" : name === "home-release" ? "/home/a" : "/repos/a", session: name === "worker" ? { id: "ses-worker-a" } : null })
   await flush()
   let extra: Record<string, unknown> = {}
 
   switch (name) {
+    case "shell-view":
+    case "shell-removal": {
+      const settingsInput = field("Coordinator model")
+      workerButton("Show commands").click()
+      await flush()
+      workerButton("Read output").click()
+      await flush()
+      const workerText = collectText(workerCard())
+      const settingsInputPreserved = settingsInput === field("Coordinator model")
+      if (name === "shell-removal") {
+        workers.splice(workers.findIndex((worker) => worker.title === "Worker A"), 1)
+        await refresh()
+      } else {
+        directoryChanged("/repos/b")
+        await flush()
+      }
+      shellSnapshot({ kind: "shells", scope: { kind: "session", sessionId: "ses-worker-a" }, shells: [{ id: "stale", sessionID: "ses-worker-a", command: "stale private command", startedAt: 1, background: false }], ended: [] })
+      await flush()
+      extra = { workerText, shellScopes, shellReads, shellUnsubscribes, settingsInputPreserved }
+      break
+    }
+    case "worker-report":
+    case "worker-report-empty":
+      extra = { workerText: collectText(workerCard()), hasReportedPr: findByText(workerCard(), "button", "Open worker-reported PR") !== null }
+      break
+    case "board-initial-superseded": {
+      holds.delete("/board:proj-a")
+      workers.splice(0, workers.length, { title: "Newest worker", state: "Working", sessionId: "ses-newest", worktree: "/trees/newest" })
+      sessionsChanged({ state: "ready", sessions: [] })
+      fake.advanceClock(1_000)
+      await flush()
+      release("/board:proj-a", { workers: [{ title: "Old worker", state: "Working" }] })
+      await flush()
+      const supersededText = collectText(fake.root)
+      const supersededRefresh = fake.querySelector("button.fm-refresh")?.textContent
+      await refresh()
+      extra = { supersededText, supersededRefresh }
+      break
+    }
+    case "board-delayed-verdict": {
+      fake.advanceClock(60_000)
+      await flush()
+      holds.add("/watches:proj-a")
+      fake.querySelector("button.fm-refresh")!.click()
+      await flush()
+      failures.add("/board")
+      sessionsChanged({ state: "ready", sessions: [] })
+      fake.advanceClock(1_000)
+      await flush()
+      release("/watches:proj-a", { watches: [] })
+      await flush()
+      break
+    }
+    case "board-last-good": {
+      failures.add("/board")
+      await refresh()
+      const staleText = collectText(fake.root)
+      const staleRefresh = fake.querySelector("button.fm-refresh")?.textContent
+      const interruptDisabled = workerButton("Interrupt").disabled
+      sessionChanged({ id: "ses-worker-a" })
+      const workerText = collectText(fake.root)
+      sessionChanged(null)
+      failures.delete("/board")
+      await refresh()
+      extra = { staleText, staleRefresh, interruptDisabled, workerText }
+      break
+    }
+    case "board-old-success":
+    case "board-old-failure":
+    case "board-old-reject":
+    case "board-old-malformed":
+    case "board-new-failure": {
+      fake.advanceClock(60_000)
+      await flush()
+      const labelBeforeOld = fake.querySelector("button.fm-refresh")?.textContent
+      holds.add("/board:proj-a")
+      fake.querySelector("button.fm-refresh")!.click()
+      await flush()
+      holds.delete("/board:proj-a")
+      if (name === "board-new-failure") failures.add("/board")
+      workers.splice(0, workers.length, { title: "Newest worker", state: "Working", sessionId: "ses-newest", worktree: "/trees/newest" })
+      sessionsChanged({ state: "ready", sessions: [] })
+      fake.advanceClock(1_000)
+      await flush()
+      if (name === "board-old-reject") rejected.get("/board:proj-a")!.shift()!(new Error("old rejection"))
+      else held.get("/board:proj-a")!.shift()!({
+        status: name === "board-old-failure" ? 500 : 200,
+        body: name === "board-old-malformed" ? "not JSON" : JSON.stringify({ workers: [{ title: "Old worker", state: "Working" }] }),
+      })
+      await flush()
+      extra = { labelBeforeOld }
+      break
+    }
+    case "command-pending-bearings":
+    case "command-pending-bearings-file":
+    case "command-pending-ahoy": {
+      type("Answer for decision-1", "Keep the decision draft")
+      if (name.endsWith("bearings-file")) field("Write the bearings report to a dated file").checked = true
+      holds.add("/command:")
+      const commandButton = button(name.endsWith("ahoy") ? "Catch me up" : "Status report")
+      commandButton.click()
+      commandButton.click()
+      button("Catch me up").click()
+      field("Send Long suggestion").click()
+      button("Proceed").click()
+      await refresh()
+      const pendingDisabled = [button("Status report").disabled, button("Catch me up").disabled, field("Send Long suggestion").disabled, button("Proceed").disabled]
+      const decisionDraft = field("Answer for decision-1").value
+      sessionChanged({ id: "ses-worker-a" })
+      type("Note for first mate", "Keep the note draft")
+      const noteDisabled = button("Send note to first mate").disabled
+      button("Send note to first mate").click()
+      const noteDraft = field("Note for first mate").value
+      sessionChanged(null)
+      const whilePendingPosts = posts()
+      release("/command:", { sent: true })
+      await flush()
+      const retryEnabled = !button("Status report").disabled
+      button("Status report").click()
+      await flush()
+      extra = { whilePendingPosts, pendingDisabled, decisionDraft, noteDisabled, noteDraft, retryEnabled }
+      break
+    }
+    case "command-failure-http":
+    case "command-failure-malformed":
+    case "command-failure-unsent":
+    case "command-failure-throw":
+    case "command-failure-reject": {
+      commandFailure = name.slice("command-failure-".length)
+      button("Status report").click()
+      await flush()
+      await refresh()
+      const failureText = collectText(fake.root)
+      const retryEnabled = !button("Status report").disabled
+      commandFailure = undefined
+      button("Status report").click()
+      await flush()
+      extra = { failureText, retryEnabled }
+      break
+    }
+    case "captain-gate-suggestion":
+    case "captain-gate-decision":
+    case "captain-gate-note": {
+      const source = name.slice("captain-gate-".length)
+      const path = source === "suggestion" ? "/suggestion/send:" : source === "decision" ? "/decision:" : "/handoff:"
+      holds.add(path)
+      if (source === "suggestion") field("Send Long suggestion").click()
+      else if (source === "decision") { type("Answer for decision-1", "Keep answer"); button("Answer").click() }
+      else {
+        sessionChanged({ id: "ses-worker-a" })
+        type("Note for first mate", "Keep note")
+        button("Send note to first mate").click()
+        sessionChanged(null)
+      }
+      const reportDisabled = button("Status report").disabled
+      button("Status report").click()
+      field("Send Long suggestion").click()
+      button("Proceed").click()
+      await flush()
+      const pendingPosts = posts()
+      release(path, { sent: true })
+      await flush()
+      button("Status report").click()
+      await flush()
+      extra = { pendingPosts, reportDisabled }
+      break
+    }
+    case "suggestion-stale-gate": {
+      holds.add("/suggestion/send:")
+      field("Send Long suggestion").click()
+      await flush()
+      directoryChanged("/repos/b")
+      await flush()
+      field("Send Long suggestion").click()
+      await flush()
+      const readsBeforeOld = calls.filter((call) => call.path === "/suggestions").length
+      held.get("/suggestion/send:")!.shift()!({ status: 409, body: JSON.stringify({ error: "old suggestion error" }) })
+      await flush()
+      const readsAfterOld = calls.filter((call) => call.path === "/suggestions").length
+      const afterOldDisabled = field("Send Long suggestion").disabled
+      field("Send Long suggestion").click()
+      button("Status report").click()
+      const pendingPosts = posts()
+      release("/suggestion/send:", { sent: true })
+      await flush()
+      const retryEnabled = !button("Status report").disabled
+      extra = { pendingPosts, afterOldDisabled, readsBeforeOld, readsAfterOld, retryEnabled }
+      break
+    }
+    case "command-stale": {
+      holds.add("/command:")
+      button("Status report").click()
+      await flush()
+      directoryChanged("/repos/b")
+      await flush()
+      button("Catch me up").click()
+      await flush()
+      held.get("/command:")!.shift()!({ status: 409, body: JSON.stringify({ error: "old command error" }) })
+      await flush()
+      const afterStaleText = collectText(fake.root)
+      const afterStaleDisabled = button("Status report").disabled
+      button("Status report").click()
+      release("/command:", { sent: true })
+      await flush()
+      extra = { afterStaleText, afterStaleDisabled, retryEnabled: !button("Status report").disabled }
+      break
+    }
     case "message-link": {
       workerButton("Copy message link").click()
       await flush()

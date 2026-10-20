@@ -101,22 +101,22 @@ export async function dismissSuggestion(
   const dismissedPath = suggestionDismissalsPath(filePath)
   // A failed read must propagate: replacing unreadable history with an empty
   // one could resurrect old prompts. Parent actions are serialized per project.
-  const markdown = await filesystem.exists(dismissedPath) ? await filesystem.readFile(dismissedPath) : ""
-  const lineEnding = markdown.includes("\r\n") ? "\r\n" : "\n"
-  const appended = `${markdown}${markdown === "" || markdown.endsWith("\n") ? "" : lineEnding}${record}${lineEnding}`
-  const entries = parseDismissalLines(appended)
-  const expiredLines = new Set(entries.slice(0, Math.max(0, entries.length - dismissalHistoryLimit)).map((entry) => entry.lineIndex))
-  const history = appended.split("\n").filter((_, lineIndex) => !expiredLines.has(lineIndex)).join("\n")
-
   // Commit history first: even if removal fails, a fresh load hides this text.
-  await writeAtomically(filesystem, dismissedPath, history)
+  await updateFileChecked(filesystem, dismissedPath, (current) => {
+    const markdown = current ?? ""
+    const lineEnding = markdown.includes("\r\n") ? "\r\n" : "\n"
+    const appended = `${markdown}${markdown === "" || markdown.endsWith("\n") ? "" : lineEnding}${record}${lineEnding}`
+    const entries = parseDismissalLines(appended)
+    const expiredLines = new Set(entries.slice(0, Math.max(0, entries.length - dismissalHistoryLimit)).map((entry) => entry.lineIndex))
+    return appended.split("\n").filter((_, lineIndex) => !expiredLines.has(lineIndex)).join("\n")
+  })
   await removeMatchingSuggestions(filesystem, filePath, (entry) =>
     entry.label === suggestion.label && normalizeSuggestionText(entry.text) === text,
   )
 }
 
-// Label-only removal remains available for sent suggestions. Dismissals use
-// dismissSuggestion instead, recording the text and matching it on removal.
+// Label-only removal remains available for callers explicitly requesting it.
+// Sends match exact label/text; dismissals record and match normalized text.
 // Everything else — the coordinator's prose — stays byte-for-byte.
 export async function removeSuggestion(filesystem: FileSystemPort, filePath: string, label: string): Promise<void> {
   await removeMatchingSuggestions(filesystem, filePath, (suggestion) => suggestion.label === label)
@@ -127,20 +127,34 @@ async function removeMatchingSuggestions(
   filePath: string,
   matches: (suggestion: Suggestion) => boolean,
 ): Promise<void> {
-  if (!(await filesystem.exists(filePath))) return
-  const markdown = await filesystem.readFile(filePath)
-  const kept = markdown.split("\n").filter((line) => {
-    const suggestion = parseSuggestionLine(line)
-    return suggestion === undefined || !matches(suggestion)
+  await updateFileChecked(filesystem, filePath, (markdown) => {
+    if (markdown === undefined) return undefined
+    return markdown.split("\n").filter((line) => {
+      const suggestion = parseSuggestionLine(line)
+      return suggestion === undefined || !matches(suggestion)
+    }).join("\n")
   })
-  const updated = kept.join("\n")
-  if (updated !== markdown) await writeAtomically(filesystem, filePath, updated)
 }
 
-async function writeAtomically(filesystem: FileSystemPort, filePath: string, contents: string): Promise<void> {
+async function updateFileChecked(
+  filesystem: FileSystemPort,
+  filePath: string,
+  update: (markdown: string | undefined) => string | undefined,
+): Promise<void> {
+  const readCurrent = async () => await filesystem.exists(filePath) ? await filesystem.readFile(filePath) : undefined
   const tempPath = `${filePath}.${Date.now()}-${Math.random().toString(16).slice(2)}.tmp`
-  await filesystem.writeFile(tempPath, contents)
-  await filesystem.rename(tempPath, filePath)
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const markdown = await readCurrent()
+    const updated = update(markdown)
+    if (updated === undefined || updated === markdown) return
+    await filesystem.writeFile(tempPath, updated)
+    if (await readCurrent() !== markdown) continue
+    // Best-effort edit detection, not CAS: a writer can still race this check
+    // and rename. The port has no remove operation; reuse one staging path.
+    await filesystem.rename(tempPath, filePath)
+    return
+  }
+  throw new Error(`could not update ${filePath} after 3 conflicting edits`)
 }
 
 export interface SuggestionSendOutcome {
@@ -160,9 +174,10 @@ export async function sendSuggestion(
   suggestion: Suggestion,
   send: (text: string) => Promise<void>,
 ): Promise<SuggestionSendOutcome> {
-  await send(suggestion.text)
+  const { label, text } = suggestion
+  await send(text)
   try {
-    await removeSuggestion(filesystem, filePath, suggestion.label)
+    await removeMatchingSuggestions(filesystem, filePath, (entry) => entry.label === label && entry.text === text)
   } catch {
     return { sent: true, warning: `the suggestion was sent to the coordinator, but its line could not be removed from ${filePath}` }
   }

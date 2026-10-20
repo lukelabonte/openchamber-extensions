@@ -91,6 +91,20 @@ describe("mapBoardState", () => {
 })
 
 describe("buildBoardWorker", () => {
+  test("exposes an idle worker's closing report after a long preamble without marking its task Done", () => {
+    const worker = buildBoardWorker(task({ prUrl: undefined }), observation("idle", null,
+      `${"Investigation details. ".repeat(100)}\n\ndone: PR https://github.com/example/sunrise/pull/42`))
+    expect(worker.state).toBe("Idle")
+    expect(worker.workerReport).toEqual({ state: "done", text: "PR https://github.com/example/sunrise/pull/42" })
+    expect(worker.reportPrUrl).toBe("https://github.com/example/sunrise/pull/42")
+  })
+
+  test("doesn't promote a previous closing report while the worker is running again", () => {
+    const worker = buildBoardWorker(task(), observation("running", null, "blocked: Waiting for a decision"))
+    expect(worker.state).toBe("Working")
+    expect(worker.workerReport).toBeUndefined()
+  })
+
   test("carries the backlog fields and refines the state from the live observation", () => {
     const worker = buildBoardWorker(task(), observation("waiting-question", null, "Which test runner should I use?"))
     expect(worker).toEqual({

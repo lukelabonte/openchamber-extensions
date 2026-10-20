@@ -23,6 +23,8 @@ export type Board =
       /** The service's supervision health, when this payload carried a well-formed record. */
       supervision?: SupervisionHealth
       refreshing: boolean
+      /** A failed later read retains these columns, explicitly marked stale. */
+      refreshError?: string
     }
   | { kind: "error"; message: string }
 
@@ -129,6 +131,9 @@ export function reducePanelState(state: PanelState, event: PanelEvent): PanelSta
     }
     case "board-failed":
       if (state.kind !== "registered") return state
+      if (state.board.kind === "ready") {
+        return { ...state, board: { ...state.board, refreshing: false, refreshError: event.message } }
+      }
       return { ...state, board: { kind: "error", message: event.message } }
     case "watches-loaded":
       if (state.kind !== "registered") return state

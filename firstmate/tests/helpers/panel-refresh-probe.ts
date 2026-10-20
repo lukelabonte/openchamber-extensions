@@ -250,7 +250,9 @@ const scenarios: Record<string, (controller: Controller) => Promise<Record<strin
     controller.ready("/repos/b")
     await controller.flush()
     const whileBPending = { ...controller.refreshLabel() }
-    await controller.advanceMs(120_000)
+    // Keep this context-isolation probe below the periodic interval; same-
+    // registration supersession is covered separately by board-old-* probes.
+    await controller.advanceMs(1_000)
     controller.releaseAll({ slug: "proj-a", outcome: "fail", all: true })
     await controller.flush()
     const afterStaleFailure = { ...controller.refreshLabel() }
@@ -273,7 +275,7 @@ const scenarios: Record<string, (controller: Controller) => Promise<Record<strin
     controller.ready("/repos/b")
     await controller.flush()
     const whileBPending = { ...controller.refreshLabel() }
-    await controller.advanceMs(60_000)
+    await controller.advanceMs(1_000)
     controller.releaseAll({ slug: "proj-a", outcome: "fail", all: true })
     await controller.flush()
     const afterStaleFailure = { ...controller.refreshLabel() }

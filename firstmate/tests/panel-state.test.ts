@@ -129,6 +129,19 @@ describe("panel board state", () => {
     })
   })
 
+  test("a later board failure retains the last columns and marks them stale until recovery", () => {
+    const ready = reduceAll(registeredState(), { type: "board-loaded", workers: [{ title: "Keep this card", state: "Working" }], deliveryError: "prior warning" })
+    const stale = reduceAll(ready, { type: "sessions-changed" }, { type: "board-failed", message: "connection lost" })
+    expect(stale.kind).toBe("registered")
+    if (ready.kind !== "registered" || stale.kind !== "registered") throw new Error("expected registration")
+    if (ready.board.kind !== "ready" || stale.board.kind !== "ready") throw new Error("expected retained board")
+    expect(stale.board).toEqual({ ...ready.board, refreshing: false, refreshError: "connection lost" })
+    expect(stale.board.columns).toBe(ready.board.columns)
+    const recovered = reduceAll(stale, { type: "board-loaded", workers: [] })
+    if (recovered.kind !== "registered") throw new Error("expected registration")
+    expect(recovered.board).toEqual({ kind: "ready", columns: [], refreshing: false })
+  })
+
   test("skipped malformed worker entries surface as the board warning", () => {
     const state = reduceAll(
       registeredState(),

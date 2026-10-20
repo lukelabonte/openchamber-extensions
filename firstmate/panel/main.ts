@@ -3,6 +3,7 @@ import { applyHostReady, mountBadge, type Tone } from "@openchamber/sdk/ui"
 import { parseBoardWorkers, parseSupervision, type BoardCard, type BoardColumn, type SupervisionHealth } from "./board"
 import { moveColumn, parseColumnOrder } from "./column-order"
 import { workerMessageLink } from "../service/message-links"
+import { createWorkerShells } from "./worker-shells"
 import { parseShipping, shippingBadgeLabel, type LandingRow, type ShippingInfo } from "./shipping"
 import { parseSuggestions, type SuggestionRow } from "./suggestions"
 import { initialPanelState, reducePanelState, type Board, type PanelEvent, type PanelState, type RegistrationInfo } from "./state"
@@ -27,8 +28,10 @@ let refreshLabelTimer: number | null = null
 let manualRefreshInFlight = false
 let lastRefreshedAt: number | null = null
 let refreshFailed = false
+let boardRequestGeneration = 0
 let contextGeneration = 0
 let currentSessionId: string | null = null
+const workerShells = createWorkerShells(host)
 
 interface ProjectSettings {
   coordinatorModel: string
@@ -59,6 +62,10 @@ let lifecycleConfirmation: "release" | "restart" | null = null
 let lifecyclePending = false
 let lifecycleFeedback: string | undefined
 let adoptSessionId = ""
+// Panel-local captain sends share one synchronous gate. Worker controls and
+// automation are independent; other frames still need service-side dedupe.
+let captainSendInFlight: RegistrationInfo | null = null
+let commandFeedback: string | undefined
 
 host.onReady((ctx) => {
   applyHostReady(ctx, document.documentElement)
@@ -172,6 +179,7 @@ function startBoardFlow(registration: RegistrationInfo): void {
   }
   stopBoardFlow()
   activeRegistration = registration
+  workerShells.setContext(registration.slug)
   void runFullRefresh(true)
   void ensureSessionsSubscription(registration)
   scheduleBoardRefresh(registration)
@@ -200,6 +208,7 @@ function applySettings(settings: ProjectSettings, registration: RegistrationInfo
 }
 
 function stopBoardFlow(): void {
+  workerShells.reset()
   activeRegistration = null
   unsubscribeSessions?.()
   unsubscribeSessions = null
@@ -229,6 +238,9 @@ function stopBoardFlow(): void {
   lifecyclePending = false
   lifecycleFeedback = undefined
   adoptSessionId = ""
+  captainSendInFlight = null
+  commandFeedback = undefined
+  suggestionActionInFlight = false
   // A directory change (or re-registration) closes any open watch editor or
   // creation form; its drafts belonged to the previous project. Run-now
   // in-flight markers and per-watch feedback belong to it too.
@@ -297,11 +309,13 @@ async function runFullRefresh(markRefreshed: boolean): Promise<void> {
   // Version-skewed services may omit all three extras. They never decide the
   // core board's freshness or keep a manual refresh waiting for an extension.
   void fetchExtensions(registration)
-  const outcomes = await Promise.all([fetchBoard(), fetchWatches(), fetchShipping(), fetchSuggestions()])
+  const boardRequest = fetchBoard()
+  const generation = boardRequestGeneration
+  const outcomes = await Promise.all([boardRequest, fetchWatches(), fetchShipping(), fetchSuggestions()])
   // The captain may have switched projects while the cycle ran; a
   // superseded cycle's completion must not mark the new flow's age or
   // failure state.
-  if (activeRegistration !== registration) return
+  if (activeRegistration !== registration || boardRequestGeneration !== generation) return
   if (!markRefreshed) return
   if (outcomes.every((succeeded) => succeeded)) {
     refreshFailed = false
@@ -359,15 +373,17 @@ function applyRefreshLabel(button: HTMLButtonElement): void {
   // A failed deliberate cycle (initial or manual) must never read as fresh:
   // without a prior successful age the failure is all there is to say, with
   // one the last good age stays visible beside the failure.
-  if (refreshFailed) {
+  if (refreshFailed || (state.kind === "registered" && (state.board.kind === "error" || (state.board.kind === "ready" && state.board.refreshError !== undefined)))) {
     button.textContent = lastRefreshedAt === null
       ? "Refresh failed"
       : `Refresh failed (${refreshAgeLabel(lastRefreshedAt)})`
     return
   }
-  // Before a freshly registered panel's first fetch settles there is no age
-  // to report; the run is already under way, so say so.
-  button.textContent = lastRefreshedAt === null ? "Refreshing…" : refreshAgeLabel(lastRefreshedAt)
+  // A superseded initial cycle cannot establish an age. Once its replacement
+  // has loaded the board, don't leave the control claiming an ongoing read.
+  button.textContent = lastRefreshedAt === null
+    ? state.kind === "registered" && state.board.kind === "ready" ? "Not refreshed yet" : "Refreshing…"
+    : refreshAgeLabel(lastRefreshedAt)
 }
 
 function refreshAgeLabel(timestamp: number): string {
@@ -381,9 +397,10 @@ function refreshAgeLabel(timestamp: number): string {
 async function fetchBoard(): Promise<boolean> {
   const registration = activeRegistration
   if (registration === null) return false
+  const generation = ++boardRequestGeneration
   try {
     const result = await host.serviceRequest({ method: "GET", path: "/board", query: { slug: registration.slug } })
-    if (activeRegistration !== registration) return false
+    if (activeRegistration !== registration || boardRequestGeneration !== generation) return false
     if (result.status !== 200) {
       dispatch({ type: "board-failed", message: `Reading the board failed (status ${result.status}).` })
       return false
@@ -407,7 +424,7 @@ async function fetchBoard(): Promise<boolean> {
     })
     return true
   } catch {
-    if (activeRegistration !== registration) return false
+    if (activeRegistration !== registration || boardRequestGeneration !== generation) return false
     dispatch({ type: "board-failed", message: "Reading the board failed: the service is unreachable." })
     return false
   }
@@ -872,6 +889,15 @@ function render(state: PanelState): void {
       break
     case "registered":
       if (state.board.kind === "ready") {
+        const cards = state.board.columns.flatMap((column) => column.cards)
+        const currentWorker = cards.find((card) => card.sessionId !== undefined && card.sessionId === currentSessionId)
+        workerShells.retainWorkers(new Set((currentWorker === undefined ? cards : [currentWorker]).flatMap((card) => card.sessionId === undefined ? [] : [card.sessionId])))
+      } else workerShells.retainWorkers(new Set())
+      if (state.board.kind === "ready" && state.board.refreshError !== undefined) {
+        root.append(warningCallout(`Board is stale — showing the last successful read. ${state.board.refreshError} Controls remain available. Steer, Interrupt, Relaunch and End still use service-side checks.`))
+      }
+      if (commandFeedback !== undefined) root.append(warningCallout(commandFeedback))
+      if (state.board.kind === "ready") {
         const worker = state.board.columns.flatMap((column) => column.cards).find((card) => card.sessionId !== undefined && card.sessionId === currentSessionId)
         if (worker !== undefined) {
           root.append(button("Open first mate", () => { void host.openSession(state.registration.coordinatorSessionId).catch(() => {}) }))
@@ -1041,6 +1067,7 @@ function statusReportButton(registration: RegistrationInfo, saveToFile: () => bo
   const button = document.createElement("button")
   button.className = "fm-button"
   button.textContent = "Status report"
+  button.disabled = captainSendInFlight !== null
   button.title =
     "Ask the coordinator for a status report (bearings): what needs your call, what landed, what is under way, what is next."
   button.addEventListener("click", () => {
@@ -1053,6 +1080,7 @@ function ahoyButton(registration: RegistrationInfo): HTMLElement {
   const button = document.createElement("button")
   button.className = "fm-button"
   button.textContent = "Catch me up"
+  button.disabled = captainSendInFlight !== null
   button.title =
     "Ask the coordinator to summarize what happened since your last exchange, with every open decision and a recommendation."
   button.addEventListener("click", () => {
@@ -1062,14 +1090,23 @@ function ahoyButton(registration: RegistrationInfo): HTMLElement {
 }
 
 async function sendCommand(registration: RegistrationInfo, command: string): Promise<void> {
+  if (activeRegistration !== registration || captainSendInFlight !== null) return
+  captainSendInFlight = registration
+  commandFeedback = undefined
+  render(state)
   try {
-    await host.serviceRequest({
-      method: "POST",
-      path: "/command",
-      body: JSON.stringify({ slug: registration.slug, command }),
-    })
-  } catch {
-    // The service is unreachable; the next press retries.
+    const result = await post("/command", { slug: registration.slug, command })
+    if (activeRegistration !== registration) return
+    if (result.sent !== true) throw new Error("Requesting the report failed: the service sent a malformed delivery answer.")
+    if (typeof result.warning === "string") commandFeedback = result.warning
+  } catch (error) {
+    if (activeRegistration !== registration) return
+    commandFeedback = `Command failed: ${errorMessage(error)}`
+  } finally {
+    if (activeRegistration === registration) {
+      captainSendInFlight = null
+      render(state)
+    }
   }
 }
 
@@ -1497,10 +1534,13 @@ function boardCard(card: BoardCard, workerContext = false): HTMLElement {
   if (card.warning !== undefined) article.append(warningBadge(card.warning))
   if (isUnfinished(card.state) && card.possiblyStalledSince !== undefined) article.append(stallNote())
   if (card.branch !== undefined) article.append(branchMeta(card.branch, card.worktree))
-  if (card.lastWord !== undefined) article.append(lastWordLine(card.lastWord))
+  if (card.workerReport !== undefined) {
+    article.append(mutedNote(`Worker reported ${card.workerReport.state}: ${card.workerReport.text || "No details supplied."}`))
+  } else if (card.lastWord !== undefined) article.append(lastWordLine(card.lastWord))
   const messageLink = messageLinkControl(card)
   if (messageLink !== undefined) article.append(messageLink)
   if (card.prUrl !== undefined) article.append(prLink(card))
+  if (card.sessionId !== undefined) article.append(workerShells.render(card.sessionId))
   if (workerContext) return article
   if (card.taskId !== undefined) article.append(decisionControls(card))
   if (card.sessionId === undefined) {
@@ -1548,10 +1588,10 @@ function messageControl(draft: MessageDraft, label: string, sendLabel: string, s
   input.value = draft.text
   input.disabled = draft.pending
   const submit = button(sendLabel, () => {
-    if (draft.pending || draft.text.trim() === "") return
+    if (draft.pending || captainSendInFlight !== null || draft.text.trim() === "") return
     send(draft.text.trim())
-  }, draft.pending || draft.text.trim() === "")
-  input.addEventListener("input", () => { draft.text = input.value; submit.disabled = draft.pending || draft.text.trim() === "" })
+  }, draft.pending || captainSendInFlight !== null || draft.text.trim() === "")
+  input.addEventListener("input", () => { draft.text = input.value; submit.disabled = draft.pending || captainSendInFlight !== null || draft.text.trim() === "" })
   row.append(input, submit)
   return row
 }
@@ -1562,7 +1602,7 @@ function decisionControls(card: BoardCard): HTMLElement {
   const taskId = card.taskId!
   const draft = messageDraft(`decision:${taskId}`)
   for (const action of card.actions ?? []) {
-    const choice = button(action.label, () => { void sendDecision(taskId, draft, { label: action.label, expectedText: action.text }) }, draft.pending)
+    const choice = button(action.label, () => { void sendDecision(taskId, draft, { label: action.label, expectedText: action.text }) }, draft.pending || captainSendInFlight !== null)
     choice.title = action.text
     row.append(choice)
   }
@@ -1574,7 +1614,8 @@ function decisionControls(card: BoardCard): HTMLElement {
 
 async function sendDecision(taskId: string, draft: MessageDraft, answer: { label: string; expectedText: string } | { text: string }): Promise<void> {
   const registration = activeRegistration
-  if (registration === null || draft.pending || messageDrafts.get(`decision:${taskId}`) !== draft) return
+  if (registration === null || captainSendInFlight !== null || draft.pending || messageDrafts.get(`decision:${taskId}`) !== draft) return
+  captainSendInFlight = registration
   draft.pending = true
   draft.feedback = undefined
   render(state)
@@ -1587,7 +1628,7 @@ async function sendDecision(taskId: string, draft: MessageDraft, answer: { label
     if (activeRegistration !== registration) return
     draft.feedback = errorMessage(error)
   } finally {
-    if (activeRegistration === registration) { draft.pending = false; render(state); void fetchBoard() }
+    if (activeRegistration === registration) { captainSendInFlight = null; draft.pending = false; render(state); void fetchBoard() }
   }
 }
 
@@ -1604,7 +1645,8 @@ function workerPanel(card: BoardCard, registration: RegistrationInfo): HTMLEleme
 }
 
 async function sendHandoff(registration: RegistrationInfo, sessionId: string, draft: MessageDraft, message: string): Promise<void> {
-  if (activeRegistration !== registration || draft.pending) return
+  if (activeRegistration !== registration || captainSendInFlight !== null || draft.pending) return
+  captainSendInFlight = registration
   draft.pending = true
   draft.feedback = undefined
   render(state)
@@ -1617,7 +1659,7 @@ async function sendHandoff(registration: RegistrationInfo, sessionId: string, dr
     if (activeRegistration !== registration) return
     draft.feedback = errorMessage(error)
   } finally {
-    if (activeRegistration === registration) { draft.pending = false; render(state) }
+    if (activeRegistration === registration) { captainSendInFlight = null; draft.pending = false; render(state) }
   }
 }
 
@@ -1706,8 +1748,8 @@ function warningCallout(message: string): HTMLElement {
 function prLink(card: BoardCard): HTMLElement {
   const button = document.createElement("button")
   button.className = "fm-button"
-  button.textContent = "Open PR on GitHub"
-  button.title = "Open the pull request in your browser."
+  button.textContent = card.prSource === "worker-report" ? "Open worker-reported PR" : "Open PR on GitHub"
+  button.title = card.prSource === "worker-report" ? "Worker testimony only. This link doesn't establish verified readiness or completion." : "Open the pull request in your browser."
   button.disabled = card.prOpenable !== true
   // The sandboxed iframe cannot open links itself; the host opens it.
   button.addEventListener("click", () => {
@@ -1967,7 +2009,7 @@ function suggestionRow(suggestion: SuggestionRow, actionPending: boolean): HTMLE
   send.textContent = "Send"
   send.title = suggestion.text
   send.setAttribute("aria-label", `Send ${suggestion.label}`)
-  send.disabled = actionPending
+  send.disabled = actionPending || captainSendInFlight !== null
   // The in-flight flag is checked in the handler as well as via the disabled
   // attribute: a re-render between the click and the answer rebuilds the row
   // with fresh buttons, and only the flag can stop a repeat press.
@@ -2002,7 +2044,9 @@ let suggestionActionInFlight = false
 
 async function runSuggestionAction(pathname: string, label: string): Promise<void> {
   const registration = activeRegistration
-  if (registration === null || suggestionActionInFlight) return
+  const sendsMessage = pathname === "/suggestion/send"
+  if (registration === null || suggestionActionInFlight || (sendsMessage && captainSendInFlight !== null)) return
+  if (sendsMessage) captainSendInFlight = registration
   suggestionActionInFlight = true
   dispatch({ type: "suggestion-action-started" })
   try {
@@ -2036,8 +2080,12 @@ async function runSuggestionAction(pathname: string, label: string): Promise<voi
     if (activeRegistration !== registration) return
     dispatch({ type: "suggestion-action-settled", feedback: "The action failed: the service is unreachable." })
   } finally {
-    suggestionActionInFlight = false
-    void fetchSuggestions()
+    if (activeRegistration === registration) {
+      if (sendsMessage) captainSendInFlight = null
+      suggestionActionInFlight = false
+      render(state)
+      void fetchSuggestions()
+    }
   }
 }
 

@@ -1,10 +1,14 @@
 # Third-party notices
 
-## FirstMate Crew PR watch
+## FirstMate Crew adaptations
 
 `templates/pr-watch` adapts the PR watch from [gpambrozio/bb-plugins](https://github.com/gpambrozio/bb-plugins), pinned to commit `f2d8491208978f13a245f46a34cc195338173c0e`.
 
 Source: https://github.com/gpambrozio/bb-plugins/blob/f2d8491208978f13a245f46a34cc195338173c0e/firstmate-crew/templates/watches/pr-watch
+
+`service/worker-report.ts` also adapts the closing-status protocol and parser patterns from FirstMate Crew. It keeps reports separate from task state, excludes quoted/fenced examples, and limits report PR buttons to GitHub pull-request URLs.
+
+Source: https://github.com/gpambrozio/bb-plugins/blob/f2d8491208978f13a245f46a34cc195338173c0e/firstmate-crew/server/crew-report.ts
 
 License: https://github.com/gpambrozio/bb-plugins/blob/f2d8491208978f13a245f46a34cc195338173c0e/LICENSE
 

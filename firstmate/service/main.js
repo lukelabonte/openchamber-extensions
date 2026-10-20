@@ -1383,6 +1383,52 @@ function workerMessageLink(sessionId, messageId) {
   return `openchamber://session/${sessionId}?message=${messageId}`;
 }
 
+// service/worker-report.ts
+function parseWorkerReport(message) {
+  if (message === undefined)
+    return;
+  const lines = [];
+  let fence;
+  for (const rawLine of message.split(/\r\n?|\n/)) {
+    const line = rawLine.trim();
+    const delimiter = /^(`{3,}|~{3,})/.exec(line);
+    if (fence !== undefined) {
+      if (delimiter?.[1][0] === fence.marker && delimiter[1].length >= fence.length && line.slice(delimiter[1].length).trim() === "")
+        fence = undefined;
+      continue;
+    }
+    if (delimiter !== null) {
+      fence = { marker: delimiter[1][0], length: delimiter[1].length };
+      continue;
+    }
+    if (line !== "")
+      lines.push(line);
+  }
+  for (let index = lines.length - 1;index >= Math.max(0, lines.length - 4); index -= 1) {
+    let line = lines[index].replace(/^[-*]\s+/, "");
+    for (const marker of ["**", "__"]) {
+      if (line.startsWith(marker) && line.endsWith(marker) && !line.slice(2, -2).includes(marker))
+        line = line.slice(2, -2);
+    }
+    const match = /^(?:\*\*|__)?(?:status\s*[:=]\s*)?(working|needs[-_ ]decision|blocked|paused|done|failed|resolved)(?:\*\*|__)?\s*(?:\[[^\]]*\]\s*)?:\s*(?:\*\*|__)?(.*)$/i.exec(line);
+    if (match === null)
+      continue;
+    return { state: match[1].toLowerCase().replace(/[_ ]/g, "-"), text: match[2].trim() };
+  }
+  return;
+}
+function reportPullRequestUrl(text) {
+  for (const match of text.matchAll(/https:\/\/[^\s<>()\[\]]+/gi)) {
+    const candidate = match[0].replace(/[.,;!?*_"'`]+$/, "");
+    try {
+      const url = new URL(candidate);
+      if (url.protocol === "https:" && url.hostname === "github.com" && url.port === "" && url.username === "" && url.password === "" && /^\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/pull\/[1-9]\d*\/?$/.test(url.pathname))
+        return candidate;
+    } catch {}
+  }
+  return;
+}
+
 // service/board.ts
 var lastWordMaxLength = 280;
 function mapBoardState(input) {
@@ -1428,6 +1474,15 @@ function buildBoardWorker(task, observation, dependencyResolved = false) {
   const lastWord = observation?.lastWord;
   if (lastWord !== undefined)
     worker.lastWord = truncateLastWord(lastWord);
+  if (observation?.status.activity === "idle" && observation.error === undefined) {
+    const report = parseWorkerReport(observation.last?.text ?? lastWord);
+    if (report !== undefined) {
+      worker.workerReport = { ...report, text: truncateLastWord(report.text) };
+      const reportPrUrl = reportPullRequestUrl(report.text);
+      if (reportPrUrl !== undefined)
+        worker.reportPrUrl = reportPrUrl;
+    }
+  }
   if (observation?.last?.text !== undefined && workerMessageLink(task.sessionId, observation.last.id) !== undefined)
     worker.lastMessageId = observation.last.id;
   if (observation?.error !== undefined)
@@ -2122,47 +2177,55 @@ async function dismissSuggestion(filesystem, filePath, suggestion, now = new Dat
     throw new Error("cannot dismiss an empty suggestion");
   const record = `- ${JSON.stringify({ label: suggestion.label, text: suggestion.text, dismissedAt: now.toISOString() })}`;
   const dismissedPath = suggestionDismissalsPath(filePath);
-  const markdown = await filesystem.exists(dismissedPath) ? await filesystem.readFile(dismissedPath) : "";
-  const lineEnding = markdown.includes(`\r
+  await updateFileChecked(filesystem, dismissedPath, (current) => {
+    const markdown = current ?? "";
+    const lineEnding = markdown.includes(`\r
 `) ? `\r
 ` : `
 `;
-  const appended = `${markdown}${markdown === "" || markdown.endsWith(`
+    const appended = `${markdown}${markdown === "" || markdown.endsWith(`
 `) ? "" : lineEnding}${record}${lineEnding}`;
-  const entries = parseDismissalLines(appended);
-  const expiredLines = new Set(entries.slice(0, Math.max(0, entries.length - dismissalHistoryLimit)).map((entry) => entry.lineIndex));
-  const history = appended.split(`
+    const entries = parseDismissalLines(appended);
+    const expiredLines = new Set(entries.slice(0, Math.max(0, entries.length - dismissalHistoryLimit)).map((entry) => entry.lineIndex));
+    return appended.split(`
 `).filter((_, lineIndex) => !expiredLines.has(lineIndex)).join(`
 `);
-  await writeAtomically(filesystem, dismissedPath, history);
+  });
   await removeMatchingSuggestions(filesystem, filePath, (entry) => entry.label === suggestion.label && normalizeSuggestionText(entry.text) === text);
 }
-async function removeSuggestion(filesystem, filePath, label) {
-  await removeMatchingSuggestions(filesystem, filePath, (suggestion) => suggestion.label === label);
-}
 async function removeMatchingSuggestions(filesystem, filePath, matches) {
-  if (!await filesystem.exists(filePath))
-    return;
-  const markdown = await filesystem.readFile(filePath);
-  const kept = markdown.split(`
+  await updateFileChecked(filesystem, filePath, (markdown) => {
+    if (markdown === undefined)
+      return;
+    return markdown.split(`
 `).filter((line) => {
-    const suggestion = parseSuggestionLine(line);
-    return suggestion === undefined || !matches(suggestion);
-  });
-  const updated = kept.join(`
+      const suggestion = parseSuggestionLine(line);
+      return suggestion === undefined || !matches(suggestion);
+    }).join(`
 `);
-  if (updated !== markdown)
-    await writeAtomically(filesystem, filePath, updated);
+  });
 }
-async function writeAtomically(filesystem, filePath, contents) {
+async function updateFileChecked(filesystem, filePath, update) {
+  const readCurrent = async () => await filesystem.exists(filePath) ? await filesystem.readFile(filePath) : undefined;
   const tempPath = `${filePath}.${Date.now()}-${Math.random().toString(16).slice(2)}.tmp`;
-  await filesystem.writeFile(tempPath, contents);
-  await filesystem.rename(tempPath, filePath);
+  for (let attempt = 0;attempt < 3; attempt += 1) {
+    const markdown = await readCurrent();
+    const updated = update(markdown);
+    if (updated === undefined || updated === markdown)
+      return;
+    await filesystem.writeFile(tempPath, updated);
+    if (await readCurrent() !== markdown)
+      continue;
+    await filesystem.rename(tempPath, filePath);
+    return;
+  }
+  throw new Error(`could not update ${filePath} after 3 conflicting edits`);
 }
 async function sendSuggestion(filesystem, filePath, suggestion, send) {
-  await send(suggestion.text);
+  const { label, text } = suggestion;
+  await send(text);
   try {
-    await removeSuggestion(filesystem, filePath, suggestion.label);
+    await removeMatchingSuggestions(filesystem, filePath, (entry) => entry.label === label && entry.text === text);
   } catch {
     return { sent: true, warning: `the suggestion was sent to the coordinator, but its line could not be removed from ${filePath}` };
   }

@@ -5,7 +5,7 @@
     "": {
       "name": "firstmate",
       "devDependencies": {
-        "@openchamber/sdk": "2.1.0",
+        "@openchamber/sdk": "2.5.0",
         "@types/bun": "^1.3.0",
         "@types/node": "^24.0.0",
         "typescript": "^5.9.0",
@@ -13,7 +13,7 @@
     },
   },
   "packages": {
-    "@openchamber/sdk": ["@openchamber/sdk@2.1.0", "", { "dependencies": { "zod": "^4.3.6" }, "bin": { "openchamber-guest-bundle": "scripts/bundle-guest.ts" } }, "sha512-jRvdmgMYfNVHlIOJ8NR/gXaJWXMPXRSu7DLNrUTTyCwnh7BoACba7/GObfcE+23ZJbgdqwXoTRDuU8Wt0WWH+g=="],
+    "@openchamber/sdk": ["@openchamber/sdk@2.5.0", "", { "dependencies": { "zod": "^4.3.6" }, "bin": { "openchamber-guest-bundle": "scripts/bundle-guest.ts" } }, "sha512-5gigGSmIIonZB0ZAfOFziKVZ6NpLt5HjUtrlMDnk4igQdgn++VvOL3gPdW5M6Ht7ldHceNKVU1Rsy+zxd9nzWA=="],
 
     "@types/bun": ["@types/bun@1.4.2", "", { "dependencies": { "bun-types": "1.4.2" } }, "sha512-GimotNn7+ZV0uVArItBbriZsR1oNf0+WTzPkdcFrzShI7k2norL0uzEaJT8T33dWr7O/c9ZDuAFQrctKCi72oQ=="],
 

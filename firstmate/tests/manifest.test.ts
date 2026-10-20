@@ -20,10 +20,11 @@ describe("openchamber manifest", () => {
     expect(manifest.apiVersion).toBe(1)
   })
 
-  test("requests the sessions and service capabilities", () => {
+  test("requests sessions, shell inspection and service capabilities", () => {
     const manifest = parseManifest()
     const capabilities = requestedGuestCapabilities(manifest.contributes)
     expect(capabilities).toContain("sessions")
+    expect(capabilities).toContain("shells")
     expect(capabilities).toContain("service")
   })
 })

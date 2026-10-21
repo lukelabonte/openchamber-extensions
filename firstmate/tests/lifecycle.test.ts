@@ -8,6 +8,7 @@ const homeRoot = "/home/firstmate"
 const homeDirectory = `${homeRoot}/projects/sunrise`
 const projectDirectory = "/repos/sunrise"
 const registration = { slug: "sunrise", projectDirectory, homeDirectory, coordinatorSessionId: "ses_old", createdAt: "2026-01-01T00:00:00.000Z" }
+const desktop = { fetcher: async () => { throw new Error("must not call desktop") }, support: { kind: "unsupported", reason: "test" } as const }
 
 function fixture(options: { registered?: boolean; activity?: string; candidates?: unknown[]; createError?: string } = {}) {
   const filesystem = new InMemoryFileSystem()
@@ -32,7 +33,7 @@ function fixture(options: { registered?: boolean; activity?: string; candidates?
     if (args[1] === "associate-project") return JSON.stringify({ sessionId: args[args.indexOf("--session") + 1] })
     throw new Error(`unexpected lifecycle command: ${args.join(" ")}`)
   }
-  return { filesystem, exec, calls, input: { filesystem: filesystem.port, exec, homeRoot, slug: "sunrise" } }
+  return { filesystem, exec, calls, input: { ...desktop, filesystem: filesystem.port, exec, homeRoot, slug: "sunrise" } }
 }
 
 function launchInput(input: ReturnType<typeof fixture>["input"]) {
@@ -75,7 +76,7 @@ describe("FirstMate lifecycle", () => {
 
   test("requires an existing home and association rather than trusting supplied registration-like properties", async () => {
     const missing = new InMemoryFileSystem()
-    await expect(adoptFirstMate({ filesystem: missing.port, exec: async () => { throw new Error("must not call CLI") }, homeRoot, slug: "sunrise", sessionId: "ses_candidate" })).rejects.toThrow("existing")
+    await expect(adoptFirstMate({ ...desktop, filesystem: missing.port, exec: async () => { throw new Error("must not call CLI") }, homeRoot, slug: "sunrise", sessionId: "ses_candidate" })).rejects.toThrow("existing")
     const noAssociation = fixture({ registered: false })
     noAssociation.filesystem.seedFile(`${homeDirectory}/settings.json`, "{}")
     await expect(adoptFirstMate({ ...noAssociation.input, sessionId: "ses_candidate" })).rejects.toThrow("projectDirectory")

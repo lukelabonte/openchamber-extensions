@@ -817,7 +817,8 @@ function isPlainObject(value) {
 }
 
 // service/session-projects.ts
-async function associateFirstMateSession(exec, registration) {
+import { isAbsolute } from "node:path";
+async function associateFirstMateSession(exec, registration, desktop) {
   try {
     await associateSessionProject(exec, {
       sessionId: registration.coordinatorSessionId,
@@ -825,19 +826,93 @@ async function associateFirstMateSession(exec, registration) {
       projectDirectory: registration.projectDirectory
     });
   } catch (error) {
-    if (error instanceof UnsupportedSessionProjectError)
-      return;
     if (error instanceof MissingCliError)
       throw error;
-    throw new Error(`first mate ${registration.coordinatorSessionId} is saved, but its sidebar project association failed: ${error instanceof Error ? error.message : String(error)}`);
+    try {
+      if (!(error instanceof UnsupportedSessionProjectError))
+        throw error;
+      await associateThroughMetadata(desktop, registration);
+    } catch (failure) {
+      throw new Error(`first mate ${registration.coordinatorSessionId} is saved, but its sidebar project association failed: ${failure instanceof Error ? failure.message : String(failure)}`);
+    }
   }
+}
+async function associateThroughMetadata(desktop, registration) {
+  if (desktop.support.kind === "unsupported")
+    return;
+  const sessionId = registration.coordinatorSessionId;
+  const directory = registration.homeDirectory;
+  if (sessionId.trim() === "" || !isAbsolute(directory) || !isAbsolute(registration.projectDirectory))
+    throw new Error("sidebar association requires an exact session and absolute home and project directories");
+  const sessionPath = `/api/openchamber/sessions/${encodeURIComponent(sessionId)}/metadata`;
+  let readStatus;
+  const observation = await callDesktopProxy({
+    ...desktop,
+    method: "GET",
+    path: `${sessionPath}?directory=${encodeURIComponent(directory)}`,
+    label: "sidebar metadata",
+    fetcher: async (url, init) => {
+      const response = await desktop.fetcher(url, init);
+      readStatus = response.status;
+      return response;
+    }
+  });
+  if (readStatus === 404 || readStatus === 405 || observation.kind === "unsupported")
+    return;
+  if (observation.kind === "failed")
+    throw new Error(observation.message);
+  const existing = readProjectDirectory(observation.text);
+  if (existing !== undefined) {
+    if (normalizeProjectDirectory(existing) !== normalizeProjectDirectory(registration.projectDirectory))
+      throw new Error("the first mate already belongs to a different sidebar project");
+  }
+  const session = await callDesktopProxy({ ...desktop, method: "GET", path: `/api/session/${encodeURIComponent(sessionId)}?directory=${encodeURIComponent(directory)}`, label: "sidebar session ownership" });
+  if (session.kind !== "ok")
+    throw new Error(session.kind === "failed" ? session.message : session.reason);
+  const parsed = JSON.parse(session.text ?? "null");
+  const record = isRecord3(parsed) && parsed.id === undefined ? parsed.data : parsed;
+  if (!isRecord3(record) || record.id !== sessionId)
+    throw new Error("the host did not identify the first mate for sidebar association");
+  const actualDirectory = isRecord3(record.location) ? record.location.directory : record.directory;
+  if (typeof actualDirectory !== "string" || actualDirectory.trim() === "" || normalizeProjectDirectory(actualDirectory) !== normalizeProjectDirectory(directory) || record.directory !== undefined && record.directory !== actualDirectory)
+    throw new Error("the first mate is not rooted in its registered home");
+  if (existing !== undefined)
+    return;
+  const outcome = await callDesktopProxy({
+    ...desktop,
+    method: "POST",
+    path: sessionPath,
+    label: "sidebar project association",
+    body: JSON.stringify({ directory, patch: { openchamber: { projectDirectory: registration.projectDirectory } } })
+  });
+  if (outcome.kind !== "ok")
+    throw new Error(outcome.kind === "failed" ? outcome.message : outcome.reason);
+  if (readProjectDirectory(outcome.text) !== registration.projectDirectory)
+    throw new Error("the host did not confirm the first mate's sidebar project association");
+}
+function readProjectDirectory(text) {
+  const parsed = JSON.parse(text ?? "null");
+  if (!isRecord3(parsed) || !isRecord3(parsed.metadata))
+    throw new Error("the host did not return sidebar session metadata");
+  const openchamber = parsed.metadata.openchamber;
+  if (openchamber === undefined)
+    return;
+  if (!isRecord3(openchamber))
+    throw new Error("the host returned malformed sidebar session metadata");
+  const directory = openchamber.projectDirectory;
+  if (directory !== undefined && (typeof directory !== "string" || !isAbsolute(directory)))
+    throw new Error("the host returned a malformed sidebar project directory");
+  return directory;
+}
+function isRecord3(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 async function restoreSessionProjects(input) {
   const registrations = await loadRegistry(input.filesystem, input.homeRoot);
   const failures = [];
   for (const registration of Object.values(registrations)) {
     try {
-      await associateFirstMateSession(input.exec, registration);
+      await associateFirstMateSession(input.exec, registration, input);
     } catch (error) {
       failures.push(error instanceof Error ? error.message : String(error));
     }
@@ -865,7 +940,7 @@ async function withProjectLifecycle(directory, operation) {
 async function launchFirstMate(input) {
   return withProjectLifecycle(input.homeRoot, async () => {
     const result = await launchOnce(input);
-    await associateFirstMateSession(input.exec, result.registration);
+    await associateFirstMateSession(input.exec, result.registration, input);
     return result;
   });
 }
@@ -1558,10 +1633,10 @@ async function cleanupCoordinatorPullRequests(input) {
     const url = canonicalPullUrl(value.url);
     if (url === undefined || !candidates.has(url))
       continue;
-    if (links.some((other) => isRecord3(other) && other.id === value.id && (!isPullLink(other) || canonicalPullUrl(other.url) !== url)))
+    if (links.some((other) => isRecord4(other) && other.id === value.id && (!isPullLink(other) || canonicalPullUrl(other.url) !== url)))
       continue;
     const response = JSON.parse(await input.exec("gh", ["pr", "view", url, "--json", "state,mergedAt,url"]));
-    if (!isRecord3(response) || canonicalPullUrl(response.url) !== url || !["OPEN", "CLOSED", "MERGED"].includes(response.state)) {
+    if (!isRecord4(response) || canonicalPullUrl(response.url) !== url || !["OPEN", "CLOSED", "MERGED"].includes(response.state)) {
       throw new Error(`GitHub did not identify the requested PR: ${url}`);
     }
     if (response.state !== "MERGED")
@@ -1592,7 +1667,7 @@ async function cleanupCoordinatorPullRequests(input) {
   if (outcome.kind !== "ok")
     throw new Error(outcome.kind === "failed" ? outcome.message : outcome.reason);
   const remaining = readLinks(outcome.text, true);
-  if (remaining.some((entry) => isRecord3(entry) && entries.some((removed) => entry.id === removed.id || canonicalPullUrl(entry.url) === canonicalPullUrl(removed.url)))) {
+  if (remaining.some((entry) => isRecord4(entry) && entries.some((removed) => entry.id === removed.id || canonicalPullUrl(entry.url) === canonicalPullUrl(removed.url)))) {
     throw new Error("the host did not confirm removal of the completed PR links");
   }
   return [...new Set(entries.map((entry) => entry.url))];
@@ -1623,12 +1698,12 @@ function canonicalPullUrl(value) {
 }
 function readLinks(text, requireList = false) {
   const parsed = JSON.parse(text ?? "null");
-  if (!isRecord3(parsed) || !isRecord3(parsed.metadata))
+  if (!isRecord4(parsed) || !isRecord4(parsed.metadata))
     throw new Error("the host did not return session metadata for PR cleanup");
   const metadata = parsed.metadata;
   if (metadata.openchamber === undefined && !requireList)
     return [];
-  if (!isRecord3(metadata.openchamber))
+  if (!isRecord4(metadata.openchamber))
     throw new Error("the host returned malformed PR link metadata");
   const links = metadata.openchamber.linked_issues;
   if (links === undefined && !requireList)
@@ -1638,9 +1713,9 @@ function readLinks(text, requireList = false) {
   return links;
 }
 function isPullLink(value) {
-  return isRecord3(value) && value.kind === "pull" && typeof value.id === "string" && value.id !== "" && typeof value.title === "string" && value.title !== "" && typeof value.url === "string";
+  return isRecord4(value) && value.kind === "pull" && typeof value.id === "string" && value.id !== "" && typeof value.title === "string" && value.title !== "" && typeof value.url === "string";
 }
-function isRecord3(value) {
+function isRecord4(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
@@ -1895,7 +1970,7 @@ async function requireIdleCoordinator(input, context) {
 async function persistCoordinator(input, context, registration) {
   await recordCoordinatorSessionId(input.filesystem, registration.homeDirectory, registration.coordinatorSessionId);
   await saveRegistry(input.filesystem, input.homeRoot, { ...context.registrations, [input.slug]: registration });
-  await associateFirstMateSession(input.exec, registration);
+  await associateFirstMateSession(input.exec, registration, input);
 }
 
 // service/message-links.ts
@@ -2155,11 +2230,11 @@ function parseSessionInfo(text, sessionId) {
   } catch {
     return { kind: "failed", reason: "the session info response was not valid JSON" };
   }
-  if (!isRecord4(parsed))
+  if (!isRecord5(parsed))
     return { kind: "failed", reason: "the session info response was not a JSON object" };
   let payload = parsed;
   if (typeof parsed.id !== "string") {
-    if (!isRecord4(parsed.data)) {
+    if (!isRecord5(parsed.data)) {
       return { kind: "failed", reason: "the session info response did not name the requested session" };
     }
     payload = parsed.data;
@@ -2167,7 +2242,7 @@ function parseSessionInfo(text, sessionId) {
   if (typeof payload.id !== "string" || payload.id !== sessionId) {
     return { kind: "failed", reason: "the session info response did not name the requested session" };
   }
-  if (!isRecord4(payload.time))
+  if (!isRecord5(payload.time))
     return { kind: "failed", reason: "the session info response had no time object" };
   const idle = payload.time.idle;
   if (idle !== undefined && idle !== null && (typeof idle !== "number" || !Number.isFinite(idle))) {
@@ -2182,7 +2257,7 @@ function sessionInfoOutcome(value) {
     return value;
   return;
 }
-function isRecord4(value) {
+function isRecord5(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
@@ -2281,7 +2356,7 @@ function confirmsArchive(text, sessionId) {
 }
 
 // service/poller.ts
-function isRecord5(value) {
+function isRecord6(value) {
   return typeof value === "object" && value !== null;
 }
 function createSupervisionPoller(input) {
@@ -2546,11 +2621,11 @@ ${sessionId}`;
       return { kind: "failed", reason: "the session status response body could not be read" };
     try {
       const parsed = JSON.parse(outcome.text);
-      if (!isRecord5(parsed) || !isRecord5(parsed.pending) || Array.isArray(parsed.pending)) {
+      if (!isRecord6(parsed) || !isRecord6(parsed.pending) || Array.isArray(parsed.pending)) {
         return { kind: "failed", reason: "the session status response had no pending map" };
       }
       for (const entry of Object.values(parsed.pending)) {
-        if (!isRecord5(entry) || Array.isArray(entry)) {
+        if (!isRecord6(entry) || Array.isArray(entry)) {
           return { kind: "failed", reason: "the session status response had a malformed pending entry" };
         }
         if (entry.permissions !== undefined && !Array.isArray(entry.permissions) || entry.forms !== undefined && !Array.isArray(entry.forms)) {
@@ -2677,7 +2752,7 @@ function describeEvent(event) {
   }
 }
 function pendingActivity(entry) {
-  if (!isRecord5(entry))
+  if (!isRecord6(entry))
     return;
   if (Array.isArray(entry.permissions) && entry.permissions.length > 0)
     return "waiting-permission";
@@ -3929,7 +4004,7 @@ async function runWatchRound() {
 function isAuthorized(request) {
   return request.headers.authorization === `Bearer ${serviceToken}`;
 }
-function isRecord6(value) {
+function isRecord7(value) {
   return typeof value === "object" && value !== null;
 }
 function respondJson(response, statusCode, body) {
@@ -3954,7 +4029,7 @@ function readJsonBody(request) {
 async function readJsonRecord(request) {
   try {
     const payload = await readJsonBody(request);
-    return isRecord6(payload) ? payload : undefined;
+    return isRecord7(payload) ? payload : undefined;
   } catch {
     return;
   }
@@ -3966,21 +4041,21 @@ function recordString(record, key) {
 function isWatchSource(value) {
   return value === undefined || value === "shared" || value === "project";
 }
-async function readProjectDirectory(request) {
+async function readProjectDirectory2(request) {
   let payload;
   try {
     payload = await readJsonBody(request);
   } catch {
     return;
   }
-  const projectDirectory = isRecord6(payload) ? payload.projectDirectory : undefined;
+  const projectDirectory = isRecord7(payload) ? payload.projectDirectory : undefined;
   if (typeof projectDirectory !== "string" || projectDirectory.trim() === "") {
     return;
   }
   return projectDirectory;
 }
 async function handleProvision(request, response) {
-  const projectDirectory = await readProjectDirectory(request);
+  const projectDirectory = await readProjectDirectory2(request);
   if (projectDirectory === undefined) {
     respondJson(response, 400, { error: "projectDirectory must be a non-empty string" });
     return;
@@ -3997,7 +4072,7 @@ async function handleProvision(request, response) {
   }
 }
 async function handleLaunch(request, response) {
-  const projectDirectory = await readProjectDirectory(request);
+  const projectDirectory = await readProjectDirectory2(request);
   if (projectDirectory === undefined) {
     respondJson(response, 400, { error: "projectDirectory must be a non-empty string" });
     return;
@@ -4741,8 +4816,9 @@ async function handleCoordinator(request, response, action) {
     respondJson(response, 400, { error: "slug must be a non-empty string" });
     return;
   }
-  const input = { filesystem: nodeFileSystem, exec: nodeExec, homeRoot, slug };
   try {
+    const support = await discoverSupport({ filesystem: nodeFileSystem, settingsPath: openchamberSettingsPath });
+    const input = { filesystem: nodeFileSystem, exec: nodeExec, homeRoot, slug, fetcher: nodeFetcher, support };
     if (action === "adopt") {
       const sessionId = recordString(payload, "sessionId");
       if (sessionId === undefined) {
@@ -4966,7 +5042,8 @@ var server = createServer((request, response) => {
 server.listen(servicePort, "127.0.0.1");
 initializeTemplates().catch(() => {});
 withProjectLifecycle(homeRoot, async () => {
-  const failures = await restoreSessionProjects({ filesystem: nodeFileSystem, exec: nodeExec, homeRoot });
+  const support = await discoverSupport({ filesystem: nodeFileSystem, settingsPath: openchamberSettingsPath });
+  const failures = await restoreSessionProjects({ filesystem: nodeFileSystem, exec: nodeExec, homeRoot, fetcher: nodeFetcher, support });
   for (const failure of failures)
     console.error(failure);
 }).catch((error) => console.error("FirstMate sidebar project association restore failed:", error instanceof Error ? error.message : String(error)));

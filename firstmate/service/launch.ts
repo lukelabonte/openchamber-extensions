@@ -48,7 +48,7 @@ export async function withProjectLifecycle<Result>(directory: string, operation:
 export async function launchFirstMate(input: LaunchFirstMateInput): Promise<LaunchFirstMateResult> {
   return withProjectLifecycle(input.homeRoot, async () => {
     const result = await launchOnce(input)
-    await associateFirstMateSession(input.exec, result.registration)
+    await associateFirstMateSession(input.exec, result.registration, input)
     return result
   })
 }

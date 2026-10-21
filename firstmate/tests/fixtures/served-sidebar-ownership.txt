@@ -1,0 +1,25 @@
+// Pure ownership/path declarations captured from the running desktop on 2026-10-21.
+// useAppFontEffects-B8uPCq95.js SHA-256: 65baba7ac8f6c52107eaa3970013ded6f91c093a877c9a1694d19addcf2fb666
+// Ownership slice [2383059,2385446), SHA-256: bab15124bc6c4963e7e8a1e00725c32d5a4bb1e9bfd0d1946b93d189f3f8aa02
+// katex.min-fNe3zKBW.js path slice [80545,81096). X/V are Zod object/string.
+// No browser/store code runs. Keep this capture distinct from the installed CLI assets.
+// Source: OpenChamber desktop's web-dist/assets; https://github.com/openchamber/openchamber
+// MIT License. Copyright (c) 2025 Bohdan Triapitsyn
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+const wu=/^(?:\/\/\?\/)?[A-Za-z]:\/+$/u,bd=/^(?:\/\/\?\/)?[A-Za-z]:$/u,ck=/^\/\/(?:[^/?][^/]*\/[^/]+|\?\/UNC\/[^/]+\/[^/]+)$/iu,Pe=e=>{if(typeof e!="string")return null;const t=e.trim();if(!t)return null;const s=t.replace(/\\/g,"/").replace(/^([a-z]):/,(a,i)=>i.toUpperCase()+":");return s==="/"?"/":wu.test(s)?s.replace(/\/+$/u,"/"):(s.length>1?s.replace(/\/+$/,""):s)||null},lk=e=>{if(e==="/"||wu.test(e)||bd.test(e)||ck.test(e))return null;const t=e.lastIndexOf("/");if(t<0)return null;if(t===0)return"/";const s=e.slice(0,t);return bd.test(s)?`${s}/`:s};const Ke=Pe,Vz=lk;
+const ert=X({openchamber:X({projectDirectory:V().trim().min(1)})});function xC(t){return Ke(ert.safeParse(t.metadata).data?.openchamber.projectDirectory)}const trt=(t,e)=>t?e.kind!==t.kind?e.kind==="project":e.projectRoot.length!==t.projectRoot.length?e.projectRoot.length>t.projectRoot.length:e.projectId.localeCompare(t.projectId)<0:!0,c6=(t,e,n)=>{trt(t.get(e),n)&&t.set(e,n)},nrt=t=>Ke(t.directory)??Ke(t.project?.worktree),srt=t=>t.projectID||t.project?.id||null,wre=(t,e,n,s,r=[],o=[],i=[])=>{const a=new Map,c=new Map;for(const S of e){const x=Ke(S.normalizedPath);if(!x)continue;const k=c.get(x);(!k||S.id.localeCompare(k.id)<0)&&c.set(x,S),c6(a,x,{projectId:S.id,projectRoot:x,scopeDirectory:x,kind:"project"})}if(!s)for(const[S,x]of n){const k=Ke(S),C=k?c.get(k):void 0;if(!(!C||!k))for(const M of x){const _=Ke(M.path);_&&c6(a,_,{projectId:C.id,projectRoot:k,scopeDirectory:_,kind:"worktree"})}}if(!s)for(const S of i){const x=Ke(S.projectDirectory),k=Ke(S.directory),C=x?c.get(x):void 0;!C||!x||!k||c6(a,k,{projectId:C.id,projectRoot:x,scopeDirectory:k,kind:"space",spaceId:S.id})}const l=new Map,u=new Set,f=(S,x)=>{if(S==="global")return;const k=Ke(x??null),C=k?c.get(k):void 0,M=C&&k?{projectId:C.id,projectRoot:k,scopeDirectory:k,kind:"project"}:null;if(!l.has(S)){l.set(S,M);return}const _=l.get(S);(!_||!M||_.projectRoot!==M.projectRoot)&&l.set(S,null)};for(const S of o)S.id&&(u.add(S.id),f(S.id,S.worktree));for(const S of[...t,...r]){const x=S.project?.id;if(!x||u.has(x))continue;const k=Ke(S.project?.worktree??null);!k||!c.has(k)||f(x,S.project?.worktree)}const m=new Map,p=new Map,h=new Map,g=new Map,b=new Map,v=S=>{if(!S)return null;if(m.has(S))return m.get(S)??null;if(s){const M=a.get(S)??null;return m.set(S,M),M}const x=[];let k=S,C=null;for(;k;){if(m.has(k)){C=m.get(k)??null;break}if(x.push(k),C=a.get(k)??null,C)break;k=Vz(k)}for(const M of x)m.set(M,C);return C},y=(S,x,k)=>{for(const C of S){const M=v(nrt(C)),_=!s&&!M?xC(C):null,I=_&&c.has(_)?a.get(_):void 0,E=M??(s?null:I??l.get(srt(C)??"")??null);if(!E)continue;p.set(C.id,E);const A=x.get(E.projectId);if(A?A.push(C):x.set(E.projectId,[C]),!k)continue;const j=k.get(E.scopeDirectory);j?j.add(C.id):k.set(E.scopeDirectory,new Set([C.id]))}};return y(t,h,b),y(r.filter(S=>!S.parentID),g),{bySessionId:p,sessionsByProject:h,archivedSessionsByProject:g,sessionsByScope:b,directoryResolutions:m.size}};
+wre

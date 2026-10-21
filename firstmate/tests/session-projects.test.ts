@@ -2,6 +2,8 @@ import { describe, expect, test } from "bun:test"
 import { restoreSessionProjects } from "../service/session-projects"
 import { InMemoryFileSystem } from "./helpers/in-memory-file-system"
 
+const desktop = { fetcher: async () => { throw new Error("must not call desktop") }, support: { kind: "unsupported", reason: "test" } as const }
+
 describe("restoreSessionProjects", () => {
   test("associates existing first mates without creating or moving sessions and continues after one failure", async () => {
     const filesystem = new InMemoryFileSystem()
@@ -14,7 +16,7 @@ describe("restoreSessionProjects", () => {
     filesystem.seedFile(`${homeRoot}/registry.json`, registryContents)
     const calls: string[][] = []
 
-    const failures = await restoreSessionProjects({ filesystem: filesystem.port, homeRoot, exec: async (command, args) => {
+    const failures = await restoreSessionProjects({ ...desktop, filesystem: filesystem.port, homeRoot, exec: async (command, args) => {
       expect(command).toBe("openchamber")
       calls.push([...args])
       if (args.includes("ses_sunrise")) throw new Error("host unavailable")
@@ -33,7 +35,7 @@ describe("restoreSessionProjects", () => {
 
   test("an empty registry starts no sessions or CLI requests", async () => {
     const filesystem = new InMemoryFileSystem()
-    expect(await restoreSessionProjects({ filesystem: filesystem.port, homeRoot: "/home/firstmate", exec: async () => {
+    expect(await restoreSessionProjects({ ...desktop, filesystem: filesystem.port, homeRoot: "/home/firstmate", exec: async () => {
       throw new Error("must not run")
     } })).toEqual([])
   })
@@ -47,7 +49,7 @@ describe("restoreSessionProjects", () => {
     } })
     filesystem.seedFile(`${homeRoot}/registry.json`, registryContents)
     const calls: string[][] = []
-    expect(await restoreSessionProjects({ filesystem: filesystem.port, homeRoot, exec: async (_command, args) => {
+    expect(await restoreSessionProjects({ ...desktop, filesystem: filesystem.port, homeRoot, exec: async (_command, args) => {
       calls.push([...args])
       throw new Error("openchamber exited with code 1: Unknown option: --display-project-dir")
     } })).toEqual([])

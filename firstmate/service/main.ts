@@ -20,6 +20,7 @@ import { createSupervisionPoller } from "./poller"
 import { createSupervisionDelivery } from "./supervision-delivery"
 import { legacyTemplateHashes, provisionProject } from "./provision"
 import { loadRegistry, type Registration } from "./registry"
+import { restoreSessionProjects } from "./session-projects"
 import { loadLandingRecords, type LandingRecord } from "./landing-record"
 import { notifyCaptain } from "./notifications"
 import { parseShippingMode } from "./shipping-mode"
@@ -1522,6 +1523,10 @@ const server = createServer((request, response) => {
 server.listen(servicePort, "127.0.0.1")
 // Preserve customized copies and offer comparisons before the new UI reads them.
 void initializeTemplates().catch(() => { /* The upgrades routes surface the failure. */ })
+void withProjectLifecycle(homeRoot, async () => {
+  const failures = await restoreSessionProjects({ filesystem: nodeFileSystem, exec: nodeExec, homeRoot })
+  for (const failure of failures) console.error(failure)
+}).catch((error) => console.error("FirstMate sidebar project association restore failed:", error instanceof Error ? error.message : String(error)))
 
 const pollTimer = clock.startInterval(() => {
   void runSupervisionRound()

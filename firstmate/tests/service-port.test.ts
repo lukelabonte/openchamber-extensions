@@ -56,7 +56,7 @@ beforeAll(async () => {
   writeFileSync(path.join(projectHome, "settings.json"), JSON.stringify({ projectDirectory: "/repos/sunrise", coordinatorSessionId: "ses_mate" }))
   writeFileSync(path.join(projectHome, "backlog.md"), "- Approve\n  id: approve\n  kind: captain\n  state: Blocked\n  hold: Merge?\n  actions: Merge => Merge the reviewed head | Hold => Keep it open\n")
   const shim = path.join(root, "bin", "openchamber")
-  writeFileSync(shim, `#!${process.execPath}\nconst fs = require('node:fs'); const args = process.argv.slice(2); fs.appendFileSync(${JSON.stringify(path.join(root, "calls.jsonl"))}, JSON.stringify(args)+'\\n'); const busy=fs.existsSync(${JSON.stringify(path.join(root, "busy"))}); console.log(JSON.stringify(args[1]==='create'?{sessionID:'ses_new'}:args[1]==='status'?{sessionStatus:{type:busy?'busy':'idle'}}:args[1]==='list'?{sessions:[]}:{}));\n`)
+  writeFileSync(shim, `#!${process.execPath}\nconst fs = require('node:fs'); const args = process.argv.slice(2); fs.appendFileSync(${JSON.stringify(path.join(root, "calls.jsonl"))}, JSON.stringify(args)+'\\n'); const busy=fs.existsSync(${JSON.stringify(path.join(root, "busy"))}); console.log(JSON.stringify(args[1]==='create'?{sessionID:'ses_new'}:args[1]==='associate-project'?{sessionId:args[args.indexOf('--session')+1]}:args[1]==='status'?{sessionStatus:{type:busy?'busy':'idle'}}:args[1]==='list'?{sessions:[]}:{}));\n`)
   chmodSync(shim, 0o755)
   const watch = path.join(projectHome, "watches", "signal")
   writeFileSync(watch, "#!/bin/sh\n# schedule: 5 4 29 2 *\nprintf 'durable signal'\n")

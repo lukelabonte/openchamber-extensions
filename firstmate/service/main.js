@@ -34,6 +34,22 @@ async function createSession(exec, input) {
   }
   return sessionId;
 }
+async function associateSessionProject(exec, input) {
+  const output = await runControlCommand(exec, [
+    "session",
+    "associate-project",
+    "--session",
+    input.sessionId,
+    "--dir",
+    input.directory,
+    "--display-project-dir",
+    input.projectDirectory,
+    "--json"
+  ]);
+  const parsed = parseJsonOutput(output);
+  if (extractSessionId(parsed) !== input.sessionId)
+    throw new Error("openchamber session associate-project returned a different session id");
+}
 async function sessionStatus(exec, input) {
   const output = await runControlCommand(exec, ["session", "status", "--session", input.sessionId, "--dir", input.directory, "--json"]);
   const parsed = parseJsonOutput(output);
@@ -1092,6 +1108,33 @@ async function createFiles(input) {
   }
 }
 
+// service/session-projects.ts
+async function associateFirstMateSession(exec, registration) {
+  try {
+    await associateSessionProject(exec, {
+      sessionId: registration.coordinatorSessionId,
+      directory: registration.homeDirectory,
+      projectDirectory: registration.projectDirectory
+    });
+  } catch (error) {
+    if (error instanceof MissingCliError)
+      throw error;
+    throw new Error(`first mate ${registration.coordinatorSessionId} is saved, but its sidebar project association failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+async function restoreSessionProjects(input) {
+  const registrations = await loadRegistry(input.filesystem, input.homeRoot);
+  const failures = [];
+  for (const registration of Object.values(registrations)) {
+    try {
+      await associateFirstMateSession(input.exec, registration);
+    } catch (error) {
+      failures.push(error instanceof Error ? error.message : String(error));
+    }
+  }
+  return failures;
+}
+
 // service/launch.ts
 var lifecycleInFlight = new Map;
 async function withProjectLifecycle(directory, operation) {
@@ -1110,7 +1153,11 @@ async function withProjectLifecycle(directory, operation) {
   }
 }
 async function launchFirstMate(input) {
-  return withProjectLifecycle(input.homeRoot, () => launchOnce(input));
+  return withProjectLifecycle(input.homeRoot, async () => {
+    const result = await launchOnce(input);
+    await associateFirstMateSession(input.exec, result.registration);
+    return result;
+  });
 }
 async function launchOnce(input) {
   const { filesystem, exec, templateReader, homeRoot } = input;
@@ -1371,6 +1418,7 @@ async function requireIdleCoordinator(input, context) {
 async function persistCoordinator(input, context, registration) {
   await recordCoordinatorSessionId(input.filesystem, registration.homeDirectory, registration.coordinatorSessionId);
   await saveRegistry(input.filesystem, input.homeRoot, { ...context.registrations, [input.slug]: registration });
+  await associateFirstMateSession(input.exec, registration);
 }
 
 // service/message-links.ts
@@ -4195,6 +4243,11 @@ var server = createServer((request, response) => {
 });
 server.listen(servicePort, "127.0.0.1");
 initializeTemplates().catch(() => {});
+withProjectLifecycle(homeRoot, async () => {
+  const failures = await restoreSessionProjects({ filesystem: nodeFileSystem, exec: nodeExec, homeRoot });
+  for (const failure of failures)
+    console.error(failure);
+}).catch((error) => console.error("FirstMate sidebar project association restore failed:", error instanceof Error ? error.message : String(error)));
 var pollTimer = clock.startInterval(() => {
   runSupervisionRound();
 }, pollIntervalMs);

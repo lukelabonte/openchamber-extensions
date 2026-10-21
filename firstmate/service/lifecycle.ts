@@ -13,6 +13,7 @@ import {
 import { loadRegistry, saveRegistry, type Registration } from "./registry"
 import { loadProjectSettings } from "./settings"
 import { normalizeProjectDirectory } from "./slug"
+import { associateFirstMateSession } from "./session-projects"
 
 export interface FirstMateLifecycleInput {
   filesystem: FileSystemPort
@@ -135,4 +136,5 @@ async function requireIdleCoordinator(input: FirstMateLifecycleInput, context: P
 async function persistCoordinator(input: FirstMateLifecycleInput, context: ProjectLifecycleContext, registration: Registration): Promise<void> {
   await recordCoordinatorSessionId(input.filesystem, registration.homeDirectory, registration.coordinatorSessionId)
   await saveRegistry(input.filesystem, input.homeRoot, { ...context.registrations, [input.slug]: registration })
+  await associateFirstMateSession(input.exec, registration)
 }

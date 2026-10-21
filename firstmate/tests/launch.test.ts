@@ -40,6 +40,8 @@ const templateReader = (templateName: string): Promise<string> => Promise.resolv
 function fakeExec(stdout = '{"sessionID":"ses_coord_1"}'): { exec: ExecRunner; calls: { command: string; args: string[] }[] } {
   const calls: { command: string; args: string[] }[] = []
   const exec: ExecRunner = async (command, args) => {
+    // These tests count session creation; association has its own assertions below.
+    if (args[1] === "associate-project") return JSON.stringify({ sessionId: args[args.indexOf("--session") + 1] })
     calls.push({ command, args: [...args] })
     return stdout
   }
@@ -50,6 +52,7 @@ function countingExec(): { exec: ExecRunner; calls: string[][] } {
   let count = 0
   const calls: string[][] = []
   const exec: ExecRunner = async (_command, args) => {
+    if (args[1] === "associate-project") return JSON.stringify({ sessionId: args[args.indexOf("--session") + 1] })
     calls.push([...args])
     await new Promise((resolve) => setTimeout(resolve, 10))
     count += 1
@@ -78,6 +81,39 @@ function registryFileContents(filesystem: InMemoryFileSystem): string {
 }
 
 describe("launchFirstMate", () => {
+  test("associates new and existing first mates with their managed project without moving their home", async () => {
+    const input = makeInput()
+    const calls: string[][] = []
+    input.exec = async (_command, args) => {
+      calls.push([...args])
+      return JSON.stringify({ sessionId: "ses_coord_1", directory: "/home/firstmate/projects/sunrise", displayProjectDirectory: projectDirectory })
+    }
+
+    await launchFirstMate(input)
+    await launchFirstMate(input)
+
+    expect(calls.filter((args) => args[1] === "create")).toHaveLength(1)
+    expect(calls.filter((args) => args[1] === "associate-project")).toEqual([
+      ["session", "associate-project", "--session", "ses_coord_1", "--dir", "/home/firstmate/projects/sunrise", "--display-project-dir", projectDirectory, "--json"],
+      ["session", "associate-project", "--session", "ses_coord_1", "--dir", "/home/firstmate/projects/sunrise", "--display-project-dir", projectDirectory, "--json"],
+    ])
+  })
+
+  test("keeps a created first mate after association failure so retry does not create a duplicate", async () => {
+    const input = makeInput()
+    let creations = 0
+    let associationFails = true
+    input.exec = async (_command, args) => {
+      if (args[1] === "create") creations += 1
+      if (args[1] === "associate-project" && associationFails) throw new Error("host unavailable")
+      return '{"sessionId":"ses_coord_1"}'
+    }
+    await expect(launchFirstMate(input)).rejects.toThrow("is saved, but its sidebar project association failed")
+    associationFails = false
+    expect((await launchFirstMate(input)).adopted).toBe(true)
+    expect(creations).toBe(1)
+  })
+
   test("creates with the captain-edited opening and persisted coordinator model without a separate send", async () => {
     const filesystem = new InMemoryFileSystem()
     filesystem.seedDirectory("/home/firstmate/projects/sunrise")
@@ -133,7 +169,7 @@ describe("launchFirstMate", () => {
     expect(filesystem.fileContents("/home/firstmate/projects/sunrise/AGENTS.md")).toContain('Use variant "default" for new workers')
   })
 
-  test("recomposes available home layers on adoption without extra CLI calls", async () => {
+  test("recomposes available home layers on adoption without creating another session", async () => {
     const filesystem = new InMemoryFileSystem()
     const fake = fakeExec()
     await launchFirstMate(makeInput({ filesystem: filesystem.port, exec: fake.exec }))

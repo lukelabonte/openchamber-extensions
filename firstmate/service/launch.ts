@@ -7,6 +7,7 @@ import { provisionProject } from "./provision"
 import { findRegistration, loadRegistry, saveRegistry, type Registration } from "./registry"
 import { loadProjectSettings } from "./settings"
 import { normalizeProjectDirectory } from "./slug"
+import { associateFirstMateSession } from "./session-projects"
 
 export interface LaunchFirstMateInput {
   filesystem: FileSystemPort
@@ -45,7 +46,11 @@ export async function withProjectLifecycle<Result>(directory: string, operation:
 }
 
 export async function launchFirstMate(input: LaunchFirstMateInput): Promise<LaunchFirstMateResult> {
-  return withProjectLifecycle(input.homeRoot, () => launchOnce(input))
+  return withProjectLifecycle(input.homeRoot, async () => {
+    const result = await launchOnce(input)
+    await associateFirstMateSession(input.exec, result.registration)
+    return result
+  })
 }
 
 async function launchOnce(input: LaunchFirstMateInput): Promise<LaunchFirstMateResult> {

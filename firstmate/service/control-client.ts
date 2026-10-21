@@ -49,6 +49,15 @@ export async function createSession(exec: ExecRunner, input: { directory: string
   return sessionId
 }
 
+export async function associateSessionProject(exec: ExecRunner, input: { sessionId: string; directory: string; projectDirectory: string }): Promise<void> {
+  const output = await runControlCommand(exec, [
+    "session", "associate-project", "--session", input.sessionId, "--dir", input.directory,
+    "--display-project-dir", input.projectDirectory, "--json",
+  ])
+  const parsed = parseJsonOutput(output)
+  if (extractSessionId(parsed) !== input.sessionId) throw new Error("openchamber session associate-project returned a different session id")
+}
+
 export async function sessionStatus(exec: ExecRunner, input: { sessionId: string; directory: string }): Promise<SessionStatus> {
   const output = await runControlCommand(exec, ["session", "status", "--session", input.sessionId, "--dir", input.directory, "--json"])
   const parsed = parseJsonOutput(output)

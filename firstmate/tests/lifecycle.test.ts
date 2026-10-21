@@ -29,6 +29,7 @@ function fixture(options: { registered?: boolean; activity?: string; candidates?
       if (options.createError) throw new Error(options.createError)
       return '{"sessionId":"ses_fresh"}'
     }
+    if (args[1] === "associate-project") return JSON.stringify({ sessionId: args[args.indexOf("--session") + 1] })
     throw new Error(`unexpected lifecycle command: ${args.join(" ")}`)
   }
   return { filesystem, exec, calls, input: { filesystem: filesystem.port, exec, homeRoot, slug: "sunrise" } }
@@ -47,6 +48,10 @@ describe("FirstMate lifecycle", () => {
     expect(JSON.parse(filesystem.fileContents(`${homeRoot}/registry.json`)).sunrise.coordinatorSessionId).toBe("ses_candidate")
     expect(filesystem.renamedFrom(`${homeDirectory}/settings.json`)).toContain(".tmp")
     expect(calls.filter((args) => args[1] === "create")).toHaveLength(0)
+    expect(calls.find((args) => args[1] === "associate-project")).toEqual([
+      "session", "associate-project", "--session", "ses_candidate", "--dir", homeDirectory,
+      "--display-project-dir", projectDirectory, "--json",
+    ])
   })
 
   test("adopts only an existing associated home when its registry was lost", async () => {
@@ -109,7 +114,7 @@ describe("FirstMate lifecycle", () => {
     expect(filesystem.fileContents(`${homeDirectory}/workers.json`)).toBe("WORKER STATE")
     expect(JSON.parse(filesystem.fileContents(`${homeRoot}/registry.json`)).sunrise).toBeUndefined()
     expect((await launchFirstMate(launchInput(input))).registration.coordinatorSessionId).toBe("ses_fresh")
-    expect(calls.every((args) => ["status", "create"].includes(args[1]))).toBe(true)
+    expect(calls.every((args) => ["status", "create", "associate-project"].includes(args[1]))).toBe(true)
   })
 
   test("a failed release registry write leaves a tombstone that launch honors", async () => {
@@ -142,7 +147,11 @@ describe("FirstMate lifecycle", () => {
     expect(prompt).toContain("do not start new tasks")
     expect(filesystem.fileContents(`${homeDirectory}/backlog.md`)).toBe("BACKLOG WITH WORKERS")
     expect(filesystem.fileContents(`${homeDirectory}/workers.json`)).toBe("WORKER STATE")
-    expect(calls.every((args) => ["status", "create"].includes(args[1]))).toBe(true)
+    expect(calls.every((args) => ["status", "create", "associate-project"].includes(args[1]))).toBe(true)
+    expect(calls.find((args) => args[1] === "associate-project")).toEqual([
+      "session", "associate-project", "--session", "ses_fresh", "--dir", homeDirectory,
+      "--display-project-dir", projectDirectory, "--json",
+    ])
   })
 
   test("failed restart creation preserves settings, registry and old session", async () => {

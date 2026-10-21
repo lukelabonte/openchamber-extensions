@@ -33,6 +33,8 @@ Variant IDs aren't limited to standard reasoning names. Provider-specific IDs su
 
 **Adopt session** accepts an idle, unarchived session listed in this project's existing FirstMate home. **Release** forgets the coordinator without deleting its chat, workers, or worktrees. **Restart in fresh session** creates a new coordinator in the same home and reuses the backlog. The previous chat and existing workers remain intact. These operations refuse a busy or unknown coordinator.
 
+The first mate's chat appears under its managed project in the OpenChamber sidebar. Its working directory stays in its home. This requires an OpenChamber host and CLI with `session associate-project` support. FirstMate records the association when it launches, adopts or restarts a first mate. Service startup also restores associations for existing registrations. A failed association preserves the saved chat and reports an error. Retrying launch reuses that chat. Release preserves the previous chat's association. VS Code keeps its workspace-only sidebar.
+
 Compact, same-thread context reset, pinning, multi-machine dispatch, and a guaranteed host parent-child fleet aren't exposed by this port. An unrelated session isn't claimed as a worker because its title happens to start with `[FM]`.
 
 ## Worker reads and message evidence

@@ -127,10 +127,14 @@ describe("POST /launch and the registry endpoints", () => {
     expect(typeof registration.createdAt).toBe("string")
 
     const shimCalls = readFileSync(shimLogPath, "utf8").trim().split("\n").map((line) => JSON.parse(line) as string[])
-    expect(shimCalls).toHaveLength(1)
+    expect(shimCalls).toHaveLength(2)
     expect(shimCalls[0].slice(0, 4)).toEqual(["session", "create", "--dir", homeDirectory])
     expect(shimCalls[0]).not.toContain(projectDirectory)
     expect(shimCalls[0][shimCalls[0].indexOf("--prompt") + 1]).toBe(readFileSync(path.join(homeDirectory, "opening.md"), "utf8"))
+    expect(shimCalls[1]).toEqual([
+      "session", "associate-project", "--session", "ses_coord_1", "--dir", homeDirectory,
+      "--display-project-dir", projectDirectory, "--json",
+    ])
 
     const persisted = JSON.parse(readFileSync(path.join(tempHome, "registry.json"), "utf8")) as Record<string, unknown>
     expect(persisted[slug]).toEqual(registration)
@@ -159,13 +163,19 @@ describe("POST /launch and the registry endpoints", () => {
     mkdirSync(projectDirectory)
     const firstResponse = await launch(servicePort, { projectDirectory })
     const first = (await firstResponse.json()) as Record<string, unknown>
+    const homeDirectory = first.homeDirectory
+    if (typeof homeDirectory !== "string") throw new Error("launch must return the first mate's home directory")
     const shimCallCountBefore = readFileSync(shimLogPath, "utf8").trim().split("\n").length
 
     const secondResponse = await launch(servicePort, { projectDirectory: `${projectDirectory}/` })
 
     expect(secondResponse.status).toBe(200)
     expect(await secondResponse.json()).toEqual(first)
-    expect(readFileSync(shimLogPath, "utf8").trim().split("\n")).toHaveLength(shimCallCountBefore)
+    const newCalls = readFileSync(shimLogPath, "utf8").trim().split("\n").slice(shimCallCountBefore).map((line) => JSON.parse(line) as string[])
+    expect(newCalls).toEqual([[
+      "session", "associate-project", "--session", "ses_coord_1", "--dir", homeDirectory,
+      "--display-project-dir", projectDirectory, "--json",
+    ]])
   })
 
   test("launching with a first mate's home directory adopts the existing registration", async () => {
@@ -173,13 +183,19 @@ describe("POST /launch and the registry endpoints", () => {
     mkdirSync(projectDirectory)
     const firstResponse = await launch(servicePort, { projectDirectory })
     const first = (await firstResponse.json()) as Record<string, unknown>
+    const homeDirectory = first.homeDirectory
+    if (typeof homeDirectory !== "string") throw new Error("launch must return the first mate's home directory")
     const shimCallCountBefore = readFileSync(shimLogPath, "utf8").trim().split("\n").length
 
-    const secondResponse = await launch(servicePort, { projectDirectory: first.homeDirectory as string })
+    const secondResponse = await launch(servicePort, { projectDirectory: homeDirectory })
 
     expect(secondResponse.status).toBe(200)
     expect(await secondResponse.json()).toEqual(first)
-    expect(readFileSync(shimLogPath, "utf8").trim().split("\n")).toHaveLength(shimCallCountBefore)
+    const newCalls = readFileSync(shimLogPath, "utf8").trim().split("\n").slice(shimCallCountBefore).map((line) => JSON.parse(line) as string[])
+    expect(newCalls).toEqual([[
+      "session", "associate-project", "--session", "ses_coord_1", "--dir", homeDirectory,
+      "--display-project-dir", projectDirectory, "--json",
+    ]])
   })
 
   test("GET /lookup answers the registration for a registered directory and null otherwise", async () => {
@@ -215,6 +231,17 @@ describe("POST /launch and the registry endpoints", () => {
 })
 
 describe("POST /launch when the openchamber CLI is missing", () => {
+  test("preserves the missing-CLI response when reopening an existing first mate", async () => {
+    const projectDirectory = path.join(tempRoot, "existing-no-cli-repo")
+    mkdirSync(projectDirectory)
+    expect((await launch(servicePort, { projectDirectory })).status).toBe(200)
+
+    const response = await launch(noCliServicePort, { projectDirectory })
+
+    expect(response.status).toBe(503)
+    expect(await response.json()).toMatchObject({ code: "cli-missing" })
+  })
+
   test("answers a clear plain-language error", async () => {
     const projectDirectory = path.join(tempRoot, "no-cli-repo")
     mkdirSync(projectDirectory)

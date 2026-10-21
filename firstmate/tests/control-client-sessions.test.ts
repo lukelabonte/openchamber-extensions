@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import {
+  associateSessionProject,
   createSession,
   MissingCliError,
   sessionLastAssistant,
@@ -64,6 +65,25 @@ describe("createSession", () => {
     for (const output of ["not JSON", "{}", '{"status":"error","sessionId":"ses_not_created"}']) {
       await expect(createSession(fakeExec(output).exec, { directory: "/home/project", title: "FirstMate" })).rejects.toThrow()
     }
+  })
+})
+
+describe("associateSessionProject", () => {
+  const input = { sessionId: "ses_mate", directory: "/home/firstmate/project with spaces", projectDirectory: "/repos/project with spaces" }
+
+  test("passes display ownership separately from the session's actual directory", async () => {
+    const { exec, calls } = fakeExec('{"sessionId":"ses_mate"}')
+    await associateSessionProject(exec, input)
+    expect(calls).toEqual([{ command: "openchamber", args: ["session", "associate-project", "--session", "ses_mate", "--dir", input.directory, "--display-project-dir", input.projectDirectory, "--json"] }])
+  })
+
+  test.each(["not JSON", "{}", '{"sessionId":"ses_other"}', '{"ok":false,"sessionId":"ses_mate"}'])("rejects an invalid association response: %s", async (output) => {
+    await expect(associateSessionProject(fakeExec(output).exec, input)).rejects.toThrow()
+  })
+
+  test("reports unsupported CLI versions and missing CLI failures", async () => {
+    await expect(associateSessionProject(failingExec(new Error("unknown session action associate-project")).exec, input)).rejects.toThrow("associate-project")
+    await expect(associateSessionProject(failingExec(Object.assign(new Error("missing"), { code: "ENOENT" })).exec, input)).rejects.toBeInstanceOf(MissingCliError)
   })
 })
 

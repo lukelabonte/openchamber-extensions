@@ -87,7 +87,7 @@ function normalizeProjectDirectory(projectDirectory) {
 
 // service/provision.ts
 var legacyTemplateHashes = {
-  charter: ["44c30fc03a72d0e3db47f520f77e9d2f256a8595da0c4a92a3613ba8d0bf4bd9", "f2a01f5f4d7e76a63bd026ebda14ecceee56c266aa2c8547af3e8b1430bf7c5b", "26ec3644f04dd682108b932ce183734b3dcaf9bba607c402da7adfde985d5d3b"],
+  charter: ["44c30fc03a72d0e3db47f520f77e9d2f256a8595da0c4a92a3613ba8d0bf4bd9", "f2a01f5f4d7e76a63bd026ebda14ecceee56c266aa2c8547af3e8b1430bf7c5b", "26ec3644f04dd682108b932ce183734b3dcaf9bba607c402da7adfde985d5d3b", "8a888fd9dd86efbd7f7bfb35a3780353c7ec690c83c8dbf7cec007c7b5447b4a"],
   "pr-watch": ["436ce74feaf4fcb7beaeca787e30b0434ed2a5feeb0e4222540852c6b103fbbe"]
 };
 var sharedFiles = [

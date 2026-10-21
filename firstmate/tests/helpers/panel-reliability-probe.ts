@@ -510,7 +510,7 @@ export async function runReliabilityScenario(name: string): Promise<ReliabilityO
       return findAll(fake.root, (element) => element.className === "fm-blocked-note").map((element) => element.textContent ?? "")
     },
     awaitingCleanupBadges() {
-      return findAll(fake.root, (element) => element.textContent === "Awaiting captain cleanup").length
+      return findAll(fake.root, (element) => element.textContent === "Cleanup pending").length
     },
     cleanupButtonCount() {
       return findAll(fake.root, (element) => element.className === "fm-cleanup").reduce(

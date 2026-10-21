@@ -70,7 +70,15 @@ ${headerLines.join("\n")}
     `During cleanup audits, run \`${cleanupCommand}\` from this registered FirstMate home. This calls the extension's guarded merged-PR cleanup directly, including from your own active turn. It accepts no session or URL overrides.`,
     "Read the JSON result and record only confirmed removals. An empty list doesn't mean every link or task is resolved. Keep unknown, unmerged, held, or untracked links and report concrete blockers. This command doesn't delete repository content or change worker sessions. The daily service pass remains a fallback; custom charter wording doesn't hide this callable command.",
   ].join("\n\n")
-  const composed = `${header}\n\n${body}\n\n${sessionTitles}\n\n${workerSelection}\n\n${captainAttention}\n\n${pullRequestCleanup}\n`
+  const cleanupRunbook = fileURLToPath(new URL("../templates/cleanup-worker.md", import.meta.url))
+  const cleanupRunner = fileURLToPath(new URL("../scripts/worktree-cleanup.js", import.meta.url))
+  const repositoryCleanup = [
+    "## Authorized repository cleanup",
+    `For already-authorized repository cleanup, dispatch or continue a worker and include the runbook at ${JSON.stringify(cleanupRunbook)} and safety runner module at ${JSON.stringify(cleanupRunner)} in its brief. Keep repository mutations delegated to that worker, never this first mate.`,
+    "Graceful per-location release of idle, task-owned tooling is included within verified landing or explicit cleanup authorization. It doesn't need a separate approval just because idle tools hold directory handles. A finished worker turn alone doesn't authorize deletion. Active or unknown sessions, requests, commands, terminals, ownership, Git state, runtime identity, or handle owners block cleanup. Never kill processes, restart shared services, interrupt active work, force-delete work, or broaden permission policies.",
+    "Require complete runtime/handle discovery, installed-contract checks, worker session and cwd outside every target, fresh clean tracked/untracked/ignored state and no unique unlanded content, protected source/unrelated/evidence snapshots, non-forced removal, bounded retries and independent outcome verification. Remote branch cleanup needs existing explicit scope. Keep retained paths and blockers visible until resolved. Higher-precedence captain exclusions and retention requests still apply.",
+  ].join("\n\n")
+  const composed = `${header}\n\n${body}\n\n${sessionTitles}\n\n${workerSelection}\n\n${captainAttention}\n\n${pullRequestCleanup}\n\n${repositoryCleanup}\n`
   const filePath = `${homeRoot}/projects/${slug}/AGENTS.md`
   const temporaryPath = `${filePath}.${randomUUID()}.tmp`
   await filesystem.writeFile(temporaryPath, composed)

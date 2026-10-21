@@ -689,6 +689,16 @@ ${layer.contents}`).join(`
   ].join(`
 
 `);
+  const cleanupRunbook = fileURLToPath(new URL("../templates/cleanup-worker.md", import.meta.url));
+  const cleanupRunner = fileURLToPath(new URL("../scripts/worktree-cleanup.js", import.meta.url));
+  const repositoryCleanup = [
+    "## Authorized repository cleanup",
+    `For already-authorized repository cleanup, dispatch or continue a worker and include the runbook at ${JSON.stringify(cleanupRunbook)} and safety runner module at ${JSON.stringify(cleanupRunner)} in its brief. Keep repository mutations delegated to that worker, never this first mate.`,
+    "Graceful per-location release of idle, task-owned tooling is included within verified landing or explicit cleanup authorization. It doesn't need a separate approval just because idle tools hold directory handles. A finished worker turn alone doesn't authorize deletion. Active or unknown sessions, requests, commands, terminals, ownership, Git state, runtime identity, or handle owners block cleanup. Never kill processes, restart shared services, interrupt active work, force-delete work, or broaden permission policies.",
+    "Require complete runtime/handle discovery, installed-contract checks, worker session and cwd outside every target, fresh clean tracked/untracked/ignored state and no unique unlanded content, protected source/unrelated/evidence snapshots, non-forced removal, bounded retries and independent outcome verification. Remote branch cleanup needs existing explicit scope. Keep retained paths and blockers visible until resolved. Higher-precedence captain exclusions and retention requests still apply."
+  ].join(`
+
+`);
   const composed = `${header}
 
 ${body}
@@ -700,6 +710,8 @@ ${workerSelection}
 ${captainAttention}
 
 ${pullRequestCleanup}
+
+${repositoryCleanup}
 `;
   const filePath = `${homeRoot}/projects/${slug}/AGENTS.md`;
   const temporaryPath = `${filePath}.${randomUUID()}.tmp`;
@@ -890,7 +902,7 @@ async function acknowledgeTemplateUpgrade(input) {
 // service/provision.ts
 var sharedDirectories = ["watches"];
 var legacyTemplateHashes = {
-  charter: ["44c30fc03a72d0e3db47f520f77e9d2f256a8595da0c4a92a3613ba8d0bf4bd9", "f2a01f5f4d7e76a63bd026ebda14ecceee56c266aa2c8547af3e8b1430bf7c5b", "26ec3644f04dd682108b932ce183734b3dcaf9bba607c402da7adfde985d5d3b"],
+  charter: ["44c30fc03a72d0e3db47f520f77e9d2f256a8595da0c4a92a3613ba8d0bf4bd9", "f2a01f5f4d7e76a63bd026ebda14ecceee56c266aa2c8547af3e8b1430bf7c5b", "26ec3644f04dd682108b932ce183734b3dcaf9bba607c402da7adfde985d5d3b", "8a888fd9dd86efbd7f7bfb35a3780353c7ec690c83c8dbf7cec007c7b5447b4a"],
   "pr-watch": ["436ce74feaf4fcb7beaeca787e30b0434ed2a5feeb0e4222540852c6b103fbbe"]
 };
 var sharedFiles = [

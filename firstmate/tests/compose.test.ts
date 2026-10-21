@@ -137,4 +137,15 @@ describe("composeInstructions", () => {
     expect(composed).toContain("from your own active turn")
     expect(composed).toContain("An empty list doesn't mean every link or task is resolved")
   })
+
+  test("supplies the worker-only cleanup runbook and runner without requiring another idle-tooling approval", async () => {
+    const filesystem = new InMemoryFileSystem()
+    const composed = await composeInstructions({ filesystem: filesystem.port, homeRoot: "/home/firstmate", slug: "sunrise" })
+    expect(composed).toContain("cleanup-worker.md")
+    expect(composed).toContain("scripts/worktree-cleanup.js")
+    expect(composed).toContain("Keep repository mutations delegated to that worker, never this first mate")
+    expect(composed).toContain("It doesn't need a separate approval just because idle tools hold directory handles")
+    expect(composed).toContain("A finished worker turn alone doesn't authorize deletion")
+    expect(composed).toContain("Higher-precedence captain exclusions and retention requests still apply")
+  })
 })

@@ -97,7 +97,7 @@ describe("FirstMate charter workflows", () => {
     expect(charter).toContain("Read the current `suggestions.md` and `suggestions-dismissed.md` before rewriting")
     expect(charter).toContain("Never edit or overwrite `suggestions-dismissed.md`")
     expect(charter).toContain("End archives the board card only; it preserves the host session")
-    expect(charter).toContain("Repository cleanup is the captain's job")
+    expect(charter).toContain("Delegate repository mutations to a cleanup worker, never perform them yourself")
     expect(charter).toContain("Discarding unlanded work always needs explicit captain approval")
   })
 
@@ -108,7 +108,7 @@ describe("FirstMate charter workflows", () => {
     expect(charter).toContain("requests to retain a PR link as a task `hold:`")
     expect(charter).toContain("preserve worker links and all saved PR URLs")
     expect(charter).toContain("Unlinking isn't repository cleanup")
-    expect(charter).toContain("both implementation and landing workers")
+    expect(charter).toContain("both implementation and landing worktrees")
     expect(charter).toContain("confirmed complete, intentionally retained, or blocked with an owner and next decision")
   })
 

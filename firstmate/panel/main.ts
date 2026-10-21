@@ -1247,7 +1247,7 @@ function landingsSection(shipping: ShippingInfo, board: Board): HTMLElement {
   // Cleanup visibility ground rule, stated once: the extension never deletes.
   const cleanupCaption = document.createElement("p")
   cleanupCaption.className = "fm-caption"
-  cleanupCaption.textContent = "FirstMate does not delete worktrees or branches; cleanup after a landing is yours."
+  cleanupCaption.textContent = "Repository cleanup needs verified landing or explicit authorization and runs through a worker, never the first mate."
   section.append(cleanupCaption)
   if (shipping.cleanupError !== undefined) section.append(warningCallout(shipping.cleanupError))
   for (const error of shipping.landingErrors) section.append(warningCallout(error))
@@ -1325,7 +1325,7 @@ function cleanupDisplay(cleanup: NonNullable<LandingRow["cleanup"]>): HTMLElemen
   const block = document.createElement("div")
   block.className = "fm-cleanup"
   if (cleanup.state === "pending") {
-    const badge = warningBadge("Awaiting captain cleanup")
+    const badge = warningBadge("Cleanup pending")
     badge.title = cleanup.worktree
     block.append(badge)
     const worktreePath = document.createElement("span")

@@ -10,3 +10,4 @@ bunx openchamber-guest-bundle panel/background.ts panel/background.js
 bunx openchamber-guest-bundle --node service/main.ts service/main.js
 bunx openchamber-guest-bundle --node service/tell.ts scripts/tell.js
 bunx openchamber-guest-bundle --node service/cleanup-pr-links.ts scripts/cleanup-pr-links.js
+bunx openchamber-guest-bundle --node service/worktree-cleanup.ts scripts/worktree-cleanup.js

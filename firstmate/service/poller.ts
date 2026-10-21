@@ -172,6 +172,10 @@ export function createSupervisionPoller(input: {
   // fail again. A waiting-permission notification is where a persisting
   // prompt would surface from.
   const autoAcceptedSessions = new Set<string>()
+  // One undelivered blocked alert per worker. Delivery success, not observation
+  // of the transition, acknowledges it. A changed/cleared block replaces or
+  // cancels the alert; a failed observation leaves it pending without sending.
+  const pendingBlockedAlerts = new Map<string, WorkerEvent>()
 
   const observationKey = (slug: string, sessionId: string): string => `${slug}\n${sessionId}`
 
@@ -203,7 +207,9 @@ export function createSupervisionPoller(input: {
       if (events.length > 0) {
         notifications.push(composeNotification(registration, events))
       }
-      for (const event of events) await notifyEvent(registration, event, support)
+      for (const event of events) {
+        if (event.kind !== "waiting-permission" && event.kind !== "waiting-question") await notifyEvent(registration, event, support)
+      }
       notifications.push(...await pollArchiveRequests(registration, support, pending))
     }
     return { notifications }
@@ -281,6 +287,10 @@ export function createSupervisionPoller(input: {
     const activeSessionIds = new Set(backlog.tasks.flatMap((task) =>
       task.sessionId === undefined || archivedSessionIds.has(task.sessionId) ? [] : [task.sessionId],
     ))
+    const prefix = observationKey(registration.slug, "")
+    for (const [key, event] of pendingBlockedAlerts) {
+      if (key.startsWith(prefix) && !activeSessionIds.has(event.sessionId)) pendingBlockedAlerts.delete(key)
+    }
     const listedSessions = new Map<string, SessionListEntry | null>()
     if (activeSessionIds.size > 1) {
       try {
@@ -321,7 +331,7 @@ export function createSupervisionPoller(input: {
             fetcher,
             support,
             sessionId: task.sessionId,
-            directory,
+            directory: task.worktreeDirectory ?? directory,
           })
           if (outcome.kind === "ok" || outcome.kind === "unsupported") {
             autoAcceptedSessions.add(task.sessionId)
@@ -384,7 +394,22 @@ export function createSupervisionPoller(input: {
         observations.set(key, current)
         updateStallTracking(key, task, current, nowMs())
         pollErrors.delete(key)
-        events.push(...detectEvents(task, previous, current, lastSeenTerminal))
+        const workerEvents = detectEvents(task, previous, current, lastSeenTerminal)
+        events.push(...workerEvents)
+        for (const event of workerEvents) {
+          if (event.kind === "waiting-permission" || event.kind === "waiting-question") pendingBlockedAlerts.set(key, event)
+        }
+        const blockedAlert = pendingBlockedAlerts.get(key)
+        if (blockedAlert !== undefined) {
+          if (current.status.activity === blockedAlert.kind) {
+            if (await notifyEvent(registration, blockedAlert, support)) pendingBlockedAlerts.delete(key)
+          } else if (current.status.activity !== "unknown" && (pending.kind === "ok" || current.status.activity === "idle" || current.status.activity === "waiting-permission" || current.status.activity === "waiting-question")) {
+            // A running CLI status cannot rule out a permission block
+            // when the host's pending snapshot is unavailable. Keep, but do
+            // not send, that alert until the worker's state is known again.
+            pendingBlockedAlerts.delete(key)
+          }
+        }
         if (seenTerminal !== undefined) lastSeenTerminals.set(key, seenTerminal)
         if (steeredBaselines.has(key) && current.lastWord !== undefined && current.lastWord !== steeredBaselines.get(key)) {
           steeredBaselines.delete(key)
@@ -536,16 +561,15 @@ export function createSupervisionPoller(input: {
     }
   }
 
-  // Only the blocking and failed transitions reach the captain's desktop: the
-  // coordinator message already carries every event, and the notification is
-  // for the captain away from the desk. Transitions only — the event logic
-  // above is transition-based, so a persisting block never re-notifies. The
-  // notification's click context is the worker's own directory (its worktree
+  // Only blocking and failed events reach the captain's desktop. Blocked
+  // alerts retry until accepted by the host or the block clears; a delivered
+  // alert never repeats for the same transition. The notification's click
+  // context is the worker's own directory (its worktree
   // when recorded) so the click lands on the session the event is about.
-  async function notifyEvent(registration: Registration, event: WorkerEvent, support: InterruptSupport | undefined): Promise<void> {
+  async function notifyEvent(registration: Registration, event: WorkerEvent, support: InterruptSupport | undefined): Promise<boolean> {
     const body = captainEventBody(event)
-    if (body === undefined || support === undefined) return
-    await notifyCaptain({
+    if (body === undefined || support === undefined) return false
+    return notifyCaptain({
       fetcher,
       support,
       title: `FirstMate — ${registration.slug}`,
@@ -737,7 +761,7 @@ function describeEvent(event: WorkerEvent): string {
     case "waiting-question":
       return "is waiting on a question. Open the session to read and answer it."
     case "waiting-permission":
-      return "was waiting on a permission; the service auto-approves worker permissions, so this should clear itself. If it persists, tell the captain."
+      return "is waiting on a permission approval. Tell the captain and open the worker session to inspect the request; do not assume auto-approval cleared it."
     case "steered-answer":
       return `answered the captain's steer: ${event.answer ?? ""}`
   }

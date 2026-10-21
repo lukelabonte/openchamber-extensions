@@ -265,7 +265,8 @@ describe("createSupervisionPoller", () => {
     const round = await poller.poll()
 
     expect(round.notifications[0].message).toContain("waiting on a permission")
-    expect(round.notifications[0].message).toContain("auto-approves")
+    expect(round.notifications[0].message).toContain("Tell the captain")
+    expect(round.notifications[0].message).not.toContain("should clear itself")
   })
 
   test("a transition is reported once, not again on the next poll", async () => {
@@ -532,6 +533,31 @@ describe("createSupervisionPoller", () => {
     expect(calls.filter((call) => call.init.method === "PUT")).toHaveLength(2)
   })
 
+  test("auto-accept reconciles an existing permission in the worker's worktree", async () => {
+    const filesystem = new InMemoryFileSystem()
+    seedRegistry(filesystem)
+    const worktreeDirectory = "/worktrees/sunrise-login"
+    seedBacklog(filesystem, `- Fix flaky login test\n  state: Working\n  session: ses_11bb\n  worktree: ${worktreeDirectory}`)
+    const { exec } = statusExec("busy")
+    let permissionPending = true
+    const { fetcher, calls } = recordingFetcher((call) => {
+      if (call.init.method === "PUT" && JSON.parse(call.init.body ?? "{}").directory === worktreeDirectory) {
+        permissionPending = false
+      }
+      return { status: 200, text: JSON.stringify({ pending: permissionPending ? { ses_11bb: { permissions: [{ id: "perm_1" }] } } : {} }) }
+    })
+    const poller = makePoller({ filesystem: filesystem.port, exec, fetcher })
+
+    await poller.poll()
+    await poller.poll()
+
+    expect(permissionPending).toBe(false)
+    const autoAccepts = calls.filter((call) => call.init.method === "PUT")
+    expect(autoAccepts).toHaveLength(1)
+    expect(JSON.parse(autoAccepts[0]?.init.body ?? "{}")).toEqual({ mode: "auto", directory: worktreeDirectory })
+    expect(poller.getBoardWorkers("sunrise", [{ title: "Fix flaky login test", state: "Working", sessionId: "ses_11bb" }])[0]?.state).toBe("Working")
+  })
+
   test("an unsupported auto-accept is not retried", async () => {
     const filesystem = new InMemoryFileSystem()
     seedRegistry(filesystem)
@@ -613,6 +639,177 @@ describe("createSupervisionPoller", () => {
     const second = await poller.poll()
     expect(second.notifications).toEqual([])
     expect(calls.filter((call) => call.url.endsWith("/api/notifications/emit"))).toHaveLength(2)
+  })
+
+  for (const activity of ["waiting-permission", "waiting-question"] as const) {
+    for (const failure of [503, 429, 401, "throw"] as const) {
+      test(`${activity} captain notification retries after ${failure} and stops after delivery`, async () => {
+        const filesystem = new InMemoryFileSystem()
+        seedRegistry(filesystem)
+        seedBacklog(filesystem, "- Fix flaky login test\n  state: Working\n  session: ses_11bb\n  worktree: /worktrees/sunrise-login")
+        const { exec } = statusExec("busy")
+        let attempts = 0
+        const { fetcher, calls } = recordingFetcher((call) => {
+          if (call.url.endsWith("/api/notifications/emit")) {
+            attempts += 1
+            if (attempts === 1) return failure === "throw" ? "throw" : { status: failure }
+          }
+          return { status: 200, text: JSON.stringify({ pending: { ses_11bb: { [activity === "waiting-permission" ? "permissions" : "forms"]: [{ id: "request_1" }] } } }) }
+        })
+        const poller = makePoller({ filesystem: filesystem.port, exec, fetcher })
+
+        expect((await poller.poll()).notifications).toHaveLength(1)
+        expect((await poller.poll()).notifications).toEqual([])
+        expect((await poller.poll()).notifications).toEqual([])
+
+        expect(attempts).toBe(2)
+        const emits = calls.filter((call) => call.url.endsWith("/api/notifications/emit"))
+        expect(emits[1]?.init.body).toBe(emits[0]?.init.body)
+        expect(JSON.parse(emits[1]?.init.body ?? "{}")).toMatchObject({ sessionId: "ses_11bb", directory: "/worktrees/sunrise-login" })
+      })
+    }
+  }
+
+  test("a blocked notification waits for desktop support to recover", async () => {
+    const filesystem = new InMemoryFileSystem()
+    seedRegistry(filesystem)
+    seedBacklog(filesystem, "- Fix flaky login test\n  state: Working\n  session: ses_11bb")
+    const { exec } = statusExec("waiting-permission")
+    const { fetcher, calls } = recordingFetcher(() => ({ status: 200 }))
+    let supportAvailable = false
+    const poller = makePoller({ filesystem: filesystem.port, exec, fetcher, resolveSupport: async () => {
+      if (!supportAvailable) throw new Error("discovery unavailable")
+      return supported
+    } })
+
+    await poller.poll()
+    supportAvailable = true
+    await poller.poll()
+    await poller.poll()
+
+    expect(calls.filter((call) => call.url.endsWith("/api/notifications/emit"))).toHaveLength(1)
+  })
+
+  test("a worker notifies again when blocked after a verified clear", async () => {
+    const filesystem = new InMemoryFileSystem()
+    seedRegistry(filesystem)
+    seedBacklog(filesystem, "- Fix flaky login test\n  state: Working\n  session: ses_11bb")
+    const { exec } = statusExec("busy")
+    let permissionPending = true
+    const { fetcher, calls } = recordingFetcher(() => ({ status: 200, text: JSON.stringify({ pending: permissionPending ? { ses_11bb: { permissions: [{ id: "perm_1" }] } } : {} }) }))
+    const poller = makePoller({ filesystem: filesystem.port, exec, fetcher })
+
+    await poller.poll()
+    permissionPending = false
+    await poller.poll()
+    permissionPending = true
+    expect((await poller.poll()).notifications).toHaveLength(1)
+    await poller.poll()
+
+    expect(calls.filter((call) => call.url.endsWith("/api/notifications/emit"))).toHaveLength(2)
+  })
+
+  test("a new block replaces the undelivered alert with the current reason", async () => {
+    const filesystem = new InMemoryFileSystem()
+    seedRegistry(filesystem)
+    seedBacklog(filesystem, "- Fix flaky login test\n  state: Working\n  session: ses_11bb")
+    const { exec } = statusExec("busy")
+    let waitingForQuestion = false
+    const { fetcher, calls } = recordingFetcher((call) => {
+      if (call.url.endsWith("/api/notifications/emit")) return { status: waitingForQuestion ? 200 : 503 }
+      return { status: 200, text: JSON.stringify({ pending: { ses_11bb: { [waitingForQuestion ? "forms" : "permissions"]: [{ id: "request_1" }] } } }) }
+    })
+    const poller = makePoller({ filesystem: filesystem.port, exec, fetcher })
+
+    await poller.poll()
+    waitingForQuestion = true
+    await poller.poll()
+    await poller.poll()
+
+    const emits = calls.filter((call) => call.url.endsWith("/api/notifications/emit"))
+    expect(emits).toHaveLength(2)
+    expect(JSON.parse(emits[0]?.init.body ?? "{}").body).toContain("permission approval")
+    expect(JSON.parse(emits[1]?.init.body ?? "{}").body).toContain("answer to a question")
+  })
+
+  test("a failed worker observation defers rather than loses the blocked alert", async () => {
+    const filesystem = new InMemoryFileSystem()
+    seedRegistry(filesystem)
+    seedBacklog(filesystem, "- Fix flaky login test\n  state: Working\n  session: ses_11bb")
+    let observationAvailable = true
+    const { exec } = scriptExec((args) => {
+      if (!observationAvailable) throw new Error("CLI unavailable")
+      return subcommand(args) === "status" ? '{"type":"busy"}' : '{"text":"the last word"}'
+    })
+    let attempts = 0
+    const { fetcher } = recordingFetcher((call) => {
+      if (call.url.endsWith("/api/notifications/emit")) {
+        attempts += 1
+        return { status: attempts === 1 ? 503 : 200 }
+      }
+      return { status: 200, text: JSON.stringify({ pending: { ses_11bb: { permissions: [{ id: "perm_1" }] } } }) }
+    })
+    const poller = makePoller({ filesystem: filesystem.port, exec, fetcher })
+
+    await poller.poll()
+    observationAvailable = false
+    await poller.poll()
+    expect(attempts).toBe(1)
+    observationAvailable = true
+    expect((await poller.poll()).notifications).toEqual([])
+    await poller.poll()
+    expect(attempts).toBe(2)
+  })
+
+  for (const resolution of ["resumed", "removed", "archived"] as const) {
+    test(`an undelivered blocked alert is discarded when the worker is ${resolution}`, async () => {
+      const filesystem = new InMemoryFileSystem()
+      seedRegistry(filesystem)
+      seedBacklog(filesystem, "- Fix flaky login test\n  state: Working\n  session: ses_11bb")
+      const { exec } = statusExec("busy")
+      let permissionPending = true
+      const { fetcher, calls } = recordingFetcher((call) => {
+        if (call.url.endsWith("/api/notifications/emit")) return { status: 503 }
+        return { status: 200, text: JSON.stringify({ pending: permissionPending ? { ses_11bb: { permissions: [{ id: "perm_1" }] } } : {} }) }
+      })
+      const poller = makePoller({ filesystem: filesystem.port, exec, fetcher })
+      await poller.poll()
+
+      if (resolution === "resumed") permissionPending = false
+      if (resolution === "removed") seedBacklog(filesystem, "")
+      if (resolution === "archived") await archiveSession(filesystem.port, homeRoot, "sunrise", { sessionId: "ses_11bb", title: "Fix flaky login test", archivedAt: "2026-10-21T00:00:00Z" })
+      await poller.poll()
+      await poller.poll()
+
+      expect(calls.filter((call) => call.url.endsWith("/api/notifications/emit"))).toHaveLength(1)
+    })
+  }
+
+  test("a degraded pending snapshot does not discard an undelivered blocked alert", async () => {
+    const filesystem = new InMemoryFileSystem()
+    seedRegistry(filesystem)
+    seedBacklog(filesystem, "- Fix flaky login test\n  state: Working\n  session: ses_11bb")
+    const { exec } = statusExec("busy")
+    let snapshotAvailable = true
+    let attempts = 0
+    const { fetcher } = recordingFetcher((call) => {
+      if (call.url.endsWith("/api/sessions/status") && !snapshotAvailable) return "throw"
+      if (call.url.endsWith("/api/notifications/emit")) {
+        attempts += 1
+        return { status: attempts === 1 ? 503 : 200 }
+      }
+      return { status: 200, text: JSON.stringify({ pending: { ses_11bb: { permissions: [{ id: "perm_1" }] } } }) }
+    })
+    const poller = makePoller({ filesystem: filesystem.port, exec, fetcher })
+
+    await poller.poll()
+    snapshotAvailable = false
+    await poller.poll()
+    expect(attempts).toBe(1)
+    snapshotAvailable = true
+    await poller.poll()
+    await poller.poll()
+    expect(attempts).toBe(2)
   })
 
   test("a host snapshot with no pending entries keeps the CLI activity", async () => {

@@ -1693,7 +1693,7 @@ function truncateLastWord(text) {
 // service/notifications.ts
 async function notifyCaptain(input) {
   try {
-    await callDesktopProxy({
+    const outcome = await callDesktopProxy({
       fetcher: input.fetcher,
       support: input.support,
       method: "POST",
@@ -1706,7 +1706,10 @@ async function notifyCaptain(input) {
       }),
       label: "captain notification"
     });
-  } catch {}
+    return outcome.kind === "ok";
+  } catch {
+    return false;
+  }
 }
 
 // service/session-observation.ts
@@ -1877,6 +1880,7 @@ function createSupervisionPoller(input) {
   const stallBaselines = new Map;
   const lastSeenTerminals = new Map;
   const autoAcceptedSessions = new Set;
+  const pendingBlockedAlerts = new Map;
   const observationKey = (slug, sessionId) => `${slug}
 ${sessionId}`;
   async function poll() {
@@ -1899,8 +1903,10 @@ ${sessionId}`;
       if (events.length > 0) {
         notifications.push(composeNotification(registration, events));
       }
-      for (const event of events)
-        await notifyEvent(registration, event, support);
+      for (const event of events) {
+        if (event.kind !== "waiting-permission" && event.kind !== "waiting-question")
+          await notifyEvent(registration, event, support);
+      }
       notifications.push(...await pollArchiveRequests(registration, support, pending));
     }
     return { notifications };
@@ -1970,6 +1976,11 @@ ${sessionId}`;
       return events;
     }
     const activeSessionIds = new Set(backlog.tasks.flatMap((task) => task.sessionId === undefined || archivedSessionIds.has(task.sessionId) ? [] : [task.sessionId]));
+    const prefix = observationKey(registration.slug, "");
+    for (const [key, event] of pendingBlockedAlerts) {
+      if (key.startsWith(prefix) && !activeSessionIds.has(event.sessionId))
+        pendingBlockedAlerts.delete(key);
+    }
     const listedSessions = new Map;
     if (activeSessionIds.size > 1) {
       try {
@@ -1999,7 +2010,7 @@ ${sessionId}`;
             fetcher,
             support,
             sessionId: task.sessionId,
-            directory
+            directory: task.worktreeDirectory ?? directory
           });
           if (outcome.kind === "ok" || outcome.kind === "unsupported") {
             autoAcceptedSessions.add(task.sessionId);
@@ -2041,7 +2052,21 @@ ${sessionId}`;
         observations.set(key, current);
         updateStallTracking(key, task, current, nowMs());
         pollErrors.delete(key);
-        events.push(...detectEvents(task, previous, current, lastSeenTerminal));
+        const workerEvents = detectEvents(task, previous, current, lastSeenTerminal);
+        events.push(...workerEvents);
+        for (const event of workerEvents) {
+          if (event.kind === "waiting-permission" || event.kind === "waiting-question")
+            pendingBlockedAlerts.set(key, event);
+        }
+        const blockedAlert = pendingBlockedAlerts.get(key);
+        if (blockedAlert !== undefined) {
+          if (current.status.activity === blockedAlert.kind) {
+            if (await notifyEvent(registration, blockedAlert, support))
+              pendingBlockedAlerts.delete(key);
+          } else if (current.status.activity !== "unknown" && (pending.kind === "ok" || current.status.activity === "idle" || current.status.activity === "waiting-permission" || current.status.activity === "waiting-question")) {
+            pendingBlockedAlerts.delete(key);
+          }
+        }
         if (seenTerminal !== undefined)
           lastSeenTerminals.set(key, seenTerminal);
         if (steeredBaselines.has(key) && current.lastWord !== undefined && current.lastWord !== steeredBaselines.get(key)) {
@@ -2139,8 +2164,8 @@ ${sessionId}`;
   async function notifyEvent(registration, event, support) {
     const body = captainEventBody(event);
     if (body === undefined || support === undefined)
-      return;
-    await notifyCaptain({
+      return false;
+    return notifyCaptain({
       fetcher,
       support,
       title: `FirstMate — ${registration.slug}`,
@@ -2258,7 +2283,7 @@ function describeEvent(event) {
     case "waiting-question":
       return "is waiting on a question. Open the session to read and answer it.";
     case "waiting-permission":
-      return "was waiting on a permission; the service auto-approves worker permissions, so this should clear itself. If it persists, tell the captain.";
+      return "is waiting on a permission approval. Tell the captain and open the worker session to inspect the request; do not assume auto-approval cleared it.";
     case "steered-answer":
       return `answered the captain's steer: ${event.answer ?? ""}`;
   }

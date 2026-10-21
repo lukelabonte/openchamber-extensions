@@ -3,9 +3,8 @@ import type { HttpFetcher, InterruptSupport } from "./interrupt"
 
 // The captain's desktop notification through the host's emit route
 // (POST /api/notifications/emit — title and body, optional session id and
-// directory context). Best effort by contract: an unsupported host, a failed
-// call, and the host's own rate limit are all swallowed — a missed
-// notification must never fail the work it reports on.
+// directory context). Never throws: a missed notification must not fail the
+// work it reports on. False leaves callers free to retry an undelivered alert.
 export async function notifyCaptain(input: {
   fetcher: HttpFetcher
   support: InterruptSupport
@@ -13,9 +12,9 @@ export async function notifyCaptain(input: {
   body: string
   sessionId?: string
   directory?: string
-}): Promise<void> {
+}): Promise<boolean> {
   try {
-    await callDesktopProxy({
+    const outcome = await callDesktopProxy({
       fetcher: input.fetcher,
       support: input.support,
       method: "POST",
@@ -28,7 +27,8 @@ export async function notifyCaptain(input: {
       }),
       label: "captain notification",
     })
+    return outcome.kind === "ok"
   } catch {
-    // Best effort: never throws.
+    return false
   }
 }

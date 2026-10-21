@@ -27,7 +27,11 @@ A handoff is a work request, not merge approval. The charter requires a durable 
 
 ## Settings and lifecycle
 
-The settings form stores coordinator and worker `provider/model` IDs, optional host model variants, and a board refresh interval from 5 to 3,600 seconds. Empty coordinator fields keep the host defaults. Empty worker fields leave selection to the first mate. Coordinator selection applies to new sessions. Worker defaults become instructions for subsequent dispatches; unavailable model/variant combinations still fail at the host.
+The settings form stores coordinator and worker `provider/model` IDs, optional host model variants, and a board refresh interval from 5 to 3,600 seconds. Empty coordinator fields keep the host defaults. Coordinator selection applies to new first mate sessions.
+
+For workers, each empty field requires the first mate to choose an explicit value before creating, resuming, steering, or relaunching a worker. The first mate checks available models and supported effort variants, then passes both values on the create or send action. It reassesses the next work and can choose a stronger model or higher effort for difficult work, or a smaller model or lower effort for routine work. Each captain-set field stays fixed unless the captain explicitly changes it. Selections and reasons go in the brief or report. An unsupported or unverifiable pair stops dispatch or resume instead of falling back to host defaults.
+
+These rules are composed instructions for the first mate, not a service-level enforcement gate. They also appear when the shared charter has local edits. The board's direct Steer action still relays the captain's message to the worker without selecting a model. The first mate's own resumed sends follow the selection rules.
 
 Variant IDs aren't limited to standard reasoning names. Provider-specific IDs such as `provider:adaptive/extended` pass through unchanged. Empty coordinator variants show “OpenChamber default”; empty worker variants show “Leave it to the first mate.” Those labels aren't saved as variant IDs. Arbitrary provider session options aren't supported by the OpenChamber adapter.
 

@@ -153,7 +153,7 @@ describe("launchFirstMate", () => {
     expect(fake.calls[0].command).toBe("openchamber")
     expect(fake.calls[0].args).toEqual(["session", "create", "--dir", "/home/firstmate/projects/sunrise", "--title", "FirstMate — sunrise", "--variant", variant, "--json"])
     expect(JSON.parse(filesystem.fileContents(settingsPath))).toMatchObject({ coordinatorVariant: variant, workerVariant: "worker:separate/variant", custom: true })
-    expect(filesystem.fileContents("/home/firstmate/projects/sunrise/AGENTS.md")).toContain('Use variant "worker:separate/variant" for new workers')
+    expect(filesystem.fileContents("/home/firstmate/projects/sunrise/AGENTS.md")).toContain('Use variant "worker:separate/variant" for new and resumed workers')
   })
 
   test("a blank coordinator variant stays omitted when a worker variant is configured", async () => {
@@ -166,7 +166,7 @@ describe("launchFirstMate", () => {
 
     expect(fake.calls).toHaveLength(1)
     expect(fake.calls[0].args).not.toContain("--variant")
-    expect(filesystem.fileContents("/home/firstmate/projects/sunrise/AGENTS.md")).toContain('Use variant "default" for new workers')
+    expect(filesystem.fileContents("/home/firstmate/projects/sunrise/AGENTS.md")).toContain('Use variant "default" for new and resumed workers')
   })
 
   test("recomposes available home layers on adoption without creating another session", async () => {

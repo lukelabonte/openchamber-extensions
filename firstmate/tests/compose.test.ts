@@ -48,22 +48,57 @@ describe("composeInstructions", () => {
     await composeInstructions({ filesystem: filesystem.port, homeRoot: "/home/firstmate", slug: "sunrise" })
 
     const composed = filesystem.fileContents("/home/firstmate/projects/sunrise/AGENTS.md")
-    expect(composed).toContain("## Configured worker defaults")
-    expect(composed).toContain(`Use variant ${quotedVariant} for new workers (session.create variant; CLI --variant), unless the captain explicitly chooses another.`)
+    expect(composed).toContain("## Worker model selection")
+    expect(composed).toContain(`Use variant ${quotedVariant} for new and resumed workers unless the captain explicitly chooses another.`)
   })
 
-  test("blank worker variants omit variant instructions without suppressing the worker model", async () => {
+  test("blank worker fields require explicit selection without suppressing captain settings", async () => {
     const filesystem = new InMemoryFileSystem()
     const settingsPath = "/home/firstmate/projects/sunrise/settings.json"
     filesystem.seedFile(settingsPath, JSON.stringify({ workerModel: "provider/worker", workerVariant: "" }))
     const withModel = await composeInstructions({ filesystem: filesystem.port, homeRoot: "/home/firstmate", slug: "sunrise" })
-    expect(withModel).toContain('Use model "provider/worker" for new workers')
+    expect(withModel).toContain('Use model "provider/worker" for new and resumed workers')
     expect(withModel).not.toContain("Use variant")
-    expect(withModel).not.toContain("--variant")
+    expect(withModel).toContain("Choose each unset field yourself")
 
     filesystem.seedFile(settingsPath, JSON.stringify({ workerModel: "", workerVariant: "" }))
     const withoutDefaults = await composeInstructions({ filesystem: filesystem.port, homeRoot: "/home/firstmate", slug: "sunrise" })
-    expect(withoutDefaults).not.toContain("Configured worker defaults")
-    expect(withoutDefaults).not.toContain("--variant")
+    expect(withoutDefaults).toContain("## Worker model selection")
+    expect(withoutDefaults).toContain("Choose each unset field yourself")
+    expect(withoutDefaults).not.toContain("Use model")
+    expect(withoutDefaults).not.toContain("Use variant")
+  })
+
+  test("always includes explicit create, resume, and replacement selection rules, even with a custom charter", async () => {
+    const filesystem = new InMemoryFileSystem()
+    filesystem.seedFile("/home/firstmate/shared/charter.md", "CUSTOM CHARTER")
+    const composed = await composeInstructions({ filesystem: filesystem.port, homeRoot: "/home/firstmate", slug: "sunrise" })
+
+    expect(composed).toContain("CUSTOM CHARTER")
+    expect(composed).toContain("Before creating, resuming, steering, or relaunching a worker")
+    expect(composed).toContain("Pass both `model` and `variant` explicitly")
+    expect(composed).toContain("`session.create` and `session.send`")
+    expect(composed).toContain("Reassess the next work rather than inheriting the session's previous selection")
+    expect(composed).toContain("Move to a more capable model or higher effort")
+    expect(composed).toContain("Move to a smaller model or lower effort")
+    expect(composed).toContain("Record the selected model, exact variant, and short reason")
+    expect(composed).toContain("preserve its session, worktree, history, scope, and holds")
+  })
+
+  test("requires supported variants and stops instead of silently using host defaults", async () => {
+    const filesystem = new InMemoryFileSystem()
+    filesystem.seedFile("/home/firstmate/projects/sunrise/settings.json", JSON.stringify({ workerVariant: "provider:adaptive/extended" }))
+    const composed = await composeInstructions({ filesystem: filesystem.port, homeRoot: "/home/firstmate", slug: "sunrise" })
+
+    expect(composed).toContain("Choose each unset field yourself")
+    expect(composed).toContain("Keep captain-set fields fixed")
+    expect(composed).toContain("provider's exact variant id")
+    expect(composed).toContain("not a fixed reasoning-level enum")
+    expect(composed).toContain("`models.search` with the worker's directory")
+    expect(composed).toContain("each model's `variants` list")
+    expect(composed).toContain("A model with no listed variants can't satisfy explicit effort selection")
+    expect(composed).toContain("If no supported explicit pair satisfies the captain's choices")
+    expect(composed).toContain("stop before dispatch or resume")
+    expect(composed).toContain("Never retry by dropping `model` or `variant`")
   })
 })

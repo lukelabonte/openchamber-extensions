@@ -651,7 +651,7 @@ function settingsSection(): HTMLElement {
   if (error !== undefined) section.append(warningCallout(error))
   const draft = settingsDraft
   if (draft !== undefined) {
-    section.append(mutedNote("Use full provider/model IDs (for example openai/gpt-example) and the provider's exact reasoning/variant IDs, not a fixed list of effort levels. Blank models use OpenChamber defaults; a blank coordinator variant uses the host default, while a blank worker variant leaves the choice to the first mate. Model and variant changes apply to new sessions. Refresh defaults to 30 seconds."))
+    section.append(mutedNote("Use full provider/model IDs (for example openai/gpt-example) and the provider's exact reasoning/variant IDs, not a fixed list of effort levels. Blank coordinator fields use OpenChamber defaults and apply to new first mate sessions. Blank worker fields require the first mate to choose an explicit model and effort variant before creating or resuming a worker. Set worker fields stay fixed unless the captain explicitly changes them. Refresh defaults to 30 seconds."))
     const fields = [
       ["Coordinator model", "coordinatorModel"], ["Coordinator variant", "coordinatorVariant"],
       ["Worker model", "workerModel"], ["Worker variant", "workerVariant"], ["Refresh seconds", "refreshSeconds"],

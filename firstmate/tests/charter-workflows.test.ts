@@ -74,9 +74,9 @@ describe("FirstMate charter workflows", () => {
     expect(charter).toContain("never invent a message id")
   })
 
-  test("keeps provider-specific variant IDs intact and names the unsupported session-option boundary", () => {
-    expect(charter).toContain("provider's exact variant id")
-    expect(charter).toContain("not a fixed reasoning-level enum")
+  test("uses the composed worker selection policy for dispatch and recovery", () => {
+    expect(charter).toContain("Worker model selection")
+    expect(charter).not.toContain("A blank worker variant leaves the choice to you")
     expect(charter).toContain("doesn't accept arbitrary provider session options")
   })
 

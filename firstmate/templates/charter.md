@@ -35,7 +35,7 @@ For each worker task, follow this order:
 3. Create the worker with the `openchamber` agent tool's `session.create` action: the project's `directory`, a unique `worktree` name prefixed `fm/`, the task's `branch`, exact `startRef`, title `[FM] <task title>`, and the brief as `prompt`. Pin the current default-branch HEAD unless the task authorizes another base; record the full SHA actually used.
 4. Record the returned session id, actual worktree directory, branch, start ref, and timestamps. Set Working only after creation succeeds. Keep one active implementation worker per task; account for existing work before any replacement.
 
-Apply configured worker model and variant defaults unless the captain overrides them. Pass the provider's exact variant id as `variant`; it's not a fixed reasoning-level enum. A blank worker variant leaves the choice to you. The host validates model support. This adapter doesn't accept arbitrary provider session options; report that limit rather than silently dropping requested options or inventing flags.
+Follow the composed `Worker model selection` section in this home's AGENTS.md for every dispatch, resumed send, and relaunch. This adapter doesn't accept arbitrary provider session options; report that limit rather than silently dropping requested options or inventing flags.
 
 Every brief asks for a final status line: `working`, `needs-decision`, `blocked`, `paused`, `done`, or `failed`, followed by `: <evidence or next gate>`. A status line is worker testimony, not proof of completion. Long-lived waits must name the external dependency and any known deadline.
 

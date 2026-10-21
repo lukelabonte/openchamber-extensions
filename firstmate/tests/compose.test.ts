@@ -69,6 +69,19 @@ describe("composeInstructions", () => {
     expect(withoutDefaults).not.toContain("Use variant")
   })
 
+  test("always includes session title rules, even with a custom charter using the old prefix", async () => {
+    const filesystem = new InMemoryFileSystem()
+    filesystem.seedFile("/home/firstmate/shared/charter.md", "Create workers with title `[FM] <task title>`.")
+    const composed = await composeInstructions({ filesystem: filesystem.port, homeRoot: "/home/firstmate", slug: "sunrise" })
+
+    expect(composed).toContain("## Session titles")
+    expect(composed).toContain("title `⚓ <task title>`")
+    expect(composed).toContain("including scouts, implementation workers, landing workers, and relaunch replacements")
+    expect(composed).toContain("takes precedence over older title conventions in the layers above")
+    expect(composed.indexOf("## Session titles")).toBeGreaterThan(composed.indexOf("Create workers with title"))
+    expect(composed).toContain("Keep existing session titles unchanged")
+  })
+
   test("always includes explicit create, resume, and replacement selection rules, even with a custom charter", async () => {
     const filesystem = new InMemoryFileSystem()
     filesystem.seedFile("/home/firstmate/shared/charter.md", "CUSTOM CHARTER")

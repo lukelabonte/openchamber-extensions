@@ -39,20 +39,20 @@ describe("createSession", () => {
   test("passes optional opening prompt, provider/model and variant atomically on create", async () => {
     const { exec, calls } = fakeExec('{"sessionId":"ses_new"}')
     expect(await createSession(exec, { directory: "/home/project", title: "FirstMate", prompt: "Captain's opening\nKeep this verbatim.", model: "provider/model", variant: "high" })).toBe("ses_new")
-    expect(calls[0].args).toEqual(["session", "create", "--dir", "/home/project", "--title", "FirstMate", "--prompt", "Captain's opening\nKeep this verbatim.", "--model", "provider/model", "--variant", "high", "--json"])
+    expect(calls[0].args).toEqual(["session", "create", "--dir", "/home/project", "--title", "⚓ FirstMate", "--prompt", "Captain's opening\nKeep this verbatim.", "--model", "provider/model", "--variant", "high", "--json"])
   })
 
   test("does not add unspecified optional flags", async () => {
     const { exec, calls } = fakeExec('{"sessionID":"ses_new"}')
     await createSession(exec, { directory: "/home/project", title: "FirstMate" })
-    expect(calls[0].args).toEqual(["session", "create", "--dir", "/home/project", "--title", "FirstMate", "--json"])
+    expect(calls[0].args).toEqual(["session", "create", "--dir", "/home/project", "--title", "⚓ FirstMate", "--json"])
   })
 
   test.each(["provider:adaptive/extended", '推論 mode "深い" \\ route', "v".repeat(200), "default", "  provider:adaptive/extended  "])("passes opaque provider variants as one unchanged CLI argument: %j", async (variant) => {
     const { exec, calls } = fakeExec('{"sessionId":"ses_new"}')
 
     expect(await createSession(exec, { directory: "/home/project", title: "FirstMate", variant })).toBe("ses_new")
-    expect(calls).toEqual([{ command: "openchamber", args: ["session", "create", "--dir", "/home/project", "--title", "FirstMate", "--variant", variant, "--json"] }])
+    expect(calls).toEqual([{ command: "openchamber", args: ["session", "create", "--dir", "/home/project", "--title", "⚓ FirstMate", "--variant", variant, "--json"] }])
   })
 
   test("propagates the CLI's unsupported provider-variant error", async () => {

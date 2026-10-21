@@ -25,7 +25,7 @@ describe("createSession", () => {
     expect(calls).toEqual([
       {
         command: "openchamber",
-        args: ["session", "create", "--dir", "/home/firstmate/projects/sunrise", "--title", "FirstMate — sunrise", "--json"],
+        args: ["session", "create", "--dir", "/home/firstmate/projects/sunrise", "--title", "⚓ FirstMate — sunrise", "--json"],
       },
     ])
   })

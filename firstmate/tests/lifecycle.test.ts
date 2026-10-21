@@ -136,6 +136,7 @@ describe("FirstMate lifecycle", () => {
     expect(result.registration).toMatchObject({ homeDirectory, projectDirectory, coordinatorSessionId: "ses_fresh" })
     expect(result.previousSessionId).toBe("ses_old")
     const create = calls.find((args) => args[1] === "create")!
+    expect(create[create.indexOf("--title") + 1]).toBe("⚓ FirstMate — sunrise")
     expect(create[create.indexOf("--model") + 1]).toBe("provider/coordinator")
     expect(create[create.indexOf("--variant") + 1]).toBe("high")
     const prompt = create[create.indexOf("--prompt") + 1]

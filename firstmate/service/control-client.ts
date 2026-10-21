@@ -35,7 +35,7 @@ export interface SessionListEntry {
 export type ExecRunner = (command: string, args: readonly string[]) => Promise<string>
 
 export async function createSession(exec: ExecRunner, input: { directory: string; title: string; prompt?: string; model?: string; variant?: string }): Promise<string> {
-  const args = ["session", "create", "--dir", input.directory, "--title", input.title]
+  const args = ["session", "create", "--dir", input.directory, "--title", `⚓ ${input.title}`]
   for (const name of ["prompt", "model", "variant"] as const) {
     if (input[name] !== undefined) args.push(`--${name}`, input[name])
   }

@@ -44,6 +44,10 @@ ${headerLines.join("\n")}
     .join("\n\n")
 
   const settings = await loadProjectSettings(filesystem, `${homeRoot}/projects/${slug}`)
+  const sessionTitles = [
+    "## Session titles",
+    "Create every new session with title `⚓ <task title>`, including scouts, implementation workers, landing workers, and relaunch replacements. This prefix takes precedence over older title conventions in the layers above. Keep existing session titles unchanged when adopting, resuming, or steering them.",
+  ].join("\n\n")
   const workerSelection = [
     "## Worker model selection",
     "Before creating, resuming, steering, or relaunching a worker, select a model and supported effort variant for the next work. Pass both `model` and `variant` explicitly with the openchamber tool's `session.create` and `session.send` actions. Blank settings require a choice, not host defaults.",
@@ -53,7 +57,7 @@ ${headerLines.join("\n")}
     "Reassess the next work rather than inheriting the session's previous selection. Choose the least costly model and effort that can reliably complete it. Move to a more capable model or higher effort for difficult reasoning, uncertain failures, or high-risk changes. Move to a smaller model or lower effort for bounded, routine work when the evidence supports it. Change only fields the captain left unset, at the next authorized send to an idle worker; preserve its session, worktree, history, scope, and holds. A model change isn't permission to interrupt, resume, or expand work.",
     "Record the selected model, exact variant, and short reason in the brief before dispatch and in the task's report before a resumed send. If the host rejects the selection, record the failure rather than claiming the change took effect. If no supported explicit pair satisfies the captain's choices, or model/variant support can't be verified, report the limit and stop before dispatch or resume. Never retry by dropping `model` or `variant` or silently changing a captain-set field.",
   ].filter(Boolean).join("\n\n")
-  const composed = `${header}\n\n${body}\n\n${workerSelection}\n`
+  const composed = `${header}\n\n${body}\n\n${sessionTitles}\n\n${workerSelection}\n`
   const filePath = `${homeRoot}/projects/${slug}/AGENTS.md`
   const temporaryPath = `${filePath}.${randomUUID()}.tmp`
   await filesystem.writeFile(temporaryPath, composed)

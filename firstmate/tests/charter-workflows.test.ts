@@ -9,6 +9,11 @@ const backlog = template("backlog.md")
 const projectCharter = template("project-charter.md")
 
 describe("FirstMate charter workflows", () => {
+  test("prefixes both initial and replacement worker titles with the anchor", () => {
+    expect(charter.match(/title `⚓ <task title>`/g)).toHaveLength(2)
+    expect(charter).not.toContain("[FM]")
+  })
+
   test("keeps project isolation and worker-only repository mutation in a short charter", () => {
     expect(charter.trim().split("\n").length).toBeLessThan(180)
     expect(charter).toContain("one first mate per OpenChamber project")

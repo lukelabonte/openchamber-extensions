@@ -39,7 +39,9 @@ Variant IDs aren't limited to standard reasoning names. Provider-specific IDs su
 
 The first mate's chat appears under its managed project in the OpenChamber sidebar. Its working directory stays in its home. This requires an OpenChamber host and CLI with `session associate-project` support. FirstMate records the association when it launches, adopts or restarts a first mate. Service startup also restores associations for existing registrations. A failed association preserves the saved chat and reports an error. Retrying launch reuses that chat. Release preserves the previous chat's association. VS Code keeps its workspace-only sidebar.
 
-Compact, same-thread context reset, pinning, multi-machine dispatch, and a guaranteed host parent-child fleet aren't exposed by this port. An unrelated session isn't claimed as a worker because its title happens to start with `[FM]`.
+New coordinator titles start with `⚓ FirstMate`, and worker instructions require `⚓ <task title>` for scouts, implementation, landing, and relaunches. Composed instructions include the prefix rule even with a custom charter. Existing and adopted sessions keep their titles. The prefix is a visual marker, not ownership evidence.
+
+Compact, same-thread context reset, pinning, multi-machine dispatch, and a guaranteed host parent-child fleet aren't exposed by this port. An unrelated session isn't claimed as a worker because its title happens to start with `⚓`.
 
 ## Worker reads and message evidence
 

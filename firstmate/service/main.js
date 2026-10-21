@@ -20,7 +20,7 @@ class SessionBusyError extends Error {
   }
 }
 async function createSession(exec, input) {
-  const args = ["session", "create", "--dir", input.directory, "--title", input.title];
+  const args = ["session", "create", "--dir", input.directory, "--title", `⚓ ${input.title}`];
   for (const name of ["prompt", "model", "variant"]) {
     if (input[name] !== undefined)
       args.push(`--${name}`, input[name]);
@@ -655,6 +655,12 @@ ${layer.contents}`).join(`
 
 `);
   const settings = await loadProjectSettings(filesystem, `${homeRoot}/projects/${slug}`);
+  const sessionTitles = [
+    "## Session titles",
+    "Create every new session with title `⚓ <task title>`, including scouts, implementation workers, landing workers, and relaunch replacements. This prefix takes precedence over older title conventions in the layers above. Keep existing session titles unchanged when adopting, resuming, or steering them."
+  ].join(`
+
+`);
   const workerSelection = [
     "## Worker model selection",
     "Before creating, resuming, steering, or relaunching a worker, select a model and supported effort variant for the next work. Pass both `model` and `variant` explicitly with the openchamber tool's `session.create` and `session.send` actions. Blank settings require a choice, not host defaults.",
@@ -669,6 +675,8 @@ ${layer.contents}`).join(`
   const composed = `${header}
 
 ${body}
+
+${sessionTitles}
 
 ${workerSelection}
 `;

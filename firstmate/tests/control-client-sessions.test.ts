@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import {
   associateSessionProject,
+  controlErrorMessage,
   createSession,
   MissingCliError,
   sessionLastAssistant,
@@ -9,6 +10,7 @@ import {
   sessionSend,
   sessionStatus,
   SessionBusyError,
+  UnsupportedSessionProjectError,
   type ExecRunner,
 } from "../service/control-client"
 
@@ -81,9 +83,33 @@ describe("associateSessionProject", () => {
     await expect(associateSessionProject(fakeExec(output).exec, input)).rejects.toThrow()
   })
 
-  test("reports unsupported CLI versions and missing CLI failures", async () => {
+  test.each(["Unknown option: --display-project-dir", "Unknown session command 'associate-project'."])("classifies only known unsupported CLI diagnostics: %s", async (message) => {
+    for (const exec of [
+      failingExec(new Error(`openchamber exited with code 1: ${message}`)).exec,
+      fakeExec(JSON.stringify({ status: "error", error: { message } })).exec,
+    ]) {
+      await expect(associateSessionProject(exec, input)).rejects.toBeInstanceOf(UnsupportedSessionProjectError)
+    }
+  })
+
+  test("reports other CLI failures and missing CLI failures", async () => {
     await expect(associateSessionProject(failingExec(new Error("unknown session action associate-project")).exec, input)).rejects.toThrow("associate-project")
+    for (const message of ["host unavailable", "Unknown option: --session", "session not found", "Unknown option: --display-project-dir while contacting server"]) {
+      const error = await associateSessionProject(failingExec(new Error(message)).exec, input).catch((error: unknown) => error)
+      expect(error).toBeInstanceOf(Error)
+      expect(error).not.toBeInstanceOf(UnsupportedSessionProjectError)
+    }
     await expect(associateSessionProject(failingExec(Object.assign(new Error("missing"), { code: "ENOENT" })).exec, input)).rejects.toBeInstanceOf(MissingCliError)
+  })
+})
+
+describe("controlErrorMessage", () => {
+  test("extracts only the diagnostic from a structured CLI error", () => {
+    expect(controlErrorMessage(JSON.stringify({ status: "error", error: { message: "Unknown option: --display-project-dir", details: ["unrelated details"] }, text: "unrelated output" }))).toBe("Unknown option: --display-project-dir")
+  })
+
+  test.each(["not JSON", "{}", '{"status":"ok","message":"session text"}', '{"status":"error","error":{}}', '{"status":"error","error":{"message":" "}}'])("does not surface arbitrary output or malformed errors: %s", (output) => {
+    expect(controlErrorMessage(output)).toBeUndefined()
   })
 })
 

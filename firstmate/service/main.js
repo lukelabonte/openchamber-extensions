@@ -19,6 +19,13 @@ class SessionBusyError extends Error {
     this.name = "SessionBusyError";
   }
 }
+
+class UnsupportedSessionProjectError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "UnsupportedSessionProjectError";
+  }
+}
 async function createSession(exec, input) {
   const args = ["session", "create", "--dir", input.directory, "--title", `⚓ ${input.title}`];
   for (const name of ["prompt", "model", "variant"]) {
@@ -35,20 +42,28 @@ async function createSession(exec, input) {
   return sessionId;
 }
 async function associateSessionProject(exec, input) {
-  const output = await runControlCommand(exec, [
-    "session",
-    "associate-project",
-    "--session",
-    input.sessionId,
-    "--dir",
-    input.directory,
-    "--display-project-dir",
-    input.projectDirectory,
-    "--json"
-  ]);
-  const parsed = parseJsonOutput(output);
-  if (extractSessionId(parsed) !== input.sessionId)
-    throw new Error("openchamber session associate-project returned a different session id");
+  try {
+    const output = await runControlCommand(exec, [
+      "session",
+      "associate-project",
+      "--session",
+      input.sessionId,
+      "--dir",
+      input.directory,
+      "--display-project-dir",
+      input.projectDirectory,
+      "--json"
+    ]);
+    const parsed = parseJsonOutput(output);
+    if (extractSessionId(parsed) !== input.sessionId)
+      throw new Error("openchamber session associate-project returned a different session id");
+  } catch (error) {
+    const message = error instanceof Error ? error.message.replace(/^openchamber exited with code \d+: /, "") : undefined;
+    if (message === "Unknown option: --display-project-dir" || message === "Unknown session command 'associate-project'.") {
+      throw new UnsupportedSessionProjectError(message);
+    }
+    throw error;
+  }
 }
 async function sessionStatus(exec, input) {
   const output = await runControlCommand(exec, ["session", "status", "--session", input.sessionId, "--dir", input.directory, "--json"]);
@@ -134,9 +149,23 @@ function parseJsonOutput(output) {
     throw new Error("openchamber command did not return valid JSON");
   }
   if (isRecord(parsed) && (parsed.status === "error" || parsed.ok === false || parsed.success === false || parsed.error != null)) {
-    throw new Error("openchamber command returned an error response");
+    throw new Error(extractControlErrorMessage(parsed) ?? "openchamber command returned an error response");
   }
   return parsed;
+}
+function controlErrorMessage(output) {
+  try {
+    return extractControlErrorMessage(JSON.parse(output));
+  } catch {
+    return;
+  }
+}
+function extractControlErrorMessage(parsed) {
+  if (!isRecord(parsed) || parsed.status !== "error" && parsed.ok !== false && parsed.success !== false && parsed.error == null)
+    return;
+  if (isRecord(parsed.error) && typeof parsed.error.message === "string" && parsed.error.message.trim() !== "")
+    return parsed.error.message;
+  return;
 }
 function extractArchived(parsed) {
   if (!isRecord(parsed))
@@ -796,6 +825,8 @@ async function associateFirstMateSession(exec, registration) {
       projectDirectory: registration.projectDirectory
     });
   } catch (error) {
+    if (error instanceof UnsupportedSessionProjectError)
+      return;
     if (error instanceof MissingCliError)
       throw error;
     throw new Error(`first mate ${registration.coordinatorSessionId} is saved, but its sidebar project association failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -3692,7 +3723,8 @@ var nodeExec = (command, args) => new Promise((resolve, reject) => {
       return;
     }
     const stderr = Buffer.concat(stderrChunks).toString("utf8").trim();
-    reject(new Error(`${command} exited with code ${code}${stderr === "" ? "" : `: ${stderr}`}`));
+    const detail = (command === "openchamber" && args.includes("--json") ? controlErrorMessage(Buffer.concat(stdoutChunks).toString("utf8")) : undefined) ?? stderr;
+    reject(new Error(`${command} exited with code ${code}${detail === undefined || detail === "" ? "" : `: ${detail}`}`));
   });
 });
 var nodeFetcher = (url, init) => fetch(url, init);

@@ -32,7 +32,24 @@ beforeAll(async () => {
   mkdirSync(emptyPathDirectory)
   writeFileSync(
     path.join(shimDirectory, "openchamber"),
-    `#!${process.execPath}\nimport { appendFileSync } from "node:fs"\nappendFileSync(process.env.FIRSTMATE_SHIM_LOG, JSON.stringify(process.argv.slice(2)) + "\\n")\nconsole.log('{"sessionID":"ses_coord_1"}')\n`,
+    `#!${process.execPath}
+import { appendFileSync, writeFileSync } from "node:fs"
+const args = process.argv.slice(2)
+appendFileSync(process.env.FIRSTMATE_SHIM_LOG, JSON.stringify(args) + "\\n")
+if (args[1] === "associate-project") {
+  const directory = args[args.indexOf("--display-project-dir") + 1]
+  const message = directory.endsWith("unsupported-sidebar-repo") || directory.endsWith("unsupported-warning-repo") ? "Unknown option: --display-project-dir"
+    : directory.endsWith("unsupported-command-repo") ? "Unknown session command 'associate-project'."
+    : directory.endsWith("failed-sidebar-repo") ? "project association request failed"
+    : undefined
+  if (message) {
+    if (directory.endsWith("unsupported-warning-repo")) writeFileSync(2, "CLI startup warning\\n")
+    writeFileSync(1, JSON.stringify({ status: "error", error: { message, details: [message] } }) + "\\n")
+    process.exit(1)
+  }
+}
+console.log('{"sessionID":"ses_coord_1"}')
+`,
   )
   chmodSync(path.join(shimDirectory, "openchamber"), 0o755)
 
@@ -228,6 +245,35 @@ describe("POST /launch and the registry endpoints", () => {
       headers: { authorization: `Bearer ${serviceToken}` },
     })
     expect(invalid.status).toBe(400)
+  })
+
+  test.each(["unsupported-sidebar-repo", "unsupported-command-repo", "unsupported-warning-repo"])("launches and reopens without duplicate sessions when the CLI lacks sidebar support: %s", async (name) => {
+    const projectDirectory = path.join(tempRoot, name)
+    mkdirSync(projectDirectory)
+    const callsBefore = readFileSync(shimLogPath, "utf8").trim().split("\n").length
+
+    const first = await launch(servicePort, { projectDirectory })
+    expect(first.status).toBe(200)
+    const registration = await first.json() as Record<string, unknown>
+    const second = await launch(servicePort, { projectDirectory })
+    expect(second.status).toBe(200)
+    expect(await second.json()).toEqual(registration)
+    expect(registration.homeDirectory).toBe(path.join(tempHome, "projects", name))
+    const calls = readFileSync(shimLogPath, "utf8").trim().split("\n").slice(callsBefore).map((line) => JSON.parse(line) as string[])
+    expect(calls.filter((args) => args[1] === "create")).toHaveLength(1)
+    expect(calls[0].slice(0, 4)).toEqual(["session", "create", "--dir", registration.homeDirectory as string])
+    const persisted = JSON.parse(readFileSync(path.join(tempHome, "registry.json"), "utf8"))
+    expect(persisted[name]).toEqual(registration)
+  })
+
+  test("still reports real association failures with the CLI's JSON stdout diagnostic", async () => {
+    const projectDirectory = path.join(tempRoot, "failed-sidebar-repo")
+    mkdirSync(projectDirectory)
+    const response = await launch(servicePort, { projectDirectory })
+    expect(response.status).toBe(500)
+    expect(await response.json()).toMatchObject({ error: expect.stringContaining("project association request failed") })
+    const persisted = JSON.parse(readFileSync(path.join(tempHome, "registry.json"), "utf8"))
+    expect(persisted["failed-sidebar-repo"].coordinatorSessionId).toBe("ses_coord_1")
   })
 })
 

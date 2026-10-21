@@ -37,4 +37,22 @@ describe("restoreSessionProjects", () => {
       throw new Error("must not run")
     } })).toEqual([])
   })
+
+  test("startup tolerates an unsupported sidebar CLI without changing registrations", async () => {
+    const filesystem = new InMemoryFileSystem()
+    const homeRoot = "/home/firstmate"
+    const registryContents = JSON.stringify({ sunrise: {
+      slug: "sunrise", projectDirectory: "/repos/sunrise", homeDirectory: `${homeRoot}/projects/sunrise`,
+      coordinatorSessionId: "ses_sunrise", createdAt: "2026-01-01T00:00:00.000Z",
+    } })
+    filesystem.seedFile(`${homeRoot}/registry.json`, registryContents)
+    const calls: string[][] = []
+    expect(await restoreSessionProjects({ filesystem: filesystem.port, homeRoot, exec: async (_command, args) => {
+      calls.push([...args])
+      throw new Error("openchamber exited with code 1: Unknown option: --display-project-dir")
+    } })).toEqual([])
+    expect(calls).toHaveLength(1)
+    expect(calls[0][1]).toBe("associate-project")
+    expect(filesystem.fileContents(`${homeRoot}/registry.json`)).toBe(registryContents)
+  })
 })

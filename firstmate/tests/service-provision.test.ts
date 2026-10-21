@@ -24,6 +24,7 @@ beforeAll(async () => {
       OPENCHAMBER_SERVICE_PORT: String(servicePort),
       OPENCHAMBER_SERVICE_TOKEN: serviceToken,
       FIRSTMATE_HOME: tempHome,
+      FIRSTMATE_OPENCHAMBER_SETTINGS: path.join(tempRoot, "absent-settings.json"),
     },
     stdio: ["ignore", "ignore", "ignore"],
   })

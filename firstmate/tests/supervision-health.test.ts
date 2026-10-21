@@ -503,7 +503,7 @@ describe("supervision health record", () => {
 })
 
 describe("failed terminal observation", () => {
-  test("an idle worker with an explicit failed outcome keyed by a finite time.idle reports failed once — coordinator message, captain POST, and board Failed", async () => {
+  test("an idle worker with an explicit failed outcome keyed by a finite time.idle reports failed once — coordinator message, no desktop alert, and board Failed", async () => {
     const filesystem = seededProject()
     const routes: { info?: HostAnswer } = {
       info: { status: 200, text: JSON.stringify({ id: "ses_11bb", outcome: "failed", time: { idle: 123 } }) },
@@ -519,21 +519,16 @@ describe("failed terminal observation", () => {
     // failure.
     expect(round.notifications[0]?.message).not.toContain("finished its turn")
 
-    const emits = emitCalls(calls)
-    expect(emits).toHaveLength(1)
-    expect(JSON.parse(emits[0]?.init.body ?? "{}")).toEqual({
-      title: "FirstMate — sunrise",
-      body: '"Fix flaky login test" failed.',
-      sessionId: "ses_11bb",
-      directory: projectDirectory,
-    })
+    // The failure relays to the coordinator; raw worker events never alert
+    // the desktop themselves.
+    expect(emitCalls(calls)).toEqual([])
 
     expect(poller.getBoardWorkers("sunrise", backlogTasks(filesystem))[0]?.state).toBe("Failed")
 
     // The same terminal re-observed on the next poll is quiet again.
     const second = await poller.poll()
     expect(second.notifications).toEqual([])
-    expect(emitCalls(calls)).toHaveLength(1)
+    expect(emitCalls(calls)).toEqual([])
   })
 
   test("a DISTINCT second failed terminal re-notifies even with no intermediate succeeded outcome", async () => {
@@ -552,7 +547,7 @@ describe("failed terminal observation", () => {
 
     expect(second.notifications).toHaveLength(1)
     expect(second.notifications[0]?.message).toContain("failed (outcome: failed).")
-    expect(emitCalls(calls)).toHaveLength(2)
+    expect(emitCalls(calls)).toEqual([])
   })
 
   test("a busy worker with an old failed outcome must not board Failed nor notify", async () => {

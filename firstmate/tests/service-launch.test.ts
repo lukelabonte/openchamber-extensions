@@ -4,6 +4,7 @@ import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync 
 import net from "node:net"
 import os from "node:os"
 import path from "node:path"
+import { sessionProjectHost } from "./helpers/session-project-host"
 
 // The service execs `openchamber` through PATH. A shim script stands in for the
 // CLI so no test ever runs the real binary; the missing-CLI service gets a PATH
@@ -274,6 +275,48 @@ describe("POST /launch and the registry endpoints", () => {
     expect(await response.json()).toMatchObject({ error: expect.stringContaining("project association request failed") })
     const persisted = JSON.parse(readFileSync(path.join(tempHome, "registry.json"), "utf8"))
     expect(persisted["failed-sidebar-repo"].coordinatorSessionId).toBe("ses_coord_1")
+  })
+
+  test("the service discovers the desktop fallback for startup, reopen and creation", async () => {
+    const host = sessionProjectHost()
+    const isolatedHome = path.join(tempRoot, "metadata-home")
+    const slug = "unsupported-sidebar-repo"
+    const projectDirectory = path.join(tempRoot, "metadata", slug)
+    const homeDirectory = path.join(isolatedHome, "projects", slug)
+    mkdirSync(homeDirectory, { recursive: true })
+    const registration = { slug, projectDirectory, homeDirectory, coordinatorSessionId: "ses_saved", createdAt: "2026-10-21T00:00:00Z" }
+    writeFileSync(path.join(isolatedHome, "registry.json"), JSON.stringify({ [slug]: registration }))
+    writeFileSync(path.join(homeDirectory, "settings.json"), JSON.stringify({ projectDirectory, coordinatorSessionId: "ses_saved" }))
+    const metadata = { openchamber: { work: { state: "open" }, linked_issues: [{ id: "keep" }] } }
+    host.sessions.set("ses_saved", { id: "ses_saved", directory: homeDirectory, metadata, title: "Keep title", messages: ["Keep conversation"] })
+    const desktop = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: async (request) => {
+      const result = await host.fetcher(request.url, { method: request.method, headers: {}, ...(request.method === "POST" ? { body: await request.text() } : {}) })
+      return new Response(await result.text?.() ?? "", { status: result.status })
+    } })
+    const settingsPath = path.join(tempRoot, "metadata-desktop-settings.json")
+    writeFileSync(settingsPath, JSON.stringify({ desktopLocalPort: desktop.port }))
+    const port = await getFreePort()
+    const service = spawnService(port, { PATH: `${shimDirectory}:${process.env.PATH ?? ""}`, FIRSTMATE_HOME: isolatedHome, FIRSTMATE_OPENCHAMBER_SETTINGS: settingsPath })
+    try {
+      await waitUntilListening(port)
+      const deadline = Date.now() + 3000
+      while (!host.sessions.get("ses_saved")!.metadata.openchamber.projectDirectory && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10))
+      expect(host.sessions.get("ses_saved")!.metadata).toEqual({ openchamber: { ...metadata.openchamber, projectDirectory } })
+      expect((await launch(port, { projectDirectory })).status).toBe(200)
+      expect(host.requests.filter((request) => request.method === "POST")).toHaveLength(1)
+
+      const newProject = path.join(tempRoot, "metadata", "unsupported-command-repo")
+      const newHome = path.join(isolatedHome, "projects", "unsupported-command-repo")
+      host.sessions.set("ses_coord_1", { id: "ses_coord_1", directory: newHome, metadata: {}, title: "New mate", messages: [] })
+      const created = await launch(port, { projectDirectory: newProject })
+      expect(created.status).toBe(200)
+      expect(host.sessions.get("ses_coord_1")!.metadata).toEqual({ openchamber: { projectDirectory: newProject } })
+      expect(host.sessions.get("ses_saved")!.title).toBe("Keep title")
+      expect(host.sessions.get("ses_saved")!.messages).toEqual(["Keep conversation"])
+    } finally {
+      service.kill()
+      desktop.stop(true)
+    }
   })
 })
 

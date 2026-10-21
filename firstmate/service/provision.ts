@@ -26,7 +26,7 @@ interface HomeFile {
 const sharedDirectories = ["watches"]
 
 export const legacyTemplateHashes = {
-  charter: ["44c30fc03a72d0e3db47f520f77e9d2f256a8595da0c4a92a3613ba8d0bf4bd9"],
+  charter: ["44c30fc03a72d0e3db47f520f77e9d2f256a8595da0c4a92a3613ba8d0bf4bd9", "f2a01f5f4d7e76a63bd026ebda14ecceee56c266aa2c8547af3e8b1430bf7c5b"],
   "pr-watch": ["436ce74feaf4fcb7beaeca787e30b0434ed2a5feeb0e4222540852c6b103fbbe"],
 }
 

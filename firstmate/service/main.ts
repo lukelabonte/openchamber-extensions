@@ -6,6 +6,7 @@ import path from "node:path"
 import { requestRelaunch, sendCoordinatorMessage, steerWorker } from "./actions"
 import { archiveSession, loadArchivedSessionIds } from "./archive"
 import { createArchiveReviewSweep } from "./archive-review"
+import { cleanupCoordinatorPullRequests } from "./pr-cleanup"
 import { loadBacklog, type BacklogTask } from "./backlog"
 import { composeInstructions } from "./compose"
 import { createNodeClock } from "./clock"
@@ -186,6 +187,19 @@ const archiveReviewSweep = createArchiveReviewSweep({
   filesystem: nodeFileSystem,
   homeRoot,
   nowMs: clock.nowMs,
+  cleanup: (registration) => withProjectLifecycle(homeRoot, async () => {
+    const current = (await loadRegistry(nodeFileSystem, homeRoot))[registration.slug]
+    if (current === undefined) return false
+    const status = await sessionStatus(nodeExec, { sessionId: current.coordinatorSessionId, directory: current.homeDirectory })
+    if (status.activity === "unknown") throw new Error("PR cleanup is waiting for a verified idle first mate")
+    if (status.activity !== "idle") return false
+    const unlinked = await cleanupCoordinatorPullRequests({
+      filesystem: nodeFileSystem, homeRoot, registration: current, exec: nodeExec, fetcher: nodeFetcher,
+      support: await discoverSupport({ filesystem: nodeFileSystem, settingsPath: openchamberSettingsPath }),
+    })
+    if (unlinked.length > 0) console.info(`FirstMate PR cleanup [${current.slug}]: unlinked ${unlinked.length} merged PR(s)`)
+    return true
+  }),
   deliver: (registration, prompt) => withProjectLifecycle(homeRoot, async () => {
     const current = (await loadRegistry(nodeFileSystem, homeRoot))[registration.slug]
     if (current === undefined) return false

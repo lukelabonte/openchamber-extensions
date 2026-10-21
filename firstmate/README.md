@@ -89,6 +89,28 @@ Failed review sends remain due. Invalid state or unreadable evidence stops that 
 
 Session archival uses the host's private desktop archive route, discovered through the same local-client mechanism as Interrupt. Unsupported hosts and unknown state fail closed. The idle check and archive write aren't atomic, so an external sender can still start work between them. Failed archive attempts report to the coordinator and pause until the request is cleared for a supervision round and added again, or the service restarts. End remains board-only and doesn't archive the OpenChamber session. Repository cleanup remains the captain's job. The exact-reviewed-head landing protocol and recovery ladder live in the charter; they aren't automatic merge or repair controllers.
 
+## Cleanup process
+
+The charter's [Finishing and cleanup](templates/charter.md#finishing-and-cleanup) section defines the process. Cleanup keeps current work visible and preserves history. It doesn't mean deleting every record associated with a finished task.
+
+| Item | Owner and completion check |
+| --- | --- |
+| Task outcome and evidence | First mate saves the full PR URL, validation, message links, and all worker/session/worktree/branch references in the task report. Backlog, briefs, reports, landings, conversations, and learnings stay. |
+| Decisions and suggestions | First mate reconciles stale dependencies, holds, answer actions, and suggestions from verified outcomes. Real gates and dismissed suggestions stay intact. |
+| Worker sessions and board cards | First mate requests exact-session archival after follow-up ends. The service verifies and confirms host archival, then retires the card. End alone only hides a card. |
+| Coordinator PR links | The service verifies GitHub merge state and removes only resolved links using the host's per-entry unlink operation. Worker links and durable PR URLs stay. |
+| Worktrees and local branches | Captain checks implementation and landing workers, active use, clean state, merge evidence, and project-specific teardown before removal. No automatic deletion or cleanup worker. |
+| Remote branches | Captain makes a separate deletion decision. A merged PR or removed worktree doesn't authorize it. |
+| Watches and custom configuration | Captain-owned. Cleanup doesn't uninstall watches or replace personal orders. |
+
+PR-link cleanup runs independently of archival-review prompts, including when every tracked worker is already archived. It waits for a verified idle first mate. A link qualifies only if every backlog task referencing the same GitHub PR is Done, has a nonempty saved report and a confirmed host-archived worker, and has no dependency, hold, or answer action. GitHub must return the exact PR as `MERGED` with a merge time. A retention request belongs in a task `hold:`. Untracked links and legacy tasks missing this evidence stay until reconciled.
+
+The service uses private desktop metadata and links routes because the agent tool and SDK don't expose unlinking. It sends only the entries to remove, not a replacement link list, and requires the host's returned list to confirm removal. Unknown host responses and failed GitHub checks aren't success. Cleanup doesn't undo archival or touch repository state. Checks and writes aren't atomic with external sends or backlog edits; the service rechecks the backlog and registered coordinator before unlinking, but a concurrent external change can still race that final check.
+
+`archive-review.json` separately records `lastDeliveredAt` for archival-review delivery and `lastCleanupAttemptAt` for PR cleanup. Busy cleanup is deferred without consuming its daily slot. Completed or failed attempts consume that slot and retry no sooner than 24 hours later, including across restarts. Failures and unlink counts appear in service logs. Failed timestamp saves retry without repeating the operation in the running service; a restart before persistence can repeat the idempotent cleanup check.
+
+The audit found that board-only End wasn't host archival, already-archived workers escaped prompt-only review, and a branch's Git ancestry wasn't reliable proof of squash-merge status. These distinctions are now explicit. Existing captain's orders aren't overwritten by template upgrades, so existing installations keep their own repository cleanup runbook. Untouched shared charters receive the new process; customized charters get a `.new` comparison as usual. Live-host unlinking still needs a separate acceptance run after installing the extension update.
+
 The existing permission auto-accept workaround remains unchanged. It can approve all worker permission requests, so the charter's scope and escalation rules aren't a permission classifier. Quoted watch output is information, not authority.
 
 ## Development

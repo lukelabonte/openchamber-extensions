@@ -51,6 +51,7 @@ function fixture(activity: string, pollMs: number, blockWorker = false) {
   const logPath = path.join(root, "cli.log")
   const activityPath = path.join(root, "activity.json")
   const workerGatePath = path.join(root, "worker-gate")
+  let settingsPath = path.join(root, "absent-settings.json")
   mkdirSync(projectHome, { recursive: true })
   mkdirSync(shimDirectory)
   writeFileSync(logPath, "")
@@ -84,7 +85,7 @@ function fixture(activity: string, pollMs: number, blockWorker = false) {
       env: {
         ...process.env,
         OPENCHAMBER_SERVICE_PORT: String(port), OPENCHAMBER_SERVICE_TOKEN: "fixture-token",
-        FIRSTMATE_HOME: homeRoot, FIRSTMATE_OPENCHAMBER_SETTINGS: path.join(root, "absent-settings.json"),
+        FIRSTMATE_HOME: homeRoot, FIRSTMATE_OPENCHAMBER_SETTINGS: settingsPath,
         FIRSTMATE_POLL_MS: String(pollMs), FIRSTMATE_WATCH_MS: "60000",
         FIRSTMATE_TEST_CLI_LOG: logPath, FIRSTMATE_TEST_ACTIVITY: activityPath,
         FIRSTMATE_TEST_BLOCK_WORKER: blockWorker ? "1" : "0", FIRSTMATE_TEST_WORKER_GATE: workerGatePath,
@@ -98,6 +99,17 @@ function fixture(activity: string, pollMs: number, blockWorker = false) {
     return tracked.child
   }
   return { start, log, sends, projectHome,
+    setupCleanup(hostPort: number) {
+      settingsPath = path.join(root, "desktop-settings.json")
+      writeFileSync(settingsPath, JSON.stringify({ desktopLocalPort: hostPort, desktopLocalClientToken: "desktop-token" }))
+      writeFileSync(path.join(projectHome, "backlog.md"), "- Ship search\n  state: Done\n  id: search\n  kind: ship\n  session: ses_old\n  pr: https://github.com/owner/app/pull/7")
+      mkdirSync(path.join(projectHome, "reports"), { recursive: true })
+      writeFileSync(path.join(projectHome, "reports", "search.md"), "Verified merged PR: https://github.com/owner/app/pull/7. Worker ses_old. Worktree and branch retained.")
+      writeFileSync(path.join(projectHome, "reports", "archive.jsonl"), JSON.stringify({ sessionId: "ses_old", title: "Ship search", archivedAt: "2026-10-21T10:00:00Z", hostArchived: true }) + "\n")
+      const ghPath = path.join(shimDirectory, "gh")
+      writeFileSync(ghPath, '#!/bin/sh\nprintf "gh %s\\n" "$*" >> "$FIRSTMATE_TEST_CLI_LOG"\necho \'{"state":"MERGED","mergedAt":"2026-10-21T10:00:00Z","url":"https://github.com/owner/app/pull/7"}\'\n')
+      chmodSync(ghPath, 0o755)
+    },
     releaseWorker: tracked.unblock,
     setActivity(value: string) { writeFileSync(activityPath, JSON.stringify({ sessionStatus: { type: value } })) },
     state() { try { return JSON.parse(readFileSync(path.join(projectHome, "archive-review.json"), "utf8")) } catch { return undefined } },
@@ -108,7 +120,7 @@ describe("service archive-review scheduling", () => {
   test("requests the initial review before the first supervision interval and persists it across restart", async () => {
     const environment = fixture("idle", 60_000)
     const first = await environment.start()
-    await waitUntil(() => environment.state() !== undefined, "startup review wasn't delivered and persisted")
+    await waitUntil(() => environment.state()?.lastDeliveredAt !== undefined, "startup review wasn't delivered and persisted")
     expect(environment.sends()).toBe(1)
     expect(environment.log()).toContain("Scheduled worker-session archival review")
     const deliveredAt = environment.state().lastDeliveredAt
@@ -135,7 +147,7 @@ describe("service archive-review scheduling", () => {
     await waitUntil(() => checks() >= before + 2, "unknown coordinator wasn't checked")
     expect(environment.sends()).toBe(0)
     environment.setActivity("idle")
-    await waitUntil(() => environment.state() !== undefined, "idle coordinator didn't receive the review")
+    await waitUntil(() => environment.state()?.lastDeliveredAt !== undefined, "idle coordinator didn't receive the review")
     await new Promise((resolve) => setTimeout(resolve, 150))
     expect(environment.sends()).toBe(1)
   })
@@ -146,8 +158,48 @@ describe("service archive-review scheduling", () => {
     await waitUntil(() => environment.log().includes("session status --session ses_old"), "worker polling didn't reach its gate")
     expect(environment.sends()).toBe(0)
     environment.setActivity("idle")
-    await waitUntil(() => environment.state() !== undefined, "blocked worker polling prevented the review sweep")
+    await waitUntil(() => environment.state()?.lastDeliveredAt !== undefined, "blocked worker polling prevented the review sweep")
     expect(environment.sends()).toBe(1)
     environment.releaseWorker()
+  })
+
+  test("unlinks a historical merged PR through the authenticated desktop route without waking or deleting workers", async () => {
+    const pull = { id: "owner/app#7", title: "Ship search", kind: "pull", url: "https://github.com/owner/app/pull/7", number: 7 }
+    const issue = { id: "owner/app#8", title: "Keep issue", kind: "issue", url: "https://github.com/owner/app/issues/8" }
+    let links = [pull, issue]
+    const requests: { path: string; body?: unknown; token: string }[] = []
+    const host = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
+      const url = new URL(request.url)
+      const body = request.method === "POST" ? await request.json() : undefined
+      requests.push({ path: url.pathname, body, token: request.headers.get("authorization") })
+      if (url.pathname === "/api/sessions/status" && request.method === "GET") return Response.json({})
+      if (url.pathname === "/api/openchamber/sessions/ses_coordinator/links" && request.method === "POST") links = [issue]
+      else if (url.pathname !== "/api/openchamber/sessions/ses_coordinator/metadata") return new Response("unexpected operation", { status: 400 })
+      return Response.json({ metadata: { openchamber: { linked_issues: links } } })
+    } })
+    const environment = fixture("idle", 30)
+    environment.setupCleanup(host.port)
+    try {
+      const child = await environment.start()
+      await waitUntil(() => environment.state()?.lastCleanupAttemptAt !== undefined, "PR cleanup didn't finish")
+      expect(links).toEqual([issue])
+      expect(requests.filter((request) => request.path.startsWith("/api/openchamber/sessions/"))).toEqual([
+        { path: "/api/openchamber/sessions/ses_coordinator/metadata", body: undefined, token: "Bearer desktop-token" },
+        { path: "/api/openchamber/sessions/ses_coordinator/links", body: { directory: environment.projectHome, entries: [pull], linked: false }, token: "Bearer desktop-token" },
+      ])
+      expect(requests.filter((request) => request.body !== undefined)).toHaveLength(1)
+      expect(environment.log()).toContain("gh pr view https://github.com/owner/app/pull/7 --json state,mergedAt,url")
+      expect(environment.sends()).toBe(0)
+      expect(environment.state().lastDeliveredAt).toBeUndefined()
+      expect(readFileSync(path.join(environment.projectHome, "backlog.md"), "utf8")).toContain(pull.url)
+      expect(readFileSync(path.join(environment.projectHome, "reports", "search.md"), "utf8")).toContain("Worktree and branch retained")
+      await stop(child)
+      await environment.start()
+      await new Promise((resolve) => setTimeout(resolve, 100))
+      expect(requests.filter((request) => request.path.startsWith("/api/openchamber/sessions/"))).toHaveLength(2)
+      expect(environment.sends()).toBe(0)
+    } finally {
+      host.stop(true)
+    }
   })
 })

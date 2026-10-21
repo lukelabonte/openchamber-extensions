@@ -879,7 +879,7 @@ async function acknowledgeTemplateUpgrade(input) {
 // service/provision.ts
 var sharedDirectories = ["watches"];
 var legacyTemplateHashes = {
-  charter: ["44c30fc03a72d0e3db47f520f77e9d2f256a8595da0c4a92a3613ba8d0bf4bd9"],
+  charter: ["44c30fc03a72d0e3db47f520f77e9d2f256a8595da0c4a92a3613ba8d0bf4bd9", "f2a01f5f4d7e76a63bd026ebda14ecceee56c266aa2c8547af3e8b1430bf7c5b"],
   "pr-watch": ["436ce74feaf4fcb7beaeca787e30b0434ed2a5feeb0e4222540852c6b103fbbe"]
 };
 var sharedFiles = [
@@ -1242,7 +1242,7 @@ async function recordCoordinatorSessionId(filesystem, homeDirectory, coordinator
 var reviewIntervalMs = 24 * 60 * 60 * 1000;
 var reviewPrompt = `Scheduled worker-session archival review for this project only.
 
-Read backlog.md and the saved briefs and reports. Review tracked worker sessions, including legacy entries and board-only End entries. Check live status and evidence before deciding which sessions no longer need review, follow-up, or an open decision. Reconcile missing task IDs or reports before requesting retirement. Age, idle status, and a worker's own done claim aren't completion evidence.
+Read backlog.md and the saved briefs and reports. Follow the charter's cleanup process. Review tracked worker sessions, including legacy entries and board-only End entries. Check live status and evidence before deciding which sessions no longer need review, follow-up, or an open decision. Reconcile missing task IDs or reports before requesting retirement. Age, idle status, and a worker's own done claim aren't completion evidence.
 
 Respect the captain's orders and requests to keep sessions active. Save checked results, evidence and message links, session/worktree references, and the retirement reason in reports/<id>.md. Only for a genuinely Done task with no remaining dependency, hold, or answer action, add archive-session: <exact current session id> to its backlog entry. The service checks ownership, a saved report, idle status, and pending questions/permissions. Wait for its confirmation before claiming archival. Leave failed archive attempts paused until their failure has been reconciled.
 
@@ -1252,7 +1252,7 @@ function archiveReviewPath(homeDirectory) {
 }
 function createArchiveReviewSweep(input) {
   const inFlight = new Set;
-  const deliveredAt = new Map;
+  const progress = new Map;
   const pendingSaves = new Map;
   const failures = new Map;
   function reportFailure(slug, error) {
@@ -1262,8 +1262,11 @@ function createArchiveReviewSweep(input) {
     failures.set(slug, reason);
     input.failed(slug, reason);
   }
-  async function saveDelivery(slug, filePath, pending) {
-    await input.filesystem.writeFile(pending.temporaryPath, `${JSON.stringify({ version: 1, lastDeliveredAt: new Date(pending.deliveredAt).toISOString() }, null, 2)}
+  async function saveProgress(slug, filePath, pending) {
+    const state = { version: 1 };
+    for (const [key, value] of Object.entries(pending.progress))
+      state[key] = new Date(value).toISOString();
+    await input.filesystem.writeFile(pending.temporaryPath, `${JSON.stringify(state, null, 2)}
 `);
     await input.filesystem.rename(pending.temporaryPath, filePath);
     pendingSaves.delete(slug);
@@ -1279,8 +1282,8 @@ function createArchiveReviewSweep(input) {
       if (normalizeProjectDirectory(registration.homeDirectory) !== homeDirectory)
         throw new Error("archive review project home doesn't match its registration");
       const filePath = archiveReviewPath(homeDirectory);
-      let lastDeliveredAt = deliveredAt.get(slug);
-      let persistedAt;
+      const current = { ...progress.get(slug) };
+      const persisted = {};
       if (await input.filesystem.exists(filePath)) {
         let parsed;
         try {
@@ -1288,20 +1291,43 @@ function createArchiveReviewSweep(input) {
         } catch {
           throw new Error(`archive review state is unreadable: ${filePath}`);
         }
-        if (typeof parsed !== "object" || parsed === null || !("version" in parsed) || parsed.version !== 1 || !("lastDeliveredAt" in parsed) || typeof parsed.lastDeliveredAt !== "string" || !Number.isFinite(Date.parse(parsed.lastDeliveredAt))) {
+        if (typeof parsed !== "object" || parsed === null || !("version" in parsed) || parsed.version !== 1 || !("lastDeliveredAt" in parsed) && !("lastCleanupAttemptAt" in parsed)) {
           throw new Error(`archive review state is invalid: ${filePath}`);
         }
-        persistedAt = Date.parse(parsed.lastDeliveredAt);
-        lastDeliveredAt = Math.max(lastDeliveredAt ?? -Infinity, persistedAt);
+        for (const key of ["lastDeliveredAt", "lastCleanupAttemptAt"]) {
+          if (!(key in parsed))
+            continue;
+          if (typeof parsed[key] !== "string" || !Number.isFinite(Date.parse(parsed[key])))
+            throw new Error(`archive review state is invalid: ${filePath}`);
+          persisted[key] = Date.parse(parsed[key]);
+          current[key] = Math.max(current[key] ?? -Infinity, persisted[key]);
+        }
       }
       const pendingSave = pendingSaves.get(slug);
       if (pendingSave !== undefined) {
-        if (persistedAt !== undefined && persistedAt >= pendingSave.deliveredAt)
+        if (Object.entries(pendingSave.progress).every(([key, value]) => persisted[key] !== undefined && persisted[key] >= value))
           pendingSaves.delete(slug);
         else
-          await saveDelivery(slug, filePath, pendingSave);
+          await saveProgress(slug, filePath, pendingSave);
       }
-      if (lastDeliveredAt !== undefined && input.nowMs() - lastDeliveredAt < reviewIntervalMs)
+      progress.set(slug, current);
+      if (input.cleanup !== undefined && (current.lastCleanupAttemptAt === undefined || input.nowMs() - current.lastCleanupAttemptAt >= reviewIntervalMs)) {
+        let attempted = false;
+        failures.delete(`${slug}:cleanup`);
+        try {
+          attempted = await input.cleanup(registration);
+        } catch (error) {
+          attempted = true;
+          reportFailure(`${slug}:cleanup`, error);
+        }
+        if (attempted) {
+          current.lastCleanupAttemptAt = input.nowMs();
+          const pending = { progress: { ...current }, temporaryPath: `${filePath}.${randomUUID3()}.tmp` };
+          pendingSaves.set(slug, pending);
+          await saveProgress(slug, filePath, pending);
+        }
+      }
+      if (current.lastDeliveredAt !== undefined && input.nowMs() - current.lastDeliveredAt < reviewIntervalMs)
         return;
       const backlog = await loadBacklog(input.filesystem, `${homeDirectory}/backlog.md`);
       if (backlog.errors.length > 0)
@@ -1312,10 +1338,10 @@ function createArchiveReviewSweep(input) {
       if (!await input.deliver(registration, reviewPrompt))
         return;
       const completedAt = input.nowMs();
-      deliveredAt.set(slug, completedAt);
-      const pending = { deliveredAt: completedAt, temporaryPath: `${filePath}.${randomUUID3()}.tmp` };
+      current.lastDeliveredAt = completedAt;
+      const pending = { progress: { ...current }, temporaryPath: `${filePath}.${randomUUID3()}.tmp` };
       pendingSaves.set(slug, pending);
-      await saveDelivery(slug, filePath, pending);
+      await saveProgress(slug, filePath, pending);
     } catch (error) {
       reportFailure(slug, error);
     } finally {
@@ -1332,6 +1358,123 @@ function createArchiveReviewSweep(input) {
     }
   }
   return { check };
+}
+
+// service/pr-cleanup.ts
+async function cleanupCoordinatorPullRequests(input) {
+  const { filesystem, homeRoot, registration } = input;
+  const backlogPath = `${registration.homeDirectory}/backlog.md`;
+  const backlog = await loadBacklog(filesystem, backlogPath);
+  if (backlog.errors.length > 0)
+    throw new Error("PR cleanup needs a readable backlog without malformed entries");
+  const archived = await loadHostArchivedSessionIds(filesystem, homeRoot, registration.slug);
+  const candidates = new Set;
+  for (const task of backlog.tasks) {
+    const url = canonicalPullUrl(task.prUrl);
+    if (url === undefined || candidates.has(url))
+      continue;
+    const references = backlog.tasks.filter((entry) => canonicalPullUrl(entry.prUrl) === url);
+    if (references.every((entry) => resolvedTask(entry, archived)) && await reportsExist(references))
+      candidates.add(url);
+  }
+  if (candidates.size === 0)
+    return [];
+  const sessionPath = `/api/openchamber/sessions/${encodeURIComponent(registration.coordinatorSessionId)}`;
+  const observation = await callDesktopProxy({ ...input, method: "GET", path: `${sessionPath}/metadata?directory=${encodeURIComponent(registration.homeDirectory)}`, label: "PR cleanup metadata" });
+  if (observation.kind !== "ok")
+    throw new Error(observation.kind === "failed" ? observation.message : observation.reason);
+  const links = readLinks(observation.text);
+  const entries = [];
+  for (const value of links) {
+    if (!isPullLink(value))
+      continue;
+    const url = canonicalPullUrl(value.url);
+    if (url === undefined || !candidates.has(url))
+      continue;
+    if (links.some((other) => isRecord3(other) && other.id === value.id && (!isPullLink(other) || canonicalPullUrl(other.url) !== url)))
+      continue;
+    const response = JSON.parse(await input.exec("gh", ["pr", "view", url, "--json", "state,mergedAt,url"]));
+    if (!isRecord3(response) || canonicalPullUrl(response.url) !== url || !["OPEN", "CLOSED", "MERGED"].includes(response.state)) {
+      throw new Error(`GitHub did not identify the requested PR: ${url}`);
+    }
+    if (response.state !== "MERGED")
+      continue;
+    if (typeof response.mergedAt !== "string" || !Number.isFinite(Date.parse(response.mergedAt)))
+      throw new Error(`GitHub did not confirm a merge time: ${url}`);
+    entries.push(value);
+  }
+  if (entries.length === 0)
+    return [];
+  const current = (await loadRegistry(filesystem, homeRoot))[registration.slug];
+  if (current?.coordinatorSessionId !== registration.coordinatorSessionId || current?.homeDirectory !== registration.homeDirectory || current?.projectDirectory !== registration.projectDirectory) {
+    throw new Error("the registered first mate changed during PR cleanup");
+  }
+  const latest = await loadBacklog(filesystem, backlogPath);
+  if (latest.errors.length > 0 || JSON.stringify(latest.tasks) !== JSON.stringify(backlog.tasks))
+    throw new Error("the backlog changed during PR cleanup");
+  const references = backlog.tasks.filter((task) => entries.some((entry) => canonicalPullUrl(entry.url) === canonicalPullUrl(task.prUrl)));
+  if (!await reportsExist(references))
+    throw new Error("saved reports changed during PR cleanup");
+  const outcome = await callDesktopProxy({
+    ...input,
+    method: "POST",
+    path: `${sessionPath}/links`,
+    label: "PR unlink",
+    body: JSON.stringify({ directory: registration.homeDirectory, entries, linked: false })
+  });
+  if (outcome.kind !== "ok")
+    throw new Error(outcome.kind === "failed" ? outcome.message : outcome.reason);
+  const remaining = readLinks(outcome.text, true);
+  if (remaining.some((entry) => isRecord3(entry) && entries.some((removed) => entry.id === removed.id || canonicalPullUrl(entry.url) === canonicalPullUrl(removed.url)))) {
+    throw new Error("the host did not confirm removal of the completed PR links");
+  }
+  return [...new Set(entries.map((entry) => entry.url))];
+  async function reportsExist(tasks) {
+    for (const task of tasks) {
+      const reportPath = `${registration.homeDirectory}/reports/${task.id}.md`;
+      if (!await filesystem.exists(reportPath) || (await filesystem.readFile(reportPath)).trim() === "")
+        return false;
+    }
+    return true;
+  }
+}
+function resolvedTask(task, archived) {
+  return task.state === "Done" && task.kind !== "captain" && task.id !== undefined && task.sessionId !== undefined && archived.has(task.sessionId) && task.hold === undefined && task.blockedBy === undefined && (task.actions?.length ?? 0) === 0;
+}
+function canonicalPullUrl(value) {
+  if (typeof value !== "string")
+    return;
+  try {
+    const url = new URL(value);
+    if (url.protocol !== "https:" || url.hostname !== "github.com" || url.port !== "" || url.username !== "" || url.password !== "")
+      return;
+    const match = /^\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/pull\/([1-9]\d*)\/?$/i.exec(url.pathname);
+    return match === null ? undefined : `https://github.com/${match[1].toLowerCase()}/${match[2].toLowerCase()}/pull/${match[3]}`;
+  } catch {
+    return;
+  }
+}
+function readLinks(text, requireList = false) {
+  const parsed = JSON.parse(text ?? "null");
+  if (!isRecord3(parsed) || !isRecord3(parsed.metadata))
+    throw new Error("the host did not return session metadata for PR cleanup");
+  const metadata = parsed.metadata;
+  if (metadata.openchamber === undefined && !requireList)
+    return [];
+  if (!isRecord3(metadata.openchamber))
+    throw new Error("the host returned malformed PR link metadata");
+  const links = metadata.openchamber.linked_issues;
+  if (links === undefined && !requireList)
+    return [];
+  if (!Array.isArray(links))
+    throw new Error("the host returned a malformed PR link list");
+  return links;
+}
+function isPullLink(value) {
+  return isRecord3(value) && value.kind === "pull" && typeof value.id === "string" && value.id !== "" && typeof value.title === "string" && value.title !== "" && typeof value.url === "string";
+}
+function isRecord3(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 // service/clock.ts
@@ -1845,11 +1988,11 @@ function parseSessionInfo(text, sessionId) {
   } catch {
     return { kind: "failed", reason: "the session info response was not valid JSON" };
   }
-  if (!isRecord3(parsed))
+  if (!isRecord4(parsed))
     return { kind: "failed", reason: "the session info response was not a JSON object" };
   let payload = parsed;
   if (typeof parsed.id !== "string") {
-    if (!isRecord3(parsed.data)) {
+    if (!isRecord4(parsed.data)) {
       return { kind: "failed", reason: "the session info response did not name the requested session" };
     }
     payload = parsed.data;
@@ -1857,7 +2000,7 @@ function parseSessionInfo(text, sessionId) {
   if (typeof payload.id !== "string" || payload.id !== sessionId) {
     return { kind: "failed", reason: "the session info response did not name the requested session" };
   }
-  if (!isRecord3(payload.time))
+  if (!isRecord4(payload.time))
     return { kind: "failed", reason: "the session info response had no time object" };
   const idle = payload.time.idle;
   if (idle !== undefined && idle !== null && (typeof idle !== "number" || !Number.isFinite(idle))) {
@@ -1872,7 +2015,7 @@ function sessionInfoOutcome(value) {
     return value;
   return;
 }
-function isRecord3(value) {
+function isRecord4(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
@@ -1971,7 +2114,7 @@ function confirmsArchive(text, sessionId) {
 }
 
 // service/poller.ts
-function isRecord4(value) {
+function isRecord5(value) {
   return typeof value === "object" && value !== null;
 }
 function createSupervisionPoller(input) {
@@ -2236,11 +2379,11 @@ ${sessionId}`;
       return { kind: "failed", reason: "the session status response body could not be read" };
     try {
       const parsed = JSON.parse(outcome.text);
-      if (!isRecord4(parsed) || !isRecord4(parsed.pending) || Array.isArray(parsed.pending)) {
+      if (!isRecord5(parsed) || !isRecord5(parsed.pending) || Array.isArray(parsed.pending)) {
         return { kind: "failed", reason: "the session status response had no pending map" };
       }
       for (const entry of Object.values(parsed.pending)) {
-        if (!isRecord4(entry) || Array.isArray(entry)) {
+        if (!isRecord5(entry) || Array.isArray(entry)) {
           return { kind: "failed", reason: "the session status response had a malformed pending entry" };
         }
         if (entry.permissions !== undefined && !Array.isArray(entry.permissions) || entry.forms !== undefined && !Array.isArray(entry.forms)) {
@@ -2367,7 +2510,7 @@ function describeEvent(event) {
   }
 }
 function pendingActivity(entry) {
-  if (!isRecord4(entry))
+  if (!isRecord5(entry))
     return;
   if (Array.isArray(entry.permissions) && entry.permissions.length > 0)
     return "waiting-permission";
@@ -3476,6 +3619,27 @@ var archiveReviewSweep = createArchiveReviewSweep({
   filesystem: nodeFileSystem,
   homeRoot,
   nowMs: clock.nowMs,
+  cleanup: (registration) => withProjectLifecycle(homeRoot, async () => {
+    const current = (await loadRegistry(nodeFileSystem, homeRoot))[registration.slug];
+    if (current === undefined)
+      return false;
+    const status = await sessionStatus(nodeExec, { sessionId: current.coordinatorSessionId, directory: current.homeDirectory });
+    if (status.activity === "unknown")
+      throw new Error("PR cleanup is waiting for a verified idle first mate");
+    if (status.activity !== "idle")
+      return false;
+    const unlinked = await cleanupCoordinatorPullRequests({
+      filesystem: nodeFileSystem,
+      homeRoot,
+      registration: current,
+      exec: nodeExec,
+      fetcher: nodeFetcher,
+      support: await discoverSupport({ filesystem: nodeFileSystem, settingsPath: openchamberSettingsPath })
+    });
+    if (unlinked.length > 0)
+      console.info(`FirstMate PR cleanup [${current.slug}]: unlinked ${unlinked.length} merged PR(s)`);
+    return true;
+  }),
   deliver: (registration, prompt) => withProjectLifecycle(homeRoot, async () => {
     const current = (await loadRegistry(nodeFileSystem, homeRoot))[registration.slug];
     if (current === undefined)
@@ -3601,7 +3765,7 @@ async function runWatchRound() {
 function isAuthorized(request) {
   return request.headers.authorization === `Bearer ${serviceToken}`;
 }
-function isRecord5(value) {
+function isRecord6(value) {
   return typeof value === "object" && value !== null;
 }
 function respondJson(response, statusCode, body) {
@@ -3626,7 +3790,7 @@ function readJsonBody(request) {
 async function readJsonRecord(request) {
   try {
     const payload = await readJsonBody(request);
-    return isRecord5(payload) ? payload : undefined;
+    return isRecord6(payload) ? payload : undefined;
   } catch {
     return;
   }
@@ -3645,7 +3809,7 @@ async function readProjectDirectory(request) {
   } catch {
     return;
   }
-  const projectDirectory = isRecord5(payload) ? payload.projectDirectory : undefined;
+  const projectDirectory = isRecord6(payload) ? payload.projectDirectory : undefined;
   if (typeof projectDirectory !== "string" || projectDirectory.trim() === "") {
     return;
   }

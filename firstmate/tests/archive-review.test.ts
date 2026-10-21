@@ -16,6 +16,7 @@ function fixture() {
   const errors: { slug: string; reason: string }[] = []
   let now = start
   let deliver: (registration: Registration, prompt: string) => Promise<boolean> = async () => true
+  let cleanup: (registration: Registration) => Promise<boolean>
   function register(slug = "app") {
     const registration: Registration = {
       slug, projectDirectory: `/repos/${slug}`, homeDirectory: `${homeRoot}/projects/${slug}`,
@@ -31,6 +32,7 @@ function fixture() {
     return createArchiveReviewSweep({
       filesystem: filesystemPort, homeRoot, nowMs: () => now,
       deliver: async (current, prompt) => { deliveries.push({ registration: current, prompt }); return deliver(current, prompt) },
+      cleanup,
       failed: (slug, reason) => { errors.push({ slug, reason }) },
     })
   }
@@ -38,6 +40,7 @@ function fixture() {
     filesystem, registration, deliveries, errors, register, create,
     setNow(value: number) { now = value },
     setDeliver(value: typeof deliver) { deliver = value },
+    setCleanup(value: typeof cleanup) { cleanup = value },
   }
 }
 
@@ -222,5 +225,86 @@ describe("daily coordinator archival review", () => {
     setDeliver(async () => true)
     await sweep.check()
     expect(deliveries.at(-1)!.registration.coordinatorSessionId).toBe("ses_replacement")
+  })
+
+  test("cleans historical PR links even when every worker is host-archived, without waking the coordinator", async () => {
+    const { filesystem, registration, deliveries, create, setCleanup, setNow } = fixture()
+    await archiveSession(filesystem.port, homeRoot, "app", { sessionId: "ses_old", title: "Old worker", archivedAt: new Date(start).toISOString(), hostArchived: true })
+    const cleaned: string[] = []
+    setCleanup(async (current) => { cleaned.push(current.coordinatorSessionId); return true })
+    await create().check()
+    expect(cleaned).toEqual([registration.coordinatorSessionId])
+    expect(deliveries).toHaveLength(0)
+    expect(JSON.parse(filesystem.fileContents(archiveReviewPath(registration.homeDirectory)))).toEqual({ version: 1, lastCleanupAttemptAt: new Date(start).toISOString() })
+    const restarted = create()
+    await restarted.check()
+    setNow(start + day)
+    await restarted.check()
+    expect(cleaned).toHaveLength(2)
+  })
+
+  test("cleans independently of a recent archive-review delivery and keeps both timestamps", async () => {
+    const { filesystem, registration, deliveries, create, setCleanup } = fixture()
+    await create().check()
+    let cleaned = false
+    setCleanup(async () => { cleaned = true; return true })
+    await create().check()
+    expect(cleaned).toBe(true)
+    expect(deliveries).toHaveLength(1)
+    expect(JSON.parse(filesystem.fileContents(archiveReviewPath(registration.homeDirectory)))).toEqual({ version: 1, lastDeliveredAt: new Date(start).toISOString(), lastCleanupAttemptAt: new Date(start).toISOString() })
+  })
+
+  test("defers busy cleanup and bounds failed cleanup to one attempt a day without blocking archival review", async () => {
+    const { filesystem, registration, deliveries, errors, create, setCleanup, setDeliver, setNow } = fixture()
+    let attempts = 0
+    let activity = "busy"
+    setCleanup(async () => { attempts += 1; if (activity === "busy") return false; throw new Error("unlink unavailable") })
+    setDeliver(async () => false)
+    const sweep = create()
+    await sweep.check()
+    expect(await filesystem.port.exists(archiveReviewPath(registration.homeDirectory))).toBe(false)
+    activity = "idle"
+    setDeliver(async () => true)
+    await sweep.check()
+    await sweep.check()
+    expect(attempts).toBe(2)
+    expect(errors).toHaveLength(1)
+    expect(deliveries).toHaveLength(2)
+    await create().check()
+    expect(attempts).toBe(2)
+    setNow(start + day)
+    await sweep.check()
+    expect(attempts).toBe(3)
+    expect(errors).toHaveLength(2)
+    await sweep.check()
+    expect(errors).toHaveLength(2)
+  })
+
+  test("deduplicates cleanup while in flight and doesn't repeat it after a failed timestamp save", async () => {
+    const { filesystem, create, setCleanup, setNow } = fixture()
+    let complete!: (cleaned: boolean) => void
+    let started!: () => void
+    let attempts = 0
+    const began = new Promise<void>((resolve) => { started = resolve })
+    setCleanup(async () => { attempts += 1; started(); return new Promise<boolean>((resolve) => { complete = resolve }) })
+    const temporaryPaths: string[] = []
+    const brokenStore: FileSystemPort = { ...filesystem.port,
+      writeFile: async (filePath, contents) => { temporaryPaths.push(filePath); await filesystem.port.writeFile(filePath, contents) },
+      rename: async () => { throw new Error("disk unavailable") },
+    }
+    const sweep = create(brokenStore)
+    const first = sweep.check()
+    await began
+    await sweep.check()
+    expect(attempts).toBe(1)
+    complete(true)
+    await first
+    await sweep.check()
+    expect(attempts).toBe(1)
+    setNow(start + day)
+    await sweep.check()
+    expect(attempts).toBe(1)
+    expect(temporaryPaths.length).toBeGreaterThan(1)
+    expect(new Set(temporaryPaths).size).toBe(1)
   })
 })

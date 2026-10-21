@@ -5,10 +5,11 @@ import { homedir } from "node:os"
 import path from "node:path"
 import { requestRelaunch, sendCoordinatorMessage, steerWorker } from "./actions"
 import { archiveSession, loadArchivedSessionIds } from "./archive"
+import { createArchiveReviewSweep } from "./archive-review"
 import { loadBacklog, type BacklogTask } from "./backlog"
 import { composeInstructions } from "./compose"
 import { createNodeClock } from "./clock"
-import { MissingCliError, sessionSend, sessionStatus, type ExecRunner } from "./control-client"
+import { MissingCliError, SessionBusyError, sessionSend, sessionStatus, type ExecRunner } from "./control-client"
 import { sendTaskDecision } from "./decisions"
 import { handoffToFirstMate, resolveProjectRegistration } from "./handoff"
 import type { FileSystemPort } from "./file-system"
@@ -180,6 +181,27 @@ const supervisionDelivery = createSupervisionDelivery({
   },
   failed: (slug, error) => supervisionPoller.recordDeliveryError(slug, error instanceof Error ? error.message : String(error)),
   succeeded: (slug) => supervisionPoller.clearDeliveryError(slug),
+})
+
+const archiveReviewSweep = createArchiveReviewSweep({
+  filesystem: nodeFileSystem,
+  homeRoot,
+  nowMs: clock.nowMs,
+  deliver: (registration, prompt) => withProjectLifecycle(homeRoot, async () => {
+    const current = (await loadRegistry(nodeFileSystem, homeRoot))[registration.slug]
+    if (current === undefined) return false
+    const status = await sessionStatus(nodeExec, { sessionId: current.coordinatorSessionId, directory: current.homeDirectory })
+    if (status.activity === "unknown") throw new Error("archive review is waiting for a verified idle coordinator")
+    if (status.activity !== "idle") return false
+    try {
+      await sessionSend(nodeExec, { sessionId: current.coordinatorSessionId, directory: current.homeDirectory, prompt })
+      return true
+    } catch (error) {
+      if (error instanceof SessionBusyError) return false
+      throw error
+    }
+  }),
+  failed: (slug, reason) => console.error(`FirstMate archive review [${slug}]: ${reason}`),
 })
 
 // One supervision round: poll every registered project's workers, then
@@ -1528,7 +1550,12 @@ void withProjectLifecycle(homeRoot, async () => {
   for (const failure of failures) console.error(failure)
 }).catch((error) => console.error("FirstMate sidebar project association restore failed:", error instanceof Error ? error.message : String(error)))
 
+void archiveReviewSweep.check()
+
 const pollTimer = clock.startInterval(() => {
+  // Independent of the round guard: slow worker polling must not postpone
+  // scheduled reviews. The sweep has its own per-project in-flight guard.
+  void archiveReviewSweep.check()
   void runSupervisionRound()
 }, pollIntervalMs)
 

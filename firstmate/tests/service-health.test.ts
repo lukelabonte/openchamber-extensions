@@ -1,6 +1,8 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test"
 import { spawn, type ChildProcess } from "node:child_process"
+import { mkdtempSync, rmSync } from "node:fs"
 import net from "node:net"
+import os from "node:os"
 import path from "node:path"
 
 const serviceToken = "test-token"
@@ -9,14 +11,18 @@ const serviceEntry = path.join(serviceRoot, "service", "main.ts")
 
 let serviceProcess: ChildProcess | undefined
 let servicePort = 0
+let tempHome: string
 
 beforeAll(async () => {
+  tempHome = mkdtempSync(path.join(os.tmpdir(), "firstmate-health-test-"))
   servicePort = await getFreePort()
   serviceProcess = spawn(process.execPath, [serviceEntry], {
     env: {
       ...process.env,
       OPENCHAMBER_SERVICE_PORT: String(servicePort),
       OPENCHAMBER_SERVICE_TOKEN: serviceToken,
+      FIRSTMATE_HOME: tempHome,
+      FIRSTMATE_OPENCHAMBER_SETTINGS: path.join(tempHome, "absent-settings.json"),
     },
     stdio: ["ignore", "ignore", "ignore"],
   })
@@ -25,6 +31,7 @@ beforeAll(async () => {
 
 afterAll(() => {
   serviceProcess?.kill()
+  rmSync(tempHome, { recursive: true, force: true })
 })
 
 function getFreePort(): Promise<number> {

@@ -290,6 +290,9 @@ function isArchiveEntry(value) {
   return typeof value === "object" && value !== null && typeof value.sessionId === "string" && typeof value.title === "string" && typeof value.archivedAt === "string";
 }
 
+// service/archive-review.ts
+import { randomUUID as randomUUID3 } from "node:crypto";
+
 // service/backlog.ts
 var backlogStates = [
   "Queued",
@@ -674,194 +677,6 @@ ${body}${defaultsSection}
   return composed;
 }
 
-// service/clock.ts
-function createNodeClock() {
-  return {
-    nowMs: () => Date.now(),
-    delay: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
-    startInterval: (callback, intervalMs) => {
-      const timer = setInterval(callback, intervalMs);
-      return { cancel: () => clearInterval(timer) };
-    }
-  };
-}
-
-// service/slug.ts
-import path from "node:path";
-var HASH_HEX_LENGTH = 8;
-function normalizeProjectDirectory(projectDirectory) {
-  return path.resolve(projectDirectory.trim());
-}
-function deriveSlug(projectDirectory, existingProjectDirectories = []) {
-  const trimmedDirectory = projectDirectory.trim();
-  const baseSlug = slugifyBase(path.basename(trimmedDirectory));
-  const candidateSlug = baseSlug === "" ? `project-${pathHash(trimmedDirectory)}` : baseSlug;
-  const isTaken = existingProjectDirectories.some((existingDirectory) => normalizeDirectory(existingDirectory) !== normalizeDirectory(trimmedDirectory) && slugifyBase(path.basename(existingDirectory)) === baseSlug);
-  return isTaken ? `${candidateSlug}-${pathHash(trimmedDirectory)}` : candidateSlug;
-}
-function slugifyBase(baseName) {
-  return baseName.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
-}
-function normalizeDirectory(directoryPath) {
-  return directoryPath.replace(/\/+$/, "");
-}
-function pathHash(directoryPath) {
-  let hash = 2166136261;
-  for (let index = 0;index < directoryPath.length; index++) {
-    hash ^= directoryPath.charCodeAt(index);
-    hash = Math.imul(hash, 16777619);
-  }
-  return (hash >>> 0).toString(16).padStart(HASH_HEX_LENGTH, "0");
-}
-
-// service/registry.ts
-class RegistryCorruptError extends Error {
-  constructor(filePath, cause) {
-    super(`FirstMate registry file ${filePath} is unreadable (${cause}). Fix or delete it, then relaunch.`);
-    this.name = "RegistryCorruptError";
-  }
-}
-function registryPath(homeRoot) {
-  return `${homeRoot}/registry.json`;
-}
-async function loadRegistry(filesystem, homeRoot) {
-  const filePath = registryPath(homeRoot);
-  if (!await filesystem.exists(filePath)) {
-    return {};
-  }
-  let parsed;
-  try {
-    parsed = JSON.parse(await filesystem.readFile(filePath));
-  } catch (error) {
-    throw new RegistryCorruptError(filePath, error instanceof Error ? error.message : "not valid JSON");
-  }
-  if (!isPlainObject(parsed)) {
-    throw new RegistryCorruptError(filePath, "not a JSON object");
-  }
-  for (const [slug, registration] of Object.entries(parsed)) {
-    if (!isRegistration(registration)) {
-      throw new RegistryCorruptError(filePath, `the entry for slug ${slug} is not a registration`);
-    }
-  }
-  return parsed;
-}
-async function saveRegistry(filesystem, homeRoot, registrations) {
-  const filePath = registryPath(homeRoot);
-  const tempPath = `${filePath}.${Date.now()}-${Math.random().toString(16).slice(2)}.tmp`;
-  await filesystem.writeFile(tempPath, `${JSON.stringify(registrations, null, 2)}
-`);
-  await filesystem.rename(tempPath, filePath);
-}
-function findRegistration(registrations, projectDirectory) {
-  const normalizedDirectory = normalizeProjectDirectory(projectDirectory);
-  return Object.values(registrations).find((registration) => normalizeProjectDirectory(registration.projectDirectory) === normalizedDirectory || normalizeProjectDirectory(registration.homeDirectory) === normalizedDirectory);
-}
-function isRegistration(value) {
-  if (!isPlainObject(value))
-    return false;
-  return typeof value.slug === "string" && typeof value.projectDirectory === "string" && typeof value.homeDirectory === "string" && typeof value.coordinatorSessionId === "string" && typeof value.createdAt === "string";
-}
-function isPlainObject(value) {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-// service/decisions.ts
-async function sendTaskDecision(input) {
-  if (!isTaskId(input.taskId))
-    throw new Error("taskId must be a path-safe task id");
-  if (input.text === undefined === (input.label === undefined))
-    throw new Error("Provide either an answer or an action label, not both.");
-  const registrations = await loadRegistry(input.filesystem, input.homeRoot);
-  if (!Object.hasOwn(registrations, input.slug))
-    throw new Error("No first mate is registered for this project.");
-  const registration = registrations[input.slug];
-  const backlog = await loadBacklog(input.filesystem, `${registration.homeDirectory}/backlog.md`);
-  if (backlog.errors.length > 0)
-    throw new Error("Fix the backlog's malformed or duplicate records before answering a task.");
-  const matches = backlog.tasks.filter((task) => task.id === input.taskId);
-  if (matches.length !== 1)
-    throw new Error("No unique task with this id exists.");
-  const task = matches[0];
-  if (task.state === "Done")
-    throw new Error("This task is already Done; refresh the board.");
-  let text = input.text;
-  if (input.label !== undefined) {
-    const actions = task.actions?.filter((action) => action.label === input.label) ?? [];
-    if (actions.length !== 1)
-      throw new Error("That task action no longer exists; refresh the board.");
-    if (input.expectedText === undefined)
-      throw new Error("The action text shown on the board is required; refresh before answering.");
-    if (actions[0].text !== input.expectedText)
-      throw new Error("That action changed; refresh the board before answering.");
-    text = actions[0].text;
-  }
-  if (typeof text !== "string" || text.trim() === "" || Buffer.byteLength(text, "utf8") > 12000)
-    throw new Error("An answer must contain 1 to 12,000 UTF-8 bytes.");
-  await sessionSend(input.exec, {
-    sessionId: registration.coordinatorSessionId,
-    directory: registration.homeDirectory,
-    prompt: `Task ${task.id} — ${task.title}: ${text}`
-  });
-}
-
-// service/handoff.ts
-async function resolveProjectRegistration(filesystem, homeRoot, directory) {
-  const registrations = await loadRegistry(filesystem, homeRoot);
-  const direct = findRegistration(registrations, directory);
-  if (direct !== undefined)
-    return direct;
-  const normalizedDirectory = normalizeProjectDirectory(directory);
-  const matches = [];
-  for (const registration of Object.values(registrations)) {
-    const backlogPath = `${registration.homeDirectory}/backlog.md`;
-    if (!await filesystem.exists(backlogPath))
-      continue;
-    const backlog = await loadBacklog(filesystem, backlogPath);
-    if (backlog.tasks.some((task) => task.worktreeDirectory !== undefined && normalizeProjectDirectory(task.worktreeDirectory) === normalizedDirectory))
-      matches.push(registration);
-  }
-  if (matches.length > 1)
-    throw new Error("This worktree belongs to more than one FirstMate backlog; resolve the conflicting records first.");
-  return matches[0];
-}
-async function handoffToFirstMate(input) {
-  if (typeof input.text !== "string" || input.text.trim() === "" || Buffer.byteLength(input.text, "utf8") > 12000)
-    throw new Error("A FirstMate handoff needs non-empty text of at most 12,000 UTF-8 bytes.");
-  const registration = await resolveProjectRegistration(input.filesystem, input.homeRoot, input.directory);
-  if (registration === undefined)
-    throw new Error("No first mate is registered for this directory. Launch one from the project's FirstMate panel.");
-  const origin = input.sessionId === undefined ? "a terminal or script" : `session ${input.sessionId.replace(/\s+/g, " ")}, as claimed by the sender`;
-  const directory = input.directory.replace(/\s+/g, " ");
-  await sessionSend(input.exec, {
-    sessionId: registration.coordinatorSessionId,
-    directory: registration.homeDirectory,
-    prompt: `Relayed to FirstMate, from ${origin} (${directory}). This is a work request, not merge approval. Keep a durable captain-approval hold on work this request starts or steers, even under +yolo.
-
-${input.text}`
-  });
-}
-
-// service/forwarder.ts
-var busyRetryDelaysMs = [30000, 120000, 300000];
-var steadyRetryDelayMs = 300000;
-async function deliverNotification(input) {
-  const { exec, clock, notification } = input;
-  for (let attempt = 0;; attempt += 1) {
-    try {
-      await sessionSend(exec, {
-        sessionId: notification.coordinatorSessionId,
-        directory: notification.homeDirectory,
-        prompt: notification.message
-      });
-      return;
-    } catch (error) {
-      if (!(error instanceof SessionBusyError))
-        throw error;
-      await clock.delay(attempt < busyRetryDelaysMs.length ? busyRetryDelaysMs[attempt] : steadyRetryDelayMs);
-    }
-  }
-}
-
 // service/desktop-proxy.ts
 async function callDesktopProxy(input) {
   if (input.support.kind === "unsupported") {
@@ -894,45 +709,6 @@ async function callDesktopProxy(input) {
   }
 }
 
-// service/interrupt.ts
-async function discoverSupport(input) {
-  let raw;
-  try {
-    raw = await input.filesystem.readFile(input.settingsPath);
-  } catch {
-    return { kind: "unsupported", reason: `the OpenChamber settings file could not be read (${input.settingsPath})` };
-  }
-  let parsed;
-  try {
-    parsed = JSON.parse(raw);
-  } catch {
-    return { kind: "unsupported", reason: "the OpenChamber settings file is not valid JSON" };
-  }
-  if (typeof parsed !== "object" || parsed === null) {
-    return { kind: "unsupported", reason: "the OpenChamber settings file is not a JSON object" };
-  }
-  const record = parsed;
-  const port = record.desktopLocalPort;
-  const token = record.desktopLocalClientToken;
-  if (typeof port !== "number" || !Number.isInteger(port) || port <= 0) {
-    return { kind: "unsupported", reason: "the OpenChamber settings file has no usable desktopLocalPort" };
-  }
-  const usableToken = typeof token === "string" && token !== "" ? token : undefined;
-  if (token !== undefined && usableToken === undefined) {
-    return { kind: "unsupported", reason: "the OpenChamber settings file has a non-string desktopLocalClientToken" };
-  }
-  return { kind: "supported", port, ...usableToken !== undefined ? { token: usableToken } : {} };
-}
-async function interruptWorker(input) {
-  return callDesktopProxy({
-    fetcher: input.fetcher,
-    support: input.support,
-    method: "POST",
-    path: `/api/session/${input.sessionId}/interrupt?directory=${encodeURIComponent(input.directory)}`,
-    label: "abort"
-  });
-}
-
 // service/permissions.ts
 async function setSessionPermissionAuto(input) {
   return callDesktopProxy({
@@ -943,6 +719,34 @@ async function setSessionPermissionAuto(input) {
     body: JSON.stringify({ mode: "auto", directory: input.directory }),
     label: "auto-accept"
   });
+}
+
+// service/slug.ts
+import path from "node:path";
+var HASH_HEX_LENGTH = 8;
+function normalizeProjectDirectory(projectDirectory) {
+  return path.resolve(projectDirectory.trim());
+}
+function deriveSlug(projectDirectory, existingProjectDirectories = []) {
+  const trimmedDirectory = projectDirectory.trim();
+  const baseSlug = slugifyBase(path.basename(trimmedDirectory));
+  const candidateSlug = baseSlug === "" ? `project-${pathHash(trimmedDirectory)}` : baseSlug;
+  const isTaken = existingProjectDirectories.some((existingDirectory) => normalizeDirectory(existingDirectory) !== normalizeDirectory(trimmedDirectory) && slugifyBase(path.basename(existingDirectory)) === baseSlug);
+  return isTaken ? `${candidateSlug}-${pathHash(trimmedDirectory)}` : candidateSlug;
+}
+function slugifyBase(baseName) {
+  return baseName.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+}
+function normalizeDirectory(directoryPath) {
+  return directoryPath.replace(/\/+$/, "");
+}
+function pathHash(directoryPath) {
+  let hash = 2166136261;
+  for (let index = 0;index < directoryPath.length; index++) {
+    hash ^= directoryPath.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(16).padStart(HASH_HEX_LENGTH, "0");
 }
 
 // service/template-upgrades.ts
@@ -1156,6 +960,57 @@ async function createFiles(input) {
   }
 }
 
+// service/registry.ts
+class RegistryCorruptError extends Error {
+  constructor(filePath, cause) {
+    super(`FirstMate registry file ${filePath} is unreadable (${cause}). Fix or delete it, then relaunch.`);
+    this.name = "RegistryCorruptError";
+  }
+}
+function registryPath(homeRoot) {
+  return `${homeRoot}/registry.json`;
+}
+async function loadRegistry(filesystem, homeRoot) {
+  const filePath = registryPath(homeRoot);
+  if (!await filesystem.exists(filePath)) {
+    return {};
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(await filesystem.readFile(filePath));
+  } catch (error) {
+    throw new RegistryCorruptError(filePath, error instanceof Error ? error.message : "not valid JSON");
+  }
+  if (!isPlainObject(parsed)) {
+    throw new RegistryCorruptError(filePath, "not a JSON object");
+  }
+  for (const [slug, registration] of Object.entries(parsed)) {
+    if (!isRegistration(registration)) {
+      throw new RegistryCorruptError(filePath, `the entry for slug ${slug} is not a registration`);
+    }
+  }
+  return parsed;
+}
+async function saveRegistry(filesystem, homeRoot, registrations) {
+  const filePath = registryPath(homeRoot);
+  const tempPath = `${filePath}.${Date.now()}-${Math.random().toString(16).slice(2)}.tmp`;
+  await filesystem.writeFile(tempPath, `${JSON.stringify(registrations, null, 2)}
+`);
+  await filesystem.rename(tempPath, filePath);
+}
+function findRegistration(registrations, projectDirectory) {
+  const normalizedDirectory = normalizeProjectDirectory(projectDirectory);
+  return Object.values(registrations).find((registration) => normalizeProjectDirectory(registration.projectDirectory) === normalizedDirectory || normalizeProjectDirectory(registration.homeDirectory) === normalizedDirectory);
+}
+function isRegistration(value) {
+  if (!isPlainObject(value))
+    return false;
+  return typeof value.slug === "string" && typeof value.projectDirectory === "string" && typeof value.homeDirectory === "string" && typeof value.coordinatorSessionId === "string" && typeof value.createdAt === "string";
+}
+function isPlainObject(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 // service/session-projects.ts
 async function associateFirstMateSession(exec, registration) {
   try {
@@ -1361,6 +1216,250 @@ async function recordCoordinatorSessionId(filesystem, homeDirectory, coordinator
   await filesystem.writeFile(temporaryPath, `${JSON.stringify(settings, null, 2)}
 `);
   await filesystem.rename(temporaryPath, settingsPath);
+}
+
+// service/archive-review.ts
+var reviewIntervalMs = 24 * 60 * 60 * 1000;
+var reviewPrompt = `Scheduled worker-session archival review for this project only.
+
+Read backlog.md and the saved briefs and reports. Review tracked worker sessions, including legacy entries and board-only End entries. Check live status and evidence before deciding which sessions no longer need review, follow-up, or an open decision. Reconcile missing task IDs or reports before requesting retirement. Age, idle status, and a worker's own done claim aren't completion evidence.
+
+Respect the captain's orders and requests to keep sessions active. Save checked results, evidence and message links, session/worktree references, and the retirement reason in reports/<id>.md. Only for a genuinely Done task with no remaining dependency, hold, or answer action, add archive-session: <exact current session id> to its backlog entry. The service checks ownership, a saved report, idle status, and pending questions/permissions. Wait for its confirmation before claiming archival. Leave failed archive attempts paused until their failure has been reconciled.
+
+Keep running, waiting, failed, unknown, or unresolved workers available. Leave untracked sessions untouched. Don't start, steer, interrupt, or relaunch workers. This review doesn't authorize landing, scope expansion, deletion, discard, or repository cleanup. Preserve conversations, branches, worktrees, and existing evidence. Keep routine no-change results quiet; report real failures or decisions.`;
+function archiveReviewPath(homeDirectory) {
+  return `${homeDirectory}/archive-review.json`;
+}
+function createArchiveReviewSweep(input) {
+  const inFlight = new Set;
+  const deliveredAt = new Map;
+  const pendingSaves = new Map;
+  const failures = new Map;
+  function reportFailure(slug, error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    if (failures.get(slug) === reason)
+      return;
+    failures.set(slug, reason);
+    input.failed(slug, reason);
+  }
+  async function saveDelivery(slug, filePath, pending) {
+    await input.filesystem.writeFile(pending.temporaryPath, `${JSON.stringify({ version: 1, lastDeliveredAt: new Date(pending.deliveredAt).toISOString() }, null, 2)}
+`);
+    await input.filesystem.rename(pending.temporaryPath, filePath);
+    pendingSaves.delete(slug);
+    failures.delete(slug);
+  }
+  async function reviewProject(registration, coordinatorIds) {
+    const { slug } = registration;
+    if (inFlight.has(slug))
+      return;
+    inFlight.add(slug);
+    try {
+      const homeDirectory = resolveProjectHomeDirectory(input.homeRoot, slug);
+      if (normalizeProjectDirectory(registration.homeDirectory) !== homeDirectory)
+        throw new Error("archive review project home doesn't match its registration");
+      const filePath = archiveReviewPath(homeDirectory);
+      let lastDeliveredAt = deliveredAt.get(slug);
+      let persistedAt;
+      if (await input.filesystem.exists(filePath)) {
+        let parsed;
+        try {
+          parsed = JSON.parse(await input.filesystem.readFile(filePath));
+        } catch {
+          throw new Error(`archive review state is unreadable: ${filePath}`);
+        }
+        if (typeof parsed !== "object" || parsed === null || !("version" in parsed) || parsed.version !== 1 || !("lastDeliveredAt" in parsed) || typeof parsed.lastDeliveredAt !== "string" || !Number.isFinite(Date.parse(parsed.lastDeliveredAt))) {
+          throw new Error(`archive review state is invalid: ${filePath}`);
+        }
+        persistedAt = Date.parse(parsed.lastDeliveredAt);
+        lastDeliveredAt = Math.max(lastDeliveredAt ?? -Infinity, persistedAt);
+      }
+      const pendingSave = pendingSaves.get(slug);
+      if (pendingSave !== undefined) {
+        if (persistedAt !== undefined && persistedAt >= pendingSave.deliveredAt)
+          pendingSaves.delete(slug);
+        else
+          await saveDelivery(slug, filePath, pendingSave);
+      }
+      if (lastDeliveredAt !== undefined && input.nowMs() - lastDeliveredAt < reviewIntervalMs)
+        return;
+      const backlog = await loadBacklog(input.filesystem, `${homeDirectory}/backlog.md`);
+      if (backlog.errors.length > 0)
+        throw new Error("archive review is waiting for a readable backlog without malformed entries");
+      const archived = await loadHostArchivedSessionIds(input.filesystem, input.homeRoot, slug);
+      if (!backlog.tasks.some((task) => task.sessionId !== undefined && !coordinatorIds.has(task.sessionId) && !archived.has(task.sessionId)))
+        return;
+      if (!await input.deliver(registration, reviewPrompt))
+        return;
+      const completedAt = input.nowMs();
+      deliveredAt.set(slug, completedAt);
+      const pending = { deliveredAt: completedAt, temporaryPath: `${filePath}.${randomUUID3()}.tmp` };
+      pendingSaves.set(slug, pending);
+      await saveDelivery(slug, filePath, pending);
+    } catch (error) {
+      reportFailure(slug, error);
+    } finally {
+      inFlight.delete(slug);
+    }
+  }
+  async function check() {
+    try {
+      const registrations = Object.values(await loadRegistry(input.filesystem, input.homeRoot));
+      const coordinatorIds = new Set(registrations.map((registration) => registration.coordinatorSessionId));
+      await Promise.all(registrations.map((registration) => reviewProject(registration, coordinatorIds)));
+    } catch (error) {
+      reportFailure("registry", error);
+    }
+  }
+  return { check };
+}
+
+// service/clock.ts
+function createNodeClock() {
+  return {
+    nowMs: () => Date.now(),
+    delay: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+    startInterval: (callback, intervalMs) => {
+      const timer = setInterval(callback, intervalMs);
+      return { cancel: () => clearInterval(timer) };
+    }
+  };
+}
+
+// service/decisions.ts
+async function sendTaskDecision(input) {
+  if (!isTaskId(input.taskId))
+    throw new Error("taskId must be a path-safe task id");
+  if (input.text === undefined === (input.label === undefined))
+    throw new Error("Provide either an answer or an action label, not both.");
+  const registrations = await loadRegistry(input.filesystem, input.homeRoot);
+  if (!Object.hasOwn(registrations, input.slug))
+    throw new Error("No first mate is registered for this project.");
+  const registration = registrations[input.slug];
+  const backlog = await loadBacklog(input.filesystem, `${registration.homeDirectory}/backlog.md`);
+  if (backlog.errors.length > 0)
+    throw new Error("Fix the backlog's malformed or duplicate records before answering a task.");
+  const matches = backlog.tasks.filter((task) => task.id === input.taskId);
+  if (matches.length !== 1)
+    throw new Error("No unique task with this id exists.");
+  const task = matches[0];
+  if (task.state === "Done")
+    throw new Error("This task is already Done; refresh the board.");
+  let text = input.text;
+  if (input.label !== undefined) {
+    const actions = task.actions?.filter((action) => action.label === input.label) ?? [];
+    if (actions.length !== 1)
+      throw new Error("That task action no longer exists; refresh the board.");
+    if (input.expectedText === undefined)
+      throw new Error("The action text shown on the board is required; refresh before answering.");
+    if (actions[0].text !== input.expectedText)
+      throw new Error("That action changed; refresh the board before answering.");
+    text = actions[0].text;
+  }
+  if (typeof text !== "string" || text.trim() === "" || Buffer.byteLength(text, "utf8") > 12000)
+    throw new Error("An answer must contain 1 to 12,000 UTF-8 bytes.");
+  await sessionSend(input.exec, {
+    sessionId: registration.coordinatorSessionId,
+    directory: registration.homeDirectory,
+    prompt: `Task ${task.id} — ${task.title}: ${text}`
+  });
+}
+
+// service/handoff.ts
+async function resolveProjectRegistration(filesystem, homeRoot, directory) {
+  const registrations = await loadRegistry(filesystem, homeRoot);
+  const direct = findRegistration(registrations, directory);
+  if (direct !== undefined)
+    return direct;
+  const normalizedDirectory = normalizeProjectDirectory(directory);
+  const matches = [];
+  for (const registration of Object.values(registrations)) {
+    const backlogPath = `${registration.homeDirectory}/backlog.md`;
+    if (!await filesystem.exists(backlogPath))
+      continue;
+    const backlog = await loadBacklog(filesystem, backlogPath);
+    if (backlog.tasks.some((task) => task.worktreeDirectory !== undefined && normalizeProjectDirectory(task.worktreeDirectory) === normalizedDirectory))
+      matches.push(registration);
+  }
+  if (matches.length > 1)
+    throw new Error("This worktree belongs to more than one FirstMate backlog; resolve the conflicting records first.");
+  return matches[0];
+}
+async function handoffToFirstMate(input) {
+  if (typeof input.text !== "string" || input.text.trim() === "" || Buffer.byteLength(input.text, "utf8") > 12000)
+    throw new Error("A FirstMate handoff needs non-empty text of at most 12,000 UTF-8 bytes.");
+  const registration = await resolveProjectRegistration(input.filesystem, input.homeRoot, input.directory);
+  if (registration === undefined)
+    throw new Error("No first mate is registered for this directory. Launch one from the project's FirstMate panel.");
+  const origin = input.sessionId === undefined ? "a terminal or script" : `session ${input.sessionId.replace(/\s+/g, " ")}, as claimed by the sender`;
+  const directory = input.directory.replace(/\s+/g, " ");
+  await sessionSend(input.exec, {
+    sessionId: registration.coordinatorSessionId,
+    directory: registration.homeDirectory,
+    prompt: `Relayed to FirstMate, from ${origin} (${directory}). This is a work request, not merge approval. Keep a durable captain-approval hold on work this request starts or steers, even under +yolo.
+
+${input.text}`
+  });
+}
+
+// service/forwarder.ts
+var busyRetryDelaysMs = [30000, 120000, 300000];
+var steadyRetryDelayMs = 300000;
+async function deliverNotification(input) {
+  const { exec, clock, notification } = input;
+  for (let attempt = 0;; attempt += 1) {
+    try {
+      await sessionSend(exec, {
+        sessionId: notification.coordinatorSessionId,
+        directory: notification.homeDirectory,
+        prompt: notification.message
+      });
+      return;
+    } catch (error) {
+      if (!(error instanceof SessionBusyError))
+        throw error;
+      await clock.delay(attempt < busyRetryDelaysMs.length ? busyRetryDelaysMs[attempt] : steadyRetryDelayMs);
+    }
+  }
+}
+
+// service/interrupt.ts
+async function discoverSupport(input) {
+  let raw;
+  try {
+    raw = await input.filesystem.readFile(input.settingsPath);
+  } catch {
+    return { kind: "unsupported", reason: `the OpenChamber settings file could not be read (${input.settingsPath})` };
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return { kind: "unsupported", reason: "the OpenChamber settings file is not valid JSON" };
+  }
+  if (typeof parsed !== "object" || parsed === null) {
+    return { kind: "unsupported", reason: "the OpenChamber settings file is not a JSON object" };
+  }
+  const record = parsed;
+  const port = record.desktopLocalPort;
+  const token = record.desktopLocalClientToken;
+  if (typeof port !== "number" || !Number.isInteger(port) || port <= 0) {
+    return { kind: "unsupported", reason: "the OpenChamber settings file has no usable desktopLocalPort" };
+  }
+  const usableToken = typeof token === "string" && token !== "" ? token : undefined;
+  if (token !== undefined && usableToken === undefined) {
+    return { kind: "unsupported", reason: "the OpenChamber settings file has a non-string desktopLocalClientToken" };
+  }
+  return { kind: "supported", port, ...usableToken !== undefined ? { token: usableToken } : {} };
+}
+async function interruptWorker(input) {
+  return callDesktopProxy({
+    fetcher: input.fetcher,
+    support: input.support,
+    method: "POST",
+    path: `/api/session/${input.sessionId}/interrupt?directory=${encodeURIComponent(input.directory)}`,
+    label: "abort"
+  });
 }
 
 // service/lifecycle.ts
@@ -3282,6 +3381,30 @@ var supervisionDelivery = createSupervisionDelivery({
   failed: (slug, error) => supervisionPoller.recordDeliveryError(slug, error instanceof Error ? error.message : String(error)),
   succeeded: (slug) => supervisionPoller.clearDeliveryError(slug)
 });
+var archiveReviewSweep = createArchiveReviewSweep({
+  filesystem: nodeFileSystem,
+  homeRoot,
+  nowMs: clock.nowMs,
+  deliver: (registration, prompt) => withProjectLifecycle(homeRoot, async () => {
+    const current = (await loadRegistry(nodeFileSystem, homeRoot))[registration.slug];
+    if (current === undefined)
+      return false;
+    const status = await sessionStatus(nodeExec, { sessionId: current.coordinatorSessionId, directory: current.homeDirectory });
+    if (status.activity === "unknown")
+      throw new Error("archive review is waiting for a verified idle coordinator");
+    if (status.activity !== "idle")
+      return false;
+    try {
+      await sessionSend(nodeExec, { sessionId: current.coordinatorSessionId, directory: current.homeDirectory, prompt });
+      return true;
+    } catch (error) {
+      if (error instanceof SessionBusyError)
+        return false;
+      throw error;
+    }
+  }),
+  failed: (slug, reason) => console.error(`FirstMate archive review [${slug}]: ${reason}`)
+});
 var roundInFlight = false;
 async function runSupervisionRound() {
   if (roundInFlight)
@@ -4443,7 +4566,9 @@ withProjectLifecycle(homeRoot, async () => {
   for (const failure of failures)
     console.error(failure);
 }).catch((error) => console.error("FirstMate sidebar project association restore failed:", error instanceof Error ? error.message : String(error)));
+archiveReviewSweep.check();
 var pollTimer = clock.startInterval(() => {
+  archiveReviewSweep.check();
   runSupervisionRound();
 }, pollIntervalMs);
 var watchTimer = clock.startInterval(() => {

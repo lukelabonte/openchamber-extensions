@@ -1,5 +1,5 @@
 import { loadBacklog, type BacklogTask } from "./backlog"
-import { loadArchivedSessionIds } from "./archive"
+import { loadArchivedSessionIds, loadHostArchivedSessionIds } from "./archive"
 import { buildBoardWorker, type BoardWorker, type WorkerObservation } from "./board"
 import { sessionLastAssistant, sessionList, sessionStatus, type ExecRunner, type SessionActivity, type SessionLastAssistant, type SessionListEntry, type SessionOutcome } from "./control-client"
 import { callDesktopProxy } from "./desktop-proxy"
@@ -11,6 +11,7 @@ import { loadRegistry, type Registration } from "./registry"
 import { fetchSessionInfo, type SessionInfo } from "./session-observation"
 import { normalizeProjectDirectory } from "./slug"
 import { workerMessageLink } from "./message-links"
+import { archiveFinishedWorker } from "./worker-archive"
 
 export type WorkerEventKind = "finished" | "failed" | "waiting-question" | "waiting-permission" | "steered-answer"
 
@@ -124,6 +125,11 @@ export function createSupervisionPoller(input: {
   const observations = new Map<string, WorkerObservation>()
   const pollErrors = new Map<string, string>()
   const deliveryErrors = new Map<string, string>()
+  // Failures require an observed clear/re-add of the explicit request before
+  // another attempt in this process. Busy/refused requests can become safe on
+  // later rounds. Notices debounce independently of completion events.
+  const failedArchiveRequests = new Set<string>()
+  const archiveNotices = new Map<string, string>()
   // Supervision health per slug, recorded at each project's completed poll
   // attempt; in-memory like every poll state.
   const supervisionHealth = new Map<string, SupervisionHealth>()
@@ -198,8 +204,50 @@ export function createSupervisionPoller(input: {
         notifications.push(composeNotification(registration, events))
       }
       for (const event of events) await notifyEvent(registration, event, support)
+      notifications.push(...await pollArchiveRequests(registration, support, pending))
     }
     return { notifications }
+  }
+
+  async function pollArchiveRequests(registration: Registration, support: InterruptSupport | undefined, pending: PendingSnapshotResult): Promise<ProjectNotification[]> {
+    let backlog: Awaited<ReturnType<typeof loadBacklog>>
+    let hostArchived: Set<string>
+    try {
+      backlog = await loadBacklog(filesystem, `${homeRoot}/projects/${registration.slug}/backlog.md`)
+      hostArchived = await loadHostArchivedSessionIds(filesystem, homeRoot, registration.slug)
+    } catch {
+      return []
+    }
+    if (backlog.errors.length > 0) return []
+    const requested = backlog.tasks.filter((task) => task.sessionId !== undefined && task.archiveSessionId === task.sessionId)
+    const keys = new Set(requested.map((task) => observationKey(registration.slug, task.sessionId!)))
+    const prefix = observationKey(registration.slug, "")
+    for (const key of archiveNotices.keys()) {
+      if (key.startsWith(prefix) && !keys.has(key)) {
+        archiveNotices.delete(key)
+        failedArchiveRequests.delete(key)
+      }
+    }
+    const notifications: ProjectNotification[] = []
+    for (const task of requested) {
+      const sessionId = task.sessionId!
+      const key = observationKey(registration.slug, sessionId)
+      if (hostArchived.has(sessionId) || failedArchiveRequests.has(key)) continue
+      const blockingState = pending.kind !== "ok" ? "unknown" : pendingActivity(pending.pending[sessionId]) === undefined ? "clear" : "waiting"
+      const outcome = await archiveFinishedWorker({
+        filesystem, exec, fetcher, homeRoot, slug: registration.slug, sessionId, nowMs, blockingState,
+        support: support ?? { kind: "unsupported", reason: "the desktop proxy could not be resolved" },
+      })
+      if (outcome.kind === "already-archived") continue
+      if (outcome.kind === "failed") failedArchiveRequests.add(key)
+      const message = outcome.kind === "archived"
+        ? `Worker session ${sessionId} archived and its board card retired. Conversation, saved evidence, branch, and worktree preserved.`
+        : `Worker session archive request for ${sessionId}: ${outcome.reason}. ${outcome.kind === "failed" ? "Check the live session and archive records. To retry, remove archive-session, wait for a supervision round, then add it again." : "The request remains pending; reconcile the task if needed."}`
+      if (archiveNotices.get(key) === message) continue
+      archiveNotices.set(key, message)
+      notifications.push({ slug: registration.slug, coordinatorSessionId: registration.coordinatorSessionId, homeDirectory: registration.homeDirectory, message })
+    }
+    return notifications
   }
 
   async function pollProject(

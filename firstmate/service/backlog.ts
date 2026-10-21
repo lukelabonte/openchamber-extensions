@@ -29,6 +29,7 @@ export interface BacklogTask {
   reviewHead?: string
   actions?: BacklogTaskAction[]
   sessionId?: string
+  archiveSessionId?: string
   worktreeDirectory?: string
   branch?: string
   startRef?: string
@@ -59,6 +60,7 @@ const fieldKeys: Record<string, OptionalFieldName> = {
   "review-head": "reviewHead",
   actions: "actions",
   session: "sessionId",
+  "archive-session": "archiveSessionId",
   worktree: "worktreeDirectory",
   branch: "branch",
   "start-ref": "startRef",
@@ -217,6 +219,10 @@ function applyField(entry: EntryDraft, field: RegExpExecArray | null, lineNumber
     entry.problem = { line: lineNumber, message: `the entry "${entry.title}" has a "${key}" that is not a hex SHA (7–64 characters)` }
     return
   }
+  if (fieldName === "archiveSessionId" && !/^[A-Za-z0-9_-]{1,128}$/.test(value)) {
+    entry.problem = { line: lineNumber, message: `the entry "${entry.title}" has an invalid "archive-session" session id` }
+    return
+  }
   entry.fields[fieldName] = value
   if (fieldName === "id") entry.idLine = lineNumber
 }
@@ -297,6 +303,7 @@ export function formatBacklogEntry(task: BacklogTask): string {
     lines.push(`  actions: ${task.actions.map((action) => `${escapeActionText(action.label)} => ${escapeActionText(action.text)}`).join(" | ")}`)
   }
   if (task.sessionId !== undefined) lines.push(`  session: ${task.sessionId}`)
+  if (task.archiveSessionId !== undefined) lines.push(`  archive-session: ${task.archiveSessionId}`)
   if (task.worktreeDirectory !== undefined) lines.push(`  worktree: ${task.worktreeDirectory}`)
   if (task.branch !== undefined) lines.push(`  branch: ${task.branch}`)
   if (task.startRef !== undefined) lines.push(`  start-ref: ${task.startRef}`)

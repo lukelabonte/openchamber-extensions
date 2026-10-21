@@ -26,6 +26,7 @@ var fieldKeys = {
   "review-head": "reviewHead",
   actions: "actions",
   session: "sessionId",
+  "archive-session": "archiveSessionId",
   worktree: "worktreeDirectory",
   branch: "branch",
   "start-ref": "startRef",
@@ -163,6 +164,10 @@ function applyField(entry, field, lineNumber) {
   }
   if (fieldName === "reviewHead" && !isReviewHead(value)) {
     entry.problem = { line: lineNumber, message: `the entry "${entry.title}" has a "${key}" that is not a hex SHA (7–64 characters)` };
+    return;
+  }
+  if (fieldName === "archiveSessionId" && !/^[A-Za-z0-9_-]{1,128}$/.test(value)) {
+    entry.problem = { line: lineNumber, message: `the entry "${entry.title}" has an invalid "archive-session" session id` };
     return;
   }
   entry.fields[fieldName] = value;

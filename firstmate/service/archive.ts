@@ -1,14 +1,16 @@
 import type { FileSystemPort } from "./file-system"
 
-// Extension-owned End state: an archived card is excluded from the board and
-// from supervision, while the session and worktree are left exactly as they
-// are. The log is one JSON object per line in the project home, so archive
+// Extension-owned retirement: an archived card is excluded from the board and
+// from supervision. End leaves the host session alone; hostArchived records
+// separate, confirmed host archival. Both preserve the worktree.
+// The log is one JSON object per line in the project home, so archive
 // state survives a service restart and a torn final line (a crash mid-append)
 // only costs that one entry.
 export interface ArchiveEntry {
   sessionId: string
   title: string
   archivedAt: string
+  hostArchived?: boolean
 }
 
 export function archivePath(homeRoot: string, slug: string): string {
@@ -16,6 +18,14 @@ export function archivePath(homeRoot: string, slug: string): string {
 }
 
 export async function loadArchivedSessionIds(filesystem: FileSystemPort, homeRoot: string, slug: string): Promise<Set<string>> {
+  return loadSessionIds(filesystem, homeRoot, slug, false)
+}
+
+export async function loadHostArchivedSessionIds(filesystem: FileSystemPort, homeRoot: string, slug: string): Promise<Set<string>> {
+  return loadSessionIds(filesystem, homeRoot, slug, true)
+}
+
+async function loadSessionIds(filesystem: FileSystemPort, homeRoot: string, slug: string, hostOnly: boolean): Promise<Set<string>> {
   const filePath = archivePath(homeRoot, slug)
   if (!(await filesystem.exists(filePath))) return new Set()
   const ids = new Set<string>()
@@ -24,7 +34,7 @@ export async function loadArchivedSessionIds(filesystem: FileSystemPort, homeRoo
     if (trimmed === "") continue
     try {
       const parsed = JSON.parse(trimmed) as unknown
-      if (isArchiveEntry(parsed)) ids.add(parsed.sessionId)
+      if (isArchiveEntry(parsed) && (!hostOnly || parsed.hostArchived === true)) ids.add(parsed.sessionId)
     } catch {
       // A torn or malformed line is skipped, not fatal.
     }

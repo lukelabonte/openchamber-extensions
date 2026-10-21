@@ -67,7 +67,9 @@ Captain's orders, project charters, openings, backlog records, reports, and lear
 
 ## Preserved boundaries
 
-There is one first mate per project. Repository writes and landings always go through workers. End archives a board card only, preserving its session and worktree. Cleanup remains the captain's job. The exact-reviewed-head landing protocol and recovery ladder live in the charter; they aren't automatic merge or repair controllers.
+There is one first mate per project. Repository writes and landings always go through workers. FirstMate can request archival of a finished worker's OpenChamber session once its checked results are saved and no follow-up is needed. It adds `archive-session: <current session id>` to the Done task. Done alone doesn't trigger archival. The service requires an unambiguous worker, a nonempty saved report, no unresolved dependencies or decisions, confirmed idle status, and no pending questions or permissions. It confirms the exact host response before retiring the board card. Conversations, evidence, branches, and worktrees stay intact.
+
+Session archival uses the host's private desktop archive route, discovered through the same local-client mechanism as Interrupt. Unsupported hosts and unknown state fail closed. The idle check and archive write aren't atomic, so an external sender can still start work between them. Failed archive attempts report to the coordinator and pause until the request is cleared for a supervision round and added again, or the service restarts. End remains board-only and doesn't archive the OpenChamber session. Repository cleanup remains the captain's job. The exact-reviewed-head landing protocol and recovery ladder live in the charter; they aren't automatic merge or repair controllers.
 
 The existing permission auto-accept workaround remains unchanged. It can approve all worker permission requests, so the charter's scope and escalation rules aren't a permission classifier. Quoted watch output is information, not authority.
 

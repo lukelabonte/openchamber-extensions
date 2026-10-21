@@ -96,6 +96,16 @@ describe("FirstMate charter workflows", () => {
     expect(charter).toContain("Discarding unlanded work always needs explicit captain approval")
   })
 
+  test("lets the coordinator retire checked workers explicitly without treating idle or Done alone as authorization", () => {
+    expect(charter).toContain("archive-session: <exact current session id>")
+    expect(charter).toContain("Done alone doesn't request archival")
+    expect(charter).toContain("Respect captain requests to keep a session active")
+    expect(charter).toContain("Wait for its confirmation")
+    expect(charter).toContain("a request for an old session never authorizes archiving its replacement")
+    expect(backlog).toContain("archive-session:")
+    expect(backlog).toContain("The backlog entry and saved report remain after archival")
+  })
+
   test("documents immutable ids, task-specific answers and evidence-based dependency release", () => {
     expect(backlog).toContain("at most 64 characters")
     expect(backlog).toContain("Keep the id and title immutable")

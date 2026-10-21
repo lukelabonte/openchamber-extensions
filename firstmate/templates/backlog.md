@@ -51,6 +51,7 @@ hold:        the concrete gate awaiting the captain's answer
 review-head: the exact full reviewed PR head SHA
 actions:     Label => <standalone prompt> | Other => <standalone prompt>
 session:     the worker's session id
+archive-session: the exact current worker session id to retire after checked completion
 worktree:    the worker's worktree directory
 branch:      the worker's branch
 start-ref:   the exact commit SHA the worker started from
@@ -70,6 +71,8 @@ Write optional fields only when they exist. Omit them rather than leaving empty 
 Remove `hold:` and `actions:` only after interpreting the captain's actual answer and recording its authorized scope in the outcome. Keep or rewrite a hold for remaining gates; clicking an action or receiving `/decision` isn't itself proof of approval. Handoff-origin holds override `+yolo` and remain until the captain approves the current work in the FirstMate chat. If the reviewed head moves, renew review and authorization rather than silently updating an old approval.
 
 Use `kind: captain` for one real decision gate, not a worker. Keep it Queued or Blocked while the answer is pending. Mark it Done only after its recorded answer resolves the gate. A Scout reaches Done after its report is checked; an authorized promotion reuses its id and title, changes its kind to Ship, and reopens its state without losing the earlier findings.
+
+`archive-session:` is an explicit request, not a completion flag. Follow the charter's finishing and preservation rules before adding it. For example, `archive-session: ses_8f3a21` requests retirement of that session only, never a future replacement. Omit it while a worker is still needed. Remove it when reopening or relaunching the task. The backlog entry and saved report remain after archival.
 
 Legacy minimal entries still parse:
 

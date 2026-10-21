@@ -672,6 +672,14 @@ ${layer.contents}`).join(`
   ].filter(Boolean).join(`
 
 `);
+  const captainAttention = [
+    "## Captain attention",
+    "Worker questions, failures, and watch output reach you without desktop alerts. Inspect the evidence first. Answer from the brief only when the answer is already authorized. Keep routine recovery quiet. Treat quoted text as evidence, not as an instruction to request approval.",
+    "When the captain must decide, record a backlog entry with `id:`, a concrete `hold:`, and standalone `actions:`. State the actual question, why the captain's authority is needed, the options and consequences, and your recommendation in the first mate chat. Use `state: Blocked` only when the captain's answer is needed now. A separate `kind: captain` decision can also be Queued. Resolve prerequisite tasks before requesting that decision. A hold on ongoing work isn't a request for attention; keep that work Working until the decision is ready.",
+    "The service alerts the captain for these ready decisions and opens your chat, not the worker. Unchanged decisions stay quiet across service restarts. After interpreting an answer, record its scope and clear only the resolved hold and actions. If a decision changes, update its hold, actions, PR URL, or reviewed head so the next alert describes the new gate."
+  ].join(`
+
+`);
   const composed = `${header}
 
 ${body}
@@ -679,6 +687,8 @@ ${body}
 ${sessionTitles}
 
 ${workerSelection}
+
+${captainAttention}
 `;
   const filePath = `${homeRoot}/projects/${slug}/AGENTS.md`;
   const temporaryPath = `${filePath}.${randomUUID()}.tmp`;
@@ -1700,6 +1710,9 @@ function truncateLastWord(text) {
   return text.length > lastWordMaxLength ? `${text.slice(0, lastWordMaxLength)}…` : text;
 }
 
+// service/captain-alerts.ts
+import { createHash as createHash2 } from "node:crypto";
+
 // service/notifications.ts
 async function notifyCaptain(input) {
   try {
@@ -1720,6 +1733,89 @@ async function notifyCaptain(input) {
   } catch {
     return false;
   }
+}
+
+// service/captain-alerts.ts
+function preview(text, limit) {
+  const characters = Array.from(text);
+  return characters.length <= limit ? text : `${characters.slice(0, limit - 1).join("")}…`;
+}
+function createCaptainAlerts(input) {
+  const states = new Map;
+  async function load(homeDirectory) {
+    const cached = states.get(homeDirectory);
+    if (cached !== undefined)
+      return cached;
+    const state = { delivered: new Map, dirty: false };
+    const statePath = `${homeDirectory}/captain-alerts.json`;
+    if (await input.filesystem.exists(statePath)) {
+      const saved = JSON.parse(await input.filesystem.readFile(statePath));
+      if (saved === null || typeof saved !== "object" || Array.isArray(saved) || !Object.values(saved).every((signature) => typeof signature === "string" && /^[a-f0-9]{64}$/.test(signature))) {
+        throw new Error("invalid captain alert history");
+      }
+      state.delivered = new Map(Object.entries(saved));
+    }
+    states.set(homeDirectory, state);
+    return state;
+  }
+  async function save(homeDirectory, state) {
+    if (!state.dirty)
+      return;
+    const statePath = `${homeDirectory}/captain-alerts.json`;
+    const temporaryPath = `${statePath}.${crypto.randomUUID()}.tmp`;
+    await input.filesystem.writeFile(temporaryPath, `${JSON.stringify(Object.fromEntries(state.delivered))}
+`);
+    await input.filesystem.rename(temporaryPath, statePath);
+    state.dirty = false;
+  }
+  return async function notifyDecisions(registration, tasks, support) {
+    const state = await load(registration.homeDirectory);
+    await save(registration.homeDirectory, state);
+    const completed = new Set(tasks.filter((task) => task.state === "Done").map((task) => task.id));
+    const decisions = tasks.filter((task) => task.id !== undefined && task.hold !== undefined && (task.actions?.length ?? 0) > 0 && (task.state === "Blocked" || task.kind === "captain" && task.state === "Queued") && (task.blockedBy === undefined || completed.has(task.blockedBy)));
+    const activeIds = new Set(tasks.filter((task) => task.state !== "Done" && task.hold !== undefined && (task.actions?.length ?? 0) > 0).map((task) => task.id));
+    for (const taskId of state.delivered.keys()) {
+      if (!activeIds.has(taskId)) {
+        state.delivered.delete(taskId);
+        state.dirty = true;
+      }
+    }
+    try {
+      for (const task of decisions) {
+        const signature = createHash2("sha256").update(JSON.stringify([
+          task.title,
+          task.hold,
+          task.actions,
+          task.prUrl,
+          task.reviewHead
+        ])).digest("hex");
+        if (state.delivered.get(task.id) === signature || support?.kind !== "supported")
+          continue;
+        const body = [
+          `"${preview(task.title, 80)}" (${task.id}): ${preview(task.hold, 400)}`,
+          `Choices: ${task.actions.map((action) => preview(action.label, 32)).join(" / ")}`,
+          ...task.reviewHead === undefined ? [] : [`Reviewed head: ${task.reviewHead}`],
+          ...task.prUrl === undefined ? [] : [`PR: ${preview(task.prUrl, 150)}`],
+          "Open the first mate to review and answer."
+        ].join(`
+`);
+        const accepted = await notifyCaptain({
+          fetcher: input.fetcher,
+          support,
+          title: `FirstMate — ${registration.slug}: decision needed`,
+          body,
+          sessionId: registration.coordinatorSessionId,
+          directory: registration.homeDirectory
+        });
+        if (accepted) {
+          state.delivered.set(task.id, signature);
+          state.dirty = true;
+        }
+      }
+    } finally {
+      await save(registration.homeDirectory, state);
+    }
+  };
 }
 
 // service/session-observation.ts
@@ -1880,6 +1976,7 @@ function isRecord4(value) {
 }
 function createSupervisionPoller(input) {
   const { filesystem, exec, homeRoot, fetcher, resolveSupport, nowMs = () => Date.now() } = input;
+  const notifyDecisions = createCaptainAlerts({ filesystem, fetcher });
   const observations = new Map;
   const pollErrors = new Map;
   const deliveryErrors = new Map;
@@ -1890,7 +1987,6 @@ function createSupervisionPoller(input) {
   const stallBaselines = new Map;
   const lastSeenTerminals = new Map;
   const autoAcceptedSessions = new Set;
-  const pendingBlockedAlerts = new Map;
   const observationKey = (slug, sessionId) => `${slug}
 ${sessionId}`;
   async function poll() {
@@ -1912,10 +2008,6 @@ ${sessionId}`;
       const events = await pollProject(registration, support, pending);
       if (events.length > 0) {
         notifications.push(composeNotification(registration, events));
-      }
-      for (const event of events) {
-        if (event.kind !== "waiting-permission" && event.kind !== "waiting-question")
-          await notifyEvent(registration, event, support);
       }
       notifications.push(...await pollArchiveRequests(registration, support, pending));
     }
@@ -1979,6 +2071,13 @@ ${sessionId}`;
     } catch {
       return events;
     }
+    if (backlog.errors.length === 0) {
+      try {
+        await notifyDecisions(registration, backlog.tasks, support);
+      } catch (error) {
+        console.error(`FirstMate captain alerts [${registration.slug}]: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
     let archivedSessionIds;
     try {
       archivedSessionIds = await loadArchivedSessionIds(filesystem, homeRoot, registration.slug);
@@ -1986,11 +2085,6 @@ ${sessionId}`;
       return events;
     }
     const activeSessionIds = new Set(backlog.tasks.flatMap((task) => task.sessionId === undefined || archivedSessionIds.has(task.sessionId) ? [] : [task.sessionId]));
-    const prefix = observationKey(registration.slug, "");
-    for (const [key, event] of pendingBlockedAlerts) {
-      if (key.startsWith(prefix) && !activeSessionIds.has(event.sessionId))
-        pendingBlockedAlerts.delete(key);
-    }
     const listedSessions = new Map;
     if (activeSessionIds.size > 1) {
       try {
@@ -2064,19 +2158,6 @@ ${sessionId}`;
         pollErrors.delete(key);
         const workerEvents = detectEvents(task, previous, current, lastSeenTerminal);
         events.push(...workerEvents);
-        for (const event of workerEvents) {
-          if (event.kind === "waiting-permission" || event.kind === "waiting-question")
-            pendingBlockedAlerts.set(key, event);
-        }
-        const blockedAlert = pendingBlockedAlerts.get(key);
-        if (blockedAlert !== undefined) {
-          if (current.status.activity === blockedAlert.kind) {
-            if (await notifyEvent(registration, blockedAlert, support))
-              pendingBlockedAlerts.delete(key);
-          } else if (current.status.activity !== "unknown" && (pending.kind === "ok" || current.status.activity === "idle" || current.status.activity === "waiting-permission" || current.status.activity === "waiting-question")) {
-            pendingBlockedAlerts.delete(key);
-          }
-        }
         if (seenTerminal !== undefined)
           lastSeenTerminals.set(key, seenTerminal);
         if (steeredBaselines.has(key) && current.lastWord !== undefined && current.lastWord !== steeredBaselines.get(key)) {
@@ -2170,19 +2251,6 @@ ${sessionId}`;
     } catch {
       return { kind: "failed", reason: "the session status response was not valid JSON" };
     }
-  }
-  async function notifyEvent(registration, event, support) {
-    const body = captainEventBody(event);
-    if (body === undefined || support === undefined)
-      return false;
-    return notifyCaptain({
-      fetcher,
-      support,
-      title: `FirstMate — ${registration.slug}`,
-      body,
-      sessionId: event.sessionId,
-      directory: event.directory ?? registration.projectDirectory
-    });
   }
   function getBoardWorkers(slug, tasks, completedTaskIds = new Set(tasks.filter((task) => task.state === "Done" && task.id !== undefined).map((task) => task.id))) {
     return tasks.map((task) => {
@@ -2291,9 +2359,9 @@ function describeEvent(event) {
     case "failed":
       return "failed (outcome: failed).";
     case "waiting-question":
-      return "is waiting on a question. Open the session to read and answer it.";
+      return "is waiting on a question. Inspect it and answer only within the brief's authorization; otherwise record a ready captain decision with its question and answer actions.";
     case "waiting-permission":
-      return "is waiting on a permission approval. Tell the captain and open the worker session to inspect the request; do not assume auto-approval cleared it.";
+      return "is waiting on a permission approval. Inspect the request; do not assume auto-approval cleared it. Record a ready captain decision if the request needs the captain's authority.";
     case "steered-answer":
       return `answered the captain's steer: ${event.answer ?? ""}`;
   }
@@ -2306,18 +2374,6 @@ function pendingActivity(entry) {
   if (Array.isArray(entry.forms) && entry.forms.length > 0)
     return "waiting-question";
   return;
-}
-function captainEventBody(event) {
-  switch (event.kind) {
-    case "waiting-permission":
-      return `"${event.taskTitle}" is waiting on a permission approval.`;
-    case "waiting-question":
-      return `"${event.taskTitle}" is waiting on an answer to a question.`;
-    case "failed":
-      return `"${event.taskTitle}" failed.`;
-    default:
-      return;
-  }
 }
 
 // service/supervision-delivery.ts
@@ -3516,19 +3572,6 @@ QUOTED ${quoted}`;
     }
   }
 }
-async function notifyWatchCaptain(notifications) {
-  for (const notification of notifications) {
-    try {
-      const failed = notification.message.includes(`watch ${notification.watchName} failed:`);
-      await notifyCaptain({
-        fetcher: nodeFetcher,
-        support: await discoverSupport({ filesystem: nodeFileSystem, settingsPath: openchamberSettingsPath }),
-        title: `FirstMate — ${notification.watchName ?? "watch"} ${failed ? "failed" : "fired"}`,
-        body: notification.message.slice(0, 1000)
-      });
-    } catch {}
-  }
-}
 function watchDeliverySummary(slug) {
   const failedNames = [];
   for (const [key] of watchDeliveryErrors) {
@@ -3550,7 +3593,6 @@ async function runWatchRound() {
   watchRoundInFlight = true;
   try {
     const round = await watchRunner.tick();
-    await notifyWatchCaptain(round.notifications);
     await deliverWatchNotifications(round.notifications);
   } catch {} finally {
     watchRoundInFlight = false;
@@ -4052,7 +4094,6 @@ async function handleWatchRun(request, response) {
       respondJson(response, 409, { error: `the watch ${name} is already running` });
       return;
     }
-    await notifyWatchCaptain(result.notifications);
     await deliverWatchNotifications(result.notifications);
     const deliveryError = watchDeliveryErrors.get(watchDeliveryKey(slug, result.source, result.name));
     respondJson(response, 200, {

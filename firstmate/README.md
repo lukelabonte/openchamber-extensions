@@ -61,6 +61,14 @@ These changes address the portable parts of [upstream issue #37](https://github.
 
 The extension now builds with SDK 2.5.0 and requests the `shells` capability, first shipped in host 2.2.0. OpenChamber must approve that permission when installing the update. The permission also allows stopping commands, but FirstMate only subscribes and reads; it never calls Stop. Command text and output stay in the panel's memory and aren't sent to the first mate or saved by this viewer. Closing the viewer or changing projects releases its subscription.
 
+## Captain attention
+
+Worker questions, permission waits, failures, and watch output go to the first mate without direct desktop alerts. The board still shows worker state. The first mate checks the evidence, handles answers already covered by the brief, and asks the captain only when a decision needs their authority.
+
+A desktop alert requires a backlog entry with a stable `id:`, a concrete `hold:`, and nonempty `actions:`. It must be Blocked, or a Queued `kind: captain` decision, with any `blocked-by:` prerequisite Done. A Working task with a future landing hold stays quiet. The alert shows the task, question, and choice labels, and targets the first mate's chat. Choices are answered in that chat or on the board, not in the alert.
+
+Delivered decision signatures persist in the project's `captain-alerts.json`. Unchanged decisions stay quiet across polls and restarts; a changed question, answer action, PR URL, or reviewed head can alert again. Cleared decisions stop retrying. A failed send retries while the decision remains ready. A failed history save retries without resending in the same service process. Host acceptance and the history save aren't atomic, so a crash between them can still repeat an alert. Invalid or unreadable history stops that project's alerts and reports an error in service logs; worker supervision continues.
+
 ## Durable watches and upgrades
 
 Watch outcomes, failure suppression, pending output, and delivered notes persist in each project's `watch-runner.json`. Up to 20 pending notes wait for a verified idle first mate. Delivery batches are bounded, and overflow drops the oldest notes with a count. The latest 50 delivered notes appear in the panel. Empty successful runs send nothing. A crash after host acceptance but before local acknowledgement can still duplicate a delivery.
@@ -86,5 +94,7 @@ The existing permission auto-accept workaround remains unchanged. It can approve
 ## Development
 
 Run `bun install --frozen-lockfile`, `bun test`, and `bun run build` from `firstmate/`. The build typechecks and bundles the panel, background commands, service, and terminal relay. Installation of an update can require approval for its contributed actions and the Node command used by the PR watch. Live-host behavior needs a separate acceptance run.
+
+Service tests set `FIRSTMATE_OPENCHAMBER_SETTINGS` to an absent temporary file, or to settings for their own desktop stub. `FIRSTMATE_HOME` alone doesn't isolate the desktop connection. Keep the explicit settings override when adding a service-process test so it can't display test alerts or call the real desktop.
 
 The port references `gpambrozio/bb-plugins/firstmate-crew` at commit `f2d8491208978f13a245f46a34cc195338173c0e`. See `THIRD-PARTY-NOTICES.md` for the adapted PR watch's license.

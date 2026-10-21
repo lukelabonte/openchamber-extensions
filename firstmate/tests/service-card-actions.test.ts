@@ -102,6 +102,7 @@ function startService(port: number): Promise<void> {
       OPENCHAMBER_SERVICE_PORT: String(port),
       OPENCHAMBER_SERVICE_TOKEN: serviceToken,
       FIRSTMATE_HOME: tempHome,
+      FIRSTMATE_OPENCHAMBER_SETTINGS: path.join(tempRoot, "absent-settings.json"),
       FIRSTMATE_POLL_MS: String(pollIntervalMs),
       FIRSTMATE_SHIM_LOG: shimLogPath,
       PATH: `${shimDirectory}:${process.env.PATH ?? ""}`,

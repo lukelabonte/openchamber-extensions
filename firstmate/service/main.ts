@@ -23,7 +23,6 @@ import { legacyTemplateHashes, provisionProject } from "./provision"
 import { loadRegistry, type Registration } from "./registry"
 import { restoreSessionProjects } from "./session-projects"
 import { loadLandingRecords, type LandingRecord } from "./landing-record"
-import { notifyCaptain } from "./notifications"
 import { parseShippingMode } from "./shipping-mode"
 import { dismissSuggestion, loadSuggestions, sendSuggestion, suggestionsPath, type Suggestion } from "./suggestions"
 import { loadProjectSettings, saveProjectSettings } from "./settings"
@@ -293,22 +292,6 @@ async function deliverWatchNotifications(notifications: WatchNotification[]): Pr
   }
 }
 
-async function notifyWatchCaptain(notifications: WatchNotification[]): Promise<void> {
-  for (const notification of notifications) {
-    try {
-      const failed = notification.message.includes(`watch ${notification.watchName} failed:`)
-      await notifyCaptain({
-        fetcher: nodeFetcher,
-        support: await discoverSupport({ filesystem: nodeFileSystem, settingsPath: openchamberSettingsPath }),
-        title: `FirstMate — ${notification.watchName ?? "watch"} ${failed ? "failed" : "fired"}`,
-        body: notification.message.slice(0, 1000),
-      })
-    } catch {
-      // Optional desktop delivery must not block the durable first-mate queue.
-    }
-  }
-}
-
 // The concise top-level line for GET /watches: which watches of this slug
 // have an undelivered notification on record — the full reasons live on
 // the rows themselves. A slug-level record (a delivery without watch
@@ -336,7 +319,6 @@ async function runWatchRound(): Promise<void> {
   watchRoundInFlight = true
   try {
     const round = await watchRunner.tick()
-    await notifyWatchCaptain(round.notifications)
     await deliverWatchNotifications(round.notifications)
   } catch {
     // A tick must never reject into the interval — an unhandled rejection
@@ -929,7 +911,6 @@ async function handleWatchRun(request: IncomingMessage, response: ServerResponse
       respondJson(response, 409, { error: `the watch ${name} is already running` })
       return
     }
-    await notifyWatchCaptain(result.notifications)
     await deliverWatchNotifications(result.notifications)
     const deliveryError = watchDeliveryErrors.get(watchDeliveryKey(slug, result.source, result.name))
     respondJson(response, 200, {

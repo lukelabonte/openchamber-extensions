@@ -57,6 +57,7 @@ function spawnService(port: number, env: Record<string, string>): ChildProcess {
       OPENCHAMBER_SERVICE_PORT: String(port),
       OPENCHAMBER_SERVICE_TOKEN: serviceToken,
       FIRSTMATE_HOME: tempHome,
+      FIRSTMATE_OPENCHAMBER_SETTINGS: path.join(tempRoot, "absent-settings.json"),
       FIRSTMATE_SHIM_LOG: shimLogPath,
       ...env,
     },

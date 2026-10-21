@@ -128,8 +128,8 @@ if (probeScenario !== undefined) {
     test("cleanup rendering: pending shows the recorded path, removed and unknown say so, no mutation control", async () => {
       const observations = await runScenario("cleanup-rendering")
       const rootText = observations.rootText as string
-      expect(rootText).toContain("FirstMate does not delete worktrees or branches; cleanup after a landing is yours.")
-      expect(rootText).toContain("Awaiting captain cleanup")
+      expect(rootText).toContain("Repository cleanup needs verified landing or explicit authorization and runs through a worker, never the first mate.")
+      expect(rootText).toContain("Cleanup pending")
       expect(rootText).toContain("/repos/a/.worktrees/pending")
       expect(rootText).toContain("Worktree removed.")
       expect(rootText).toContain("Cleanup status unknown.")

@@ -293,273 +293,6 @@ function isArchiveEntry(value) {
 // service/archive-review.ts
 import { randomUUID as randomUUID3 } from "node:crypto";
 
-// service/backlog.ts
-var backlogStates = [
-  "Queued",
-  "Working",
-  "Blocked",
-  "Parked",
-  "Done",
-  "Failed",
-  "Idle"
-];
-var fieldKeys = {
-  id: "id",
-  kind: "kind",
-  "blocked-by": "blockedBy",
-  hold: "hold",
-  "review-head": "reviewHead",
-  actions: "actions",
-  session: "sessionId",
-  "archive-session": "archiveSessionId",
-  worktree: "worktreeDirectory",
-  branch: "branch",
-  "start-ref": "startRef",
-  pr: "prUrl",
-  created: "createdAt",
-  updated: "updatedAt"
-};
-var allFieldKeys = new Set(["state", ...Object.keys(fieldKeys)]);
-var timestampFields = ["createdAt", "updatedAt"];
-function parseBacklog(markdown) {
-  const tasks = [];
-  const errors = [];
-  const taskIds = new Set;
-  let entry;
-  let inCodeFence = false;
-  const closeEntry = () => {
-    if (entry === undefined)
-      return;
-    const draft = entry;
-    entry = undefined;
-    if (draft.problem !== undefined) {
-      errors.push(draft.problem);
-      return;
-    }
-    const { state, ...optionalFields } = draft.fields;
-    if (state === undefined) {
-      errors.push({ line: draft.titleLine, message: `the entry "${draft.title}" has no state line` });
-      return;
-    }
-    if (optionalFields.id !== undefined) {
-      if (taskIds.has(optionalFields.id)) {
-        errors.push({ line: draft.idLine ?? draft.titleLine, message: `the entry "${draft.title}" repeats the task id "${optionalFields.id}"` });
-        return;
-      }
-      taskIds.add(optionalFields.id);
-    }
-    tasks.push({ title: draft.title, ...optionalFields, state });
-  };
-  markdown.split(`
-`).forEach((line, index) => {
-    const lineNumber = index + 1;
-    const trimmed = line.trim();
-    if (trimmed.startsWith("```")) {
-      inCodeFence = !inCodeFence;
-      return;
-    }
-    if (inCodeFence || trimmed === "")
-      return;
-    const bullet = /^[-*]\s+(.+)$/.exec(trimmed);
-    if (bullet !== null) {
-      closeEntry();
-      entry = { titleLine: lineNumber, title: bullet[1].trim(), fields: {} };
-      return;
-    }
-    if (trimmed.startsWith("#")) {
-      closeEntry();
-      return;
-    }
-    const field = /^([A-Za-z][A-Za-z-]*):\s*(.*)$/.exec(trimmed);
-    const indented = line.startsWith(" ") || line.startsWith("\t");
-    if (!indented) {
-      closeEntry();
-      return;
-    }
-    if (entry === undefined) {
-      if (field !== null && allFieldKeys.has(field[1])) {
-        errors.push({ line: lineNumber, message: `the field "${field[1]}" has no entry above it` });
-      }
-      return;
-    }
-    applyField(entry, field, lineNumber);
-  });
-  closeEntry();
-  return { tasks, errors };
-}
-function applyField(entry, field, lineNumber) {
-  if (entry.problem !== undefined)
-    return;
-  if (field === null) {
-    entry.problem = {
-      line: lineNumber,
-      message: `the entry "${entry.title}" has a line that is not a \`key: value\` field`
-    };
-    return;
-  }
-  const key = field[1];
-  const value = field[2].trim();
-  if (key === "state") {
-    if (!isBacklogState(value)) {
-      entry.problem = { line: lineNumber, message: `the entry "${entry.title}" has an unknown state "${value}"` };
-    } else if (entry.fields.state !== undefined) {
-      entry.problem = { line: lineNumber, message: `the entry "${entry.title}" repeats the "state" field` };
-    } else {
-      entry.fields.state = value;
-    }
-    return;
-  }
-  const fieldName = fieldKeys[key];
-  if (fieldName === undefined) {
-    entry.problem = { line: lineNumber, message: `the entry "${entry.title}" has an unknown field "${key}"` };
-    return;
-  }
-  if (entry.fields[fieldName] !== undefined) {
-    entry.problem = { line: lineNumber, message: `the entry "${entry.title}" repeats the "${key}" field` };
-    return;
-  }
-  if (fieldName === "actions") {
-    const actions = parseTaskActions(value);
-    if (actions === undefined) {
-      entry.problem = { line: lineNumber, message: `the entry "${entry.title}" has an invalid "actions" field; use up to four unique nonempty labels and prompts separated by "=>" and "|", escaping pipes and backslashes` };
-    } else {
-      entry.fields.actions = actions;
-    }
-    return;
-  }
-  if (value === "") {
-    entry.problem = { line: lineNumber, message: `the entry "${entry.title}" has an empty "${key}" field` };
-    return;
-  }
-  if (timestampFields.includes(fieldName) && Number.isNaN(Date.parse(value))) {
-    entry.problem = { line: lineNumber, message: `the entry "${entry.title}" has a "${key}" that is not a timestamp` };
-    return;
-  }
-  if (fieldName === "kind") {
-    if (!isTaskKind(value)) {
-      entry.problem = { line: lineNumber, message: `the entry "${entry.title}" has an unknown "kind" value "${value}"` };
-    } else {
-      entry.fields.kind = value;
-    }
-    return;
-  }
-  if ((fieldName === "id" || fieldName === "blockedBy") && !isTaskId(value)) {
-    entry.problem = { line: lineNumber, message: `the entry "${entry.title}" has a "${key}" that is not a path-safe task id (1–64 lowercase letters, digits or hyphens, starting with a letter or digit)` };
-    return;
-  }
-  if (fieldName === "reviewHead" && !isReviewHead(value)) {
-    entry.problem = { line: lineNumber, message: `the entry "${entry.title}" has a "${key}" that is not a hex SHA (7–64 characters)` };
-    return;
-  }
-  if (fieldName === "archiveSessionId" && !/^[A-Za-z0-9_-]{1,128}$/.test(value)) {
-    entry.problem = { line: lineNumber, message: `the entry "${entry.title}" has an invalid "archive-session" session id` };
-    return;
-  }
-  entry.fields[fieldName] = value;
-  if (fieldName === "id")
-    entry.idLine = lineNumber;
-}
-function isBacklogState(value) {
-  return backlogStates.includes(value);
-}
-function isTaskId(value) {
-  return typeof value === "string" && value.trim() === value && /^[a-z0-9][a-z0-9-]{0,63}$/.test(value);
-}
-function isTaskKind(value) {
-  return value === "ship" || value === "scout" || value === "captain";
-}
-function isReviewHead(value) {
-  return typeof value === "string" && value.trim() === value && /^[0-9a-f]{7,64}$/i.test(value);
-}
-function isTaskActions(value) {
-  if (!Array.isArray(value) || value.length > 4)
-    return false;
-  const labels = new Set;
-  for (const action of value) {
-    if (typeof action !== "object" || action === null || Array.isArray(action))
-      return false;
-    if (typeof action.label !== "string" || typeof action.text !== "string")
-      return false;
-    const label = action.label.trim();
-    if (label === "" || action.text.trim() === "" || labels.has(label))
-      return false;
-    labels.add(label);
-  }
-  return true;
-}
-function parseTaskActions(value) {
-  if (value === "")
-    return [];
-  const segments = [];
-  let segment = "";
-  for (let index = 0;index < value.length; index += 1) {
-    const character = value[index];
-    if (character === "\\") {
-      const escaped = value[index + 1];
-      if (escaped !== "\\" && escaped !== "|")
-        return;
-      segment += escaped;
-      index += 1;
-    } else if (character === "|") {
-      segments.push(segment);
-      segment = "";
-    } else {
-      segment += character;
-    }
-  }
-  segments.push(segment);
-  if (segments.length > 4)
-    return;
-  const actions = [];
-  for (const entry of segments) {
-    const separator = entry.indexOf("=>");
-    if (separator === -1)
-      return;
-    actions.push({ label: entry.slice(0, separator).trim(), text: entry.slice(separator + 2).trim() });
-  }
-  return isTaskActions(actions) ? actions : undefined;
-}
-function escapeActionText(text) {
-  return text.replace(/\\/g, "\\\\").replace(/\|/g, "\\|");
-}
-function formatBacklogEntry(task) {
-  const lines = [`- ${task.title}`, `  state: ${task.state}`];
-  if (task.id !== undefined)
-    lines.push(`  id: ${task.id}`);
-  if (task.kind !== undefined)
-    lines.push(`  kind: ${task.kind}`);
-  if (task.blockedBy !== undefined)
-    lines.push(`  blocked-by: ${task.blockedBy}`);
-  if (task.hold !== undefined)
-    lines.push(`  hold: ${task.hold}`);
-  if (task.reviewHead !== undefined)
-    lines.push(`  review-head: ${task.reviewHead}`);
-  if (task.actions !== undefined) {
-    lines.push(`  actions: ${task.actions.map((action) => `${escapeActionText(action.label)} => ${escapeActionText(action.text)}`).join(" | ")}`);
-  }
-  if (task.sessionId !== undefined)
-    lines.push(`  session: ${task.sessionId}`);
-  if (task.archiveSessionId !== undefined)
-    lines.push(`  archive-session: ${task.archiveSessionId}`);
-  if (task.worktreeDirectory !== undefined)
-    lines.push(`  worktree: ${task.worktreeDirectory}`);
-  if (task.branch !== undefined)
-    lines.push(`  branch: ${task.branch}`);
-  if (task.startRef !== undefined)
-    lines.push(`  start-ref: ${task.startRef}`);
-  if (task.prUrl !== undefined)
-    lines.push(`  pr: ${task.prUrl}`);
-  if (task.createdAt !== undefined)
-    lines.push(`  created: ${task.createdAt}`);
-  if (task.updatedAt !== undefined)
-    lines.push(`  updated: ${task.updatedAt}`);
-  return lines.join(`
-`);
-}
-async function loadBacklog(filesystem, backlogPath) {
-  return parseBacklog(await filesystem.readFile(backlogPath));
-}
-
 // service/compose.ts
 import { randomUUID } from "node:crypto";
 
@@ -628,6 +361,7 @@ async function saveProjectSettings(filesystem, homeDirectory, value) {
 }
 
 // service/compose.ts
+import { fileURLToPath } from "node:url";
 async function composeInstructions(input) {
   const { filesystem, homeRoot, slug } = input;
   const relativePaths = [
@@ -680,6 +414,24 @@ ${layer.contents}`).join(`
   ].join(`
 
 `);
+  const cleanupCommand = `node ${JSON.stringify(fileURLToPath(new URL("../scripts/cleanup-pr-links.js", import.meta.url)))}`;
+  const pullRequestCleanup = [
+    "## PR link cleanup",
+    `During cleanup audits, run \`${cleanupCommand}\` from this registered FirstMate home. This calls the extension's guarded merged-PR cleanup directly, including from your own active turn. It accepts no session or URL overrides.`,
+    "Read the JSON result and record only confirmed removals. An empty list doesn't mean every link or task is resolved. Keep unknown, unmerged, held, or untracked links and report concrete blockers. This command doesn't delete repository content or change worker sessions. The automatic service pass remains a fallback; custom charter wording doesn't hide this callable command."
+  ].join(`
+
+`);
+  const cleanupRunbook = fileURLToPath(new URL("../templates/cleanup-worker.md", import.meta.url));
+  const cleanupRunner = fileURLToPath(new URL("../scripts/worktree-cleanup.js", import.meta.url));
+  const repositoryCleanup = [
+    "## Authorized repository cleanup",
+    `For already-authorized repository cleanup, dispatch or continue a worker and include the runbook at ${JSON.stringify(cleanupRunbook)} and safety runner module at ${JSON.stringify(cleanupRunner)} in its brief. Keep repository mutations delegated to that worker, never this first mate.`,
+    "Graceful per-location release of idle, task-owned tooling is included within verified landing or explicit cleanup authorization. It doesn't need a separate approval just because idle tools hold directory handles. A finished worker turn alone doesn't authorize deletion. Active or unknown sessions, requests, commands, terminals, ownership, Git state, runtime identity, or handle owners block cleanup. Never kill processes, restart shared services, interrupt active work, force-delete work, or broaden permission policies.",
+    "Require complete runtime/handle discovery, installed-contract checks, worker session and cwd outside every target, fresh clean tracked/untracked/ignored state and no unique unlanded content, protected source/unrelated/evidence snapshots, non-forced removal, bounded retries and independent outcome verification. Remote branch cleanup needs existing explicit scope. Keep retained paths and blockers visible until resolved. Higher-precedence captain exclusions and retention requests still apply."
+  ].join(`
+
+`);
   const composed = `${header}
 
 ${body}
@@ -689,6 +441,10 @@ ${sessionTitles}
 ${workerSelection}
 
 ${captainAttention}
+
+${pullRequestCleanup}
+
+${repositoryCleanup}
 `;
   const filePath = `${homeRoot}/projects/${slug}/AGENTS.md`;
   const temporaryPath = `${filePath}.${randomUUID()}.tmp`;
@@ -879,7 +635,7 @@ async function acknowledgeTemplateUpgrade(input) {
 // service/provision.ts
 var sharedDirectories = ["watches"];
 var legacyTemplateHashes = {
-  charter: ["44c30fc03a72d0e3db47f520f77e9d2f256a8595da0c4a92a3613ba8d0bf4bd9"],
+  charter: ["44c30fc03a72d0e3db47f520f77e9d2f256a8595da0c4a92a3613ba8d0bf4bd9", "f2a01f5f4d7e76a63bd026ebda14ecceee56c266aa2c8547af3e8b1430bf7c5b", "26ec3644f04dd682108b932ce183734b3dcaf9bba607c402da7adfde985d5d3b", "8a888fd9dd86efbd7f7bfb35a3780353c7ec690c83c8dbf7cec007c7b5447b4a", "a5b7d8f8131c05da4372b3f627e2180e76c8ee78c3caff071e92f5472c4a1fcd"],
   "pr-watch": ["436ce74feaf4fcb7beaeca787e30b0434ed2a5feeb0e4222540852c6b103fbbe"]
 };
 var sharedFiles = [
@@ -1238,11 +994,327 @@ async function recordCoordinatorSessionId(filesystem, homeDirectory, coordinator
   await filesystem.rename(temporaryPath, settingsPath);
 }
 
+// service/cleanup-revision.ts
+import { createHash as createHash2 } from "node:crypto";
+
+// service/backlog.ts
+var backlogStates = [
+  "Queued",
+  "Working",
+  "Blocked",
+  "Parked",
+  "Done",
+  "Failed",
+  "Idle"
+];
+var fieldKeys = {
+  id: "id",
+  kind: "kind",
+  "blocked-by": "blockedBy",
+  hold: "hold",
+  "review-head": "reviewHead",
+  actions: "actions",
+  session: "sessionId",
+  "archive-session": "archiveSessionId",
+  worktree: "worktreeDirectory",
+  branch: "branch",
+  "start-ref": "startRef",
+  pr: "prUrl",
+  created: "createdAt",
+  updated: "updatedAt"
+};
+var allFieldKeys = new Set(["state", ...Object.keys(fieldKeys)]);
+var timestampFields = ["createdAt", "updatedAt"];
+function parseBacklog(markdown) {
+  const tasks = [];
+  const errors = [];
+  const taskIds = new Set;
+  let entry;
+  let inCodeFence = false;
+  const closeEntry = () => {
+    if (entry === undefined)
+      return;
+    const draft = entry;
+    entry = undefined;
+    if (draft.problem !== undefined) {
+      errors.push(draft.problem);
+      return;
+    }
+    const { state, ...optionalFields } = draft.fields;
+    if (state === undefined) {
+      errors.push({ line: draft.titleLine, message: `the entry "${draft.title}" has no state line` });
+      return;
+    }
+    if (optionalFields.id !== undefined) {
+      if (taskIds.has(optionalFields.id)) {
+        errors.push({ line: draft.idLine ?? draft.titleLine, message: `the entry "${draft.title}" repeats the task id "${optionalFields.id}"` });
+        return;
+      }
+      taskIds.add(optionalFields.id);
+    }
+    tasks.push({ title: draft.title, ...optionalFields, state });
+  };
+  markdown.split(`
+`).forEach((line, index) => {
+    const lineNumber = index + 1;
+    const trimmed = line.trim();
+    if (trimmed.startsWith("```")) {
+      inCodeFence = !inCodeFence;
+      return;
+    }
+    if (inCodeFence || trimmed === "")
+      return;
+    const bullet = /^[-*]\s+(.+)$/.exec(trimmed);
+    if (bullet !== null) {
+      closeEntry();
+      entry = { titleLine: lineNumber, title: bullet[1].trim(), fields: {} };
+      return;
+    }
+    if (trimmed.startsWith("#")) {
+      closeEntry();
+      return;
+    }
+    const field = /^([A-Za-z][A-Za-z-]*):\s*(.*)$/.exec(trimmed);
+    const indented = line.startsWith(" ") || line.startsWith("\t");
+    if (!indented) {
+      closeEntry();
+      return;
+    }
+    if (entry === undefined) {
+      if (field !== null && allFieldKeys.has(field[1])) {
+        errors.push({ line: lineNumber, message: `the field "${field[1]}" has no entry above it` });
+      }
+      return;
+    }
+    applyField(entry, field, lineNumber);
+  });
+  closeEntry();
+  return { tasks, errors };
+}
+function applyField(entry, field, lineNumber) {
+  if (entry.problem !== undefined)
+    return;
+  if (field === null) {
+    entry.problem = {
+      line: lineNumber,
+      message: `the entry "${entry.title}" has a line that is not a \`key: value\` field`
+    };
+    return;
+  }
+  const key = field[1];
+  const value = field[2].trim();
+  if (key === "state") {
+    if (!isBacklogState(value)) {
+      entry.problem = { line: lineNumber, message: `the entry "${entry.title}" has an unknown state "${value}"` };
+    } else if (entry.fields.state !== undefined) {
+      entry.problem = { line: lineNumber, message: `the entry "${entry.title}" repeats the "state" field` };
+    } else {
+      entry.fields.state = value;
+    }
+    return;
+  }
+  const fieldName = fieldKeys[key];
+  if (fieldName === undefined) {
+    entry.problem = { line: lineNumber, message: `the entry "${entry.title}" has an unknown field "${key}"` };
+    return;
+  }
+  if (entry.fields[fieldName] !== undefined) {
+    entry.problem = { line: lineNumber, message: `the entry "${entry.title}" repeats the "${key}" field` };
+    return;
+  }
+  if (fieldName === "actions") {
+    const actions = parseTaskActions(value);
+    if (actions === undefined) {
+      entry.problem = { line: lineNumber, message: `the entry "${entry.title}" has an invalid "actions" field; use up to four unique nonempty labels and prompts separated by "=>" and "|", escaping pipes and backslashes` };
+    } else {
+      entry.fields.actions = actions;
+    }
+    return;
+  }
+  if (value === "") {
+    entry.problem = { line: lineNumber, message: `the entry "${entry.title}" has an empty "${key}" field` };
+    return;
+  }
+  if (timestampFields.includes(fieldName) && Number.isNaN(Date.parse(value))) {
+    entry.problem = { line: lineNumber, message: `the entry "${entry.title}" has a "${key}" that is not a timestamp` };
+    return;
+  }
+  if (fieldName === "kind") {
+    if (!isTaskKind(value)) {
+      entry.problem = { line: lineNumber, message: `the entry "${entry.title}" has an unknown "kind" value "${value}"` };
+    } else {
+      entry.fields.kind = value;
+    }
+    return;
+  }
+  if ((fieldName === "id" || fieldName === "blockedBy") && !isTaskId(value)) {
+    entry.problem = { line: lineNumber, message: `the entry "${entry.title}" has a "${key}" that is not a path-safe task id (1–64 lowercase letters, digits or hyphens, starting with a letter or digit)` };
+    return;
+  }
+  if (fieldName === "reviewHead" && !isReviewHead(value)) {
+    entry.problem = { line: lineNumber, message: `the entry "${entry.title}" has a "${key}" that is not a hex SHA (7–64 characters)` };
+    return;
+  }
+  if (fieldName === "archiveSessionId" && !/^[A-Za-z0-9_-]{1,128}$/.test(value)) {
+    entry.problem = { line: lineNumber, message: `the entry "${entry.title}" has an invalid "archive-session" session id` };
+    return;
+  }
+  entry.fields[fieldName] = value;
+  if (fieldName === "id")
+    entry.idLine = lineNumber;
+}
+function isBacklogState(value) {
+  return backlogStates.includes(value);
+}
+function isTaskId(value) {
+  return typeof value === "string" && value.trim() === value && /^[a-z0-9][a-z0-9-]{0,63}$/.test(value);
+}
+function isTaskKind(value) {
+  return value === "ship" || value === "scout" || value === "captain";
+}
+function isReviewHead(value) {
+  return typeof value === "string" && value.trim() === value && /^[0-9a-f]{7,64}$/i.test(value);
+}
+function isTaskActions(value) {
+  if (!Array.isArray(value) || value.length > 4)
+    return false;
+  const labels = new Set;
+  for (const action of value) {
+    if (typeof action !== "object" || action === null || Array.isArray(action))
+      return false;
+    if (typeof action.label !== "string" || typeof action.text !== "string")
+      return false;
+    const label = action.label.trim();
+    if (label === "" || action.text.trim() === "" || labels.has(label))
+      return false;
+    labels.add(label);
+  }
+  return true;
+}
+function parseTaskActions(value) {
+  if (value === "")
+    return [];
+  const segments = [];
+  let segment = "";
+  for (let index = 0;index < value.length; index += 1) {
+    const character = value[index];
+    if (character === "\\") {
+      const escaped = value[index + 1];
+      if (escaped !== "\\" && escaped !== "|")
+        return;
+      segment += escaped;
+      index += 1;
+    } else if (character === "|") {
+      segments.push(segment);
+      segment = "";
+    } else {
+      segment += character;
+    }
+  }
+  segments.push(segment);
+  if (segments.length > 4)
+    return;
+  const actions = [];
+  for (const entry of segments) {
+    const separator = entry.indexOf("=>");
+    if (separator === -1)
+      return;
+    actions.push({ label: entry.slice(0, separator).trim(), text: entry.slice(separator + 2).trim() });
+  }
+  return isTaskActions(actions) ? actions : undefined;
+}
+function escapeActionText(text) {
+  return text.replace(/\\/g, "\\\\").replace(/\|/g, "\\|");
+}
+function formatBacklogEntry(task) {
+  const lines = [`- ${task.title}`, `  state: ${task.state}`];
+  if (task.id !== undefined)
+    lines.push(`  id: ${task.id}`);
+  if (task.kind !== undefined)
+    lines.push(`  kind: ${task.kind}`);
+  if (task.blockedBy !== undefined)
+    lines.push(`  blocked-by: ${task.blockedBy}`);
+  if (task.hold !== undefined)
+    lines.push(`  hold: ${task.hold}`);
+  if (task.reviewHead !== undefined)
+    lines.push(`  review-head: ${task.reviewHead}`);
+  if (task.actions !== undefined) {
+    lines.push(`  actions: ${task.actions.map((action) => `${escapeActionText(action.label)} => ${escapeActionText(action.text)}`).join(" | ")}`);
+  }
+  if (task.sessionId !== undefined)
+    lines.push(`  session: ${task.sessionId}`);
+  if (task.archiveSessionId !== undefined)
+    lines.push(`  archive-session: ${task.archiveSessionId}`);
+  if (task.worktreeDirectory !== undefined)
+    lines.push(`  worktree: ${task.worktreeDirectory}`);
+  if (task.branch !== undefined)
+    lines.push(`  branch: ${task.branch}`);
+  if (task.startRef !== undefined)
+    lines.push(`  start-ref: ${task.startRef}`);
+  if (task.prUrl !== undefined)
+    lines.push(`  pr: ${task.prUrl}`);
+  if (task.createdAt !== undefined)
+    lines.push(`  created: ${task.createdAt}`);
+  if (task.updatedAt !== undefined)
+    lines.push(`  updated: ${task.updatedAt}`);
+  return lines.join(`
+`);
+}
+async function loadBacklog(filesystem, backlogPath) {
+  return parseBacklog(await filesystem.readFile(backlogPath));
+}
+
+// service/cleanup-revision.ts
+async function loadCleanupRevision(input) {
+  const { filesystem, homeRoot, registration, coordinatorIds } = input;
+  const backlog = await loadBacklog(filesystem, `${registration.homeDirectory}/backlog.md`);
+  if (backlog.errors.length > 0)
+    throw new Error("archive review is waiting for a readable backlog without malformed entries");
+  const archived = await loadHostArchivedSessionIds(filesystem, homeRoot, registration.slug);
+  const rows = [];
+  const reviewRows = [];
+  let hasWorkers = false;
+  let hasPullCandidates = false;
+  for (const task of backlog.tasks) {
+    if (task.kind === "captain" || task.sessionId !== undefined && coordinatorIds.has(task.sessionId))
+      continue;
+    const hostArchived = task.sessionId !== undefined && archived.has(task.sessionId);
+    const tracked = task.sessionId !== undefined;
+    if (tracked && !hostArchived)
+      hasWorkers = true;
+    const reportPath = task.id === undefined ? undefined : `${registration.homeDirectory}/reports/${task.id}.md`;
+    const reportReady = reportPath !== undefined && ["Done", "Failed", "Idle"].includes(task.state) && await filesystem.exists(reportPath) && (await filesystem.readFile(reportPath)).trim() !== "";
+    const row = {
+      id: task.id,
+      kind: task.kind,
+      state: task.state,
+      sessionId: task.sessionId,
+      prUrl: task.prUrl,
+      hasHold: task.hold !== undefined,
+      hasDependency: task.blockedBy !== undefined,
+      hasActions: (task.actions?.length ?? 0) > 0,
+      reportReady,
+      hostArchived
+    };
+    if (task.prUrl !== undefined)
+      rows.push(row);
+    if (tracked && !hostArchived && task.archiveSessionId !== task.sessionId && ["Done", "Failed", "Idle"].includes(task.state))
+      reviewRows.push(row);
+    if (task.prUrl !== undefined && task.state === "Done" && tracked && hostArchived && reportReady && task.hold === undefined && task.blockedBy === undefined && (task.actions?.length ?? 0) === 0)
+      hasPullCandidates = true;
+  }
+  const fingerprint = (records) => createHash2("sha256").update(JSON.stringify(records.map((record) => JSON.stringify(record)).sort())).digest("hex");
+  return { cleanup: fingerprint(rows), review: fingerprint(reviewRows), hasWorkers, hasReviewCandidates: reviewRows.length > 0, hasPullCandidates };
+}
+
 // service/archive-review.ts
 var reviewIntervalMs = 24 * 60 * 60 * 1000;
+var retryIntervalMs = 5 * 60 * 1000;
 var reviewPrompt = `Scheduled worker-session archival review for this project only.
 
-Read backlog.md and the saved briefs and reports. Review tracked worker sessions, including legacy entries and board-only End entries. Check live status and evidence before deciding which sessions no longer need review, follow-up, or an open decision. Reconcile missing task IDs or reports before requesting retirement. Age, idle status, and a worker's own done claim aren't completion evidence.
+Read backlog.md and the saved briefs and reports. Follow the charter's cleanup process. Review tracked worker sessions, including legacy entries and board-only End entries. Check live status and evidence before deciding which sessions no longer need review, follow-up, or an open decision. Reconcile missing task IDs or reports before requesting retirement. Age, idle status, and a worker's own done claim aren't completion evidence.
+
+Run the guarded command in the composed PR link cleanup instructions as part of this audit. Record its confirmed removals, keep unresolved links, and report failures. It changes only coordinator link metadata and never authorizes repository deletion.
 
 Respect the captain's orders and requests to keep sessions active. Save checked results, evidence and message links, session/worktree references, and the retirement reason in reports/<id>.md. Only for a genuinely Done task with no remaining dependency, hold, or answer action, add archive-session: <exact current session id> to its backlog entry. The service checks ownership, a saved report, idle status, and pending questions/permissions. Wait for its confirmation before claiming archival. Leave failed archive attempts paused until their failure has been reconciled.
 
@@ -1252,7 +1324,7 @@ function archiveReviewPath(homeDirectory) {
 }
 function createArchiveReviewSweep(input) {
   const inFlight = new Set;
-  const deliveredAt = new Map;
+  const progress = new Map;
   const pendingSaves = new Map;
   const failures = new Map;
   function reportFailure(slug, error) {
@@ -1262,8 +1334,13 @@ function createArchiveReviewSweep(input) {
     failures.set(slug, reason);
     input.failed(slug, reason);
   }
-  async function saveDelivery(slug, filePath, pending) {
-    await input.filesystem.writeFile(pending.temporaryPath, `${JSON.stringify({ version: 1, lastDeliveredAt: new Date(pending.deliveredAt).toISOString() }, null, 2)}
+  async function saveProgress(slug, filePath, pending) {
+    const state = { version: 2, ...pending.progress };
+    for (const key of ["lastDeliveredAt", "lastReviewAttemptAt", "lastCleanupAttemptAt"]) {
+      if (pending.progress[key] !== undefined)
+        state[key] = new Date(pending.progress[key]).toISOString();
+    }
+    await input.filesystem.writeFile(pending.temporaryPath, `${JSON.stringify(state, null, 2)}
 `);
     await input.filesystem.rename(pending.temporaryPath, filePath);
     pendingSaves.delete(slug);
@@ -1279,43 +1356,73 @@ function createArchiveReviewSweep(input) {
       if (normalizeProjectDirectory(registration.homeDirectory) !== homeDirectory)
         throw new Error("archive review project home doesn't match its registration");
       const filePath = archiveReviewPath(homeDirectory);
-      let lastDeliveredAt = deliveredAt.get(slug);
-      let persistedAt;
+      let persisted = {};
       if (await input.filesystem.exists(filePath)) {
-        let parsed;
         try {
-          parsed = JSON.parse(await input.filesystem.readFile(filePath));
+          persisted = parseProgress(JSON.parse(await input.filesystem.readFile(filePath)));
         } catch {
-          throw new Error(`archive review state is unreadable: ${filePath}`);
+          throw new Error(`archive review state is unreadable or invalid: ${filePath}`);
         }
-        if (typeof parsed !== "object" || parsed === null || !("version" in parsed) || parsed.version !== 1 || !("lastDeliveredAt" in parsed) || typeof parsed.lastDeliveredAt !== "string" || !Number.isFinite(Date.parse(parsed.lastDeliveredAt))) {
-          throw new Error(`archive review state is invalid: ${filePath}`);
-        }
-        persistedAt = Date.parse(parsed.lastDeliveredAt);
-        lastDeliveredAt = Math.max(lastDeliveredAt ?? -Infinity, persistedAt);
       }
+      const current = mergeProgress(persisted, progress.get(slug), registration);
       const pendingSave = pendingSaves.get(slug);
       if (pendingSave !== undefined) {
-        if (persistedAt !== undefined && persistedAt >= pendingSave.deliveredAt)
+        if (Object.entries(pendingSave.progress).every(([key, value]) => persisted[key] === value))
           pendingSaves.delete(slug);
         else
-          await saveDelivery(slug, filePath, pendingSave);
+          await saveProgress(slug, filePath, pendingSave);
       }
-      if (lastDeliveredAt !== undefined && input.nowMs() - lastDeliveredAt < reviewIntervalMs)
+      progress.set(slug, current);
+      const revision = await loadCleanupRevision({ ...input, registration, coordinatorIds });
+      const cleanupInterval = revision.hasPullCandidates || current.cleanupFailed ? retryIntervalMs : reviewIntervalMs;
+      const cleanupBackoff = current.cleanupFailed && current.lastCleanupAttemptAt !== undefined && input.nowMs() - current.lastCleanupAttemptAt < retryIntervalMs;
+      const cleanupDue = current.cleanupFingerprint !== revision.cleanup || current.lastCleanupAttemptAt === undefined || input.nowMs() - current.lastCleanupAttemptAt >= cleanupInterval;
+      if (input.cleanup !== undefined && cleanupDue && !cleanupBackoff) {
+        let attempted = false;
+        failures.delete(`${slug}:cleanup`);
+        try {
+          attempted = await input.cleanup(registration);
+          if (attempted)
+            current.cleanupFailed = false;
+        } catch (error) {
+          attempted = true;
+          current.cleanupFailed = true;
+          reportFailure(`${slug}:cleanup`, error);
+        }
+        if (attempted) {
+          current.lastCleanupAttemptAt = input.nowMs();
+          current.cleanupFingerprint = revision.cleanup;
+          await remember();
+        }
+      }
+      if (!revision.hasReviewCandidates && current.reviewFingerprint !== revision.review) {
+        current.reviewFingerprint = revision.review;
+        if (current.lastDeliveredAt !== undefined || current.lastCleanupAttemptAt !== undefined || current.lastReviewAttemptAt !== undefined)
+          await remember();
+      }
+      const reviewBackoff = current.reviewFailed && current.lastReviewAttemptAt !== undefined && input.nowMs() - current.lastReviewAttemptAt < retryIntervalMs;
+      const reviewDue = current.lastDeliveredAt === undefined || input.nowMs() - current.lastDeliveredAt >= reviewIntervalMs || revision.hasReviewCandidates && current.reviewFingerprint !== revision.review;
+      if (!revision.hasWorkers || !reviewDue || reviewBackoff)
         return;
-      const backlog = await loadBacklog(input.filesystem, `${homeDirectory}/backlog.md`);
-      if (backlog.errors.length > 0)
-        throw new Error("archive review is waiting for a readable backlog without malformed entries");
-      const archived = await loadHostArchivedSessionIds(input.filesystem, input.homeRoot, slug);
-      if (!backlog.tasks.some((task) => task.sessionId !== undefined && !coordinatorIds.has(task.sessionId) && !archived.has(task.sessionId)))
-        return;
-      if (!await input.deliver(registration, reviewPrompt))
-        return;
-      const completedAt = input.nowMs();
-      deliveredAt.set(slug, completedAt);
-      const pending = { deliveredAt: completedAt, temporaryPath: `${filePath}.${randomUUID3()}.tmp` };
-      pendingSaves.set(slug, pending);
-      await saveDelivery(slug, filePath, pending);
+      failures.delete(`${slug}:review`);
+      try {
+        if (!await input.deliver(registration, reviewPrompt))
+          return;
+        current.lastDeliveredAt = input.nowMs();
+        current.reviewFingerprint = revision.review;
+        current.reviewFailed = false;
+      } catch (error) {
+        current.reviewFailed = true;
+        reportFailure(`${slug}:review`, error);
+      }
+      current.lastReviewAttemptAt = input.nowMs();
+      await remember();
+      async function remember() {
+        progress.set(slug, { ...current });
+        const pending = { progress: { ...current }, temporaryPath: pendingSaves.get(slug)?.temporaryPath ?? `${filePath}.${randomUUID3()}.tmp` };
+        pendingSaves.set(slug, pending);
+        await saveProgress(slug, filePath, pending);
+      }
     } catch (error) {
       reportFailure(slug, error);
     } finally {
@@ -1332,6 +1439,178 @@ function createArchiveReviewSweep(input) {
     }
   }
   return { check };
+}
+function parseProgress(parsed) {
+  if (typeof parsed !== "object" || parsed === null || !("version" in parsed) || ![1, 2].includes(parsed.version))
+    throw new Error("invalid review state");
+  const value = parsed;
+  const result = {};
+  for (const key of ["lastDeliveredAt", "lastReviewAttemptAt", "lastCleanupAttemptAt"]) {
+    if (!(key in value))
+      continue;
+    if (typeof value[key] !== "string" || !Number.isFinite(Date.parse(value[key])))
+      throw new Error("invalid review timestamp");
+    result[key] = Date.parse(value[key]);
+  }
+  if (result.lastDeliveredAt === undefined && result.lastReviewAttemptAt === undefined && result.lastCleanupAttemptAt === undefined)
+    throw new Error("missing review timestamp");
+  if (value.version === 1)
+    return result;
+  for (const key of ["coordinatorSessionId", "projectDirectory"]) {
+    if (typeof value[key] !== "string" || value[key] === "")
+      throw new Error("missing review scope");
+    result[key] = value[key];
+  }
+  for (const key of ["reviewFingerprint", "cleanupFingerprint"]) {
+    if (!(key in value))
+      continue;
+    if (typeof value[key] !== "string" || !/^[a-f0-9]{64}$/.test(value[key]))
+      throw new Error("invalid review fingerprint");
+    result[key] = value[key];
+  }
+  for (const key of ["reviewFailed", "cleanupFailed"]) {
+    if (!(key in value))
+      continue;
+    if (typeof value[key] !== "boolean")
+      throw new Error("invalid review retry state");
+    result[key] = value[key];
+  }
+  return result;
+}
+function mergeProgress(persisted, local, registration) {
+  const matchesScope = (entry) => entry.coordinatorSessionId === undefined || entry.coordinatorSessionId === registration.coordinatorSessionId && entry.projectDirectory === registration.projectDirectory;
+  const disk = matchesScope(persisted) ? persisted : {};
+  const memory = local !== undefined && matchesScope(local) ? local : {};
+  const review = (memory.lastReviewAttemptAt ?? memory.lastDeliveredAt ?? -Infinity) >= (disk.lastReviewAttemptAt ?? disk.lastDeliveredAt ?? -Infinity) ? memory : disk;
+  const cleanup = (memory.lastCleanupAttemptAt ?? -Infinity) >= (disk.lastCleanupAttemptAt ?? -Infinity) ? memory : disk;
+  return {
+    coordinatorSessionId: registration.coordinatorSessionId,
+    projectDirectory: registration.projectDirectory,
+    lastDeliveredAt: review.lastDeliveredAt,
+    lastReviewAttemptAt: review.lastReviewAttemptAt,
+    reviewFingerprint: review.reviewFingerprint,
+    reviewFailed: review.reviewFailed,
+    lastCleanupAttemptAt: cleanup.lastCleanupAttemptAt,
+    cleanupFingerprint: cleanup.cleanupFingerprint,
+    cleanupFailed: cleanup.cleanupFailed
+  };
+}
+
+// service/pr-cleanup.ts
+async function cleanupCoordinatorPullRequests(input) {
+  const { filesystem, homeRoot, registration } = input;
+  const backlogPath = `${registration.homeDirectory}/backlog.md`;
+  const backlog = await loadBacklog(filesystem, backlogPath);
+  if (backlog.errors.length > 0)
+    throw new Error("PR cleanup needs a readable backlog without malformed entries");
+  const archived = await loadHostArchivedSessionIds(filesystem, homeRoot, registration.slug);
+  const candidates = new Set;
+  for (const task of backlog.tasks) {
+    const url = canonicalPullUrl(task.prUrl);
+    if (url === undefined || candidates.has(url))
+      continue;
+    const references = backlog.tasks.filter((entry) => canonicalPullUrl(entry.prUrl) === url);
+    if (references.every((entry) => resolvedTask(entry, archived)) && await reportsExist(references))
+      candidates.add(url);
+  }
+  if (candidates.size === 0)
+    return [];
+  const sessionPath = `/api/openchamber/sessions/${encodeURIComponent(registration.coordinatorSessionId)}`;
+  const observation = await callDesktopProxy({ ...input, method: "GET", path: `${sessionPath}/metadata?directory=${encodeURIComponent(registration.homeDirectory)}`, label: "PR cleanup metadata" });
+  if (observation.kind !== "ok")
+    throw new Error(observation.kind === "failed" ? observation.message : observation.reason);
+  const links = readLinks(observation.text);
+  const entries = [];
+  for (const value of links) {
+    if (!isPullLink(value))
+      continue;
+    const url = canonicalPullUrl(value.url);
+    if (url === undefined || !candidates.has(url))
+      continue;
+    if (links.some((other) => isRecord3(other) && other.id === value.id && (!isPullLink(other) || canonicalPullUrl(other.url) !== url)))
+      continue;
+    const response = JSON.parse(await input.exec("gh", ["pr", "view", url, "--json", "state,mergedAt,url"]));
+    if (!isRecord3(response) || canonicalPullUrl(response.url) !== url || !["OPEN", "CLOSED", "MERGED"].includes(response.state)) {
+      throw new Error(`GitHub did not identify the requested PR: ${url}`);
+    }
+    if (response.state !== "MERGED")
+      continue;
+    if (typeof response.mergedAt !== "string" || !Number.isFinite(Date.parse(response.mergedAt)))
+      throw new Error(`GitHub did not confirm a merge time: ${url}`);
+    entries.push(value);
+  }
+  if (entries.length === 0)
+    return [];
+  const current = (await loadRegistry(filesystem, homeRoot))[registration.slug];
+  if (current?.coordinatorSessionId !== registration.coordinatorSessionId || current?.homeDirectory !== registration.homeDirectory || current?.projectDirectory !== registration.projectDirectory) {
+    throw new Error("the registered first mate changed during PR cleanup");
+  }
+  const latest = await loadBacklog(filesystem, backlogPath);
+  if (latest.errors.length > 0 || JSON.stringify(latest.tasks) !== JSON.stringify(backlog.tasks))
+    throw new Error("the backlog changed during PR cleanup");
+  const references = backlog.tasks.filter((task) => entries.some((entry) => canonicalPullUrl(entry.url) === canonicalPullUrl(task.prUrl)));
+  if (!await reportsExist(references))
+    throw new Error("saved reports changed during PR cleanup");
+  const outcome = await callDesktopProxy({
+    ...input,
+    method: "POST",
+    path: `${sessionPath}/links`,
+    label: "PR unlink",
+    body: JSON.stringify({ directory: registration.homeDirectory, entries, linked: false })
+  });
+  if (outcome.kind !== "ok")
+    throw new Error(outcome.kind === "failed" ? outcome.message : outcome.reason);
+  const remaining = readLinks(outcome.text, true);
+  if (remaining.some((entry) => isRecord3(entry) && entries.some((removed) => entry.id === removed.id || canonicalPullUrl(entry.url) === canonicalPullUrl(removed.url)))) {
+    throw new Error("the host did not confirm removal of the completed PR links");
+  }
+  return [...new Set(entries.map((entry) => entry.url))];
+  async function reportsExist(tasks) {
+    for (const task of tasks) {
+      const reportPath = `${registration.homeDirectory}/reports/${task.id}.md`;
+      if (!await filesystem.exists(reportPath) || (await filesystem.readFile(reportPath)).trim() === "")
+        return false;
+    }
+    return true;
+  }
+}
+function resolvedTask(task, archived) {
+  return task.state === "Done" && task.kind !== "captain" && task.id !== undefined && task.sessionId !== undefined && archived.has(task.sessionId) && task.hold === undefined && task.blockedBy === undefined && (task.actions?.length ?? 0) === 0;
+}
+function canonicalPullUrl(value) {
+  if (typeof value !== "string")
+    return;
+  try {
+    const url = new URL(value);
+    if (url.protocol !== "https:" || url.hostname !== "github.com" || url.port !== "" || url.username !== "" || url.password !== "")
+      return;
+    const match = /^\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/pull\/([1-9]\d*)\/?$/i.exec(url.pathname);
+    return match === null ? undefined : `https://github.com/${match[1].toLowerCase()}/${match[2].toLowerCase()}/pull/${match[3]}`;
+  } catch {
+    return;
+  }
+}
+function readLinks(text, requireList = false) {
+  const parsed = JSON.parse(text ?? "null");
+  if (!isRecord3(parsed) || !isRecord3(parsed.metadata))
+    throw new Error("the host did not return session metadata for PR cleanup");
+  const metadata = parsed.metadata;
+  if (metadata.openchamber === undefined && !requireList)
+    return [];
+  if (!isRecord3(metadata.openchamber))
+    throw new Error("the host returned malformed PR link metadata");
+  const links = metadata.openchamber.linked_issues;
+  if (links === undefined && !requireList)
+    return [];
+  if (!Array.isArray(links))
+    throw new Error("the host returned a malformed PR link list");
+  return links;
+}
+function isPullLink(value) {
+  return isRecord3(value) && value.kind === "pull" && typeof value.id === "string" && value.id !== "" && typeof value.title === "string" && value.title !== "" && typeof value.url === "string";
+}
+function isRecord3(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 // service/clock.ts
@@ -1711,7 +1990,7 @@ function truncateLastWord(text) {
 }
 
 // service/captain-alerts.ts
-import { createHash as createHash2 } from "node:crypto";
+import { createHash as createHash3 } from "node:crypto";
 
 // service/notifications.ts
 async function notifyCaptain(input) {
@@ -1782,7 +2061,7 @@ function createCaptainAlerts(input) {
     }
     try {
       for (const task of decisions) {
-        const signature = createHash2("sha256").update(JSON.stringify([
+        const signature = createHash3("sha256").update(JSON.stringify([
           task.title,
           task.hold,
           task.actions,
@@ -1845,11 +2124,11 @@ function parseSessionInfo(text, sessionId) {
   } catch {
     return { kind: "failed", reason: "the session info response was not valid JSON" };
   }
-  if (!isRecord3(parsed))
+  if (!isRecord4(parsed))
     return { kind: "failed", reason: "the session info response was not a JSON object" };
   let payload = parsed;
   if (typeof parsed.id !== "string") {
-    if (!isRecord3(parsed.data)) {
+    if (!isRecord4(parsed.data)) {
       return { kind: "failed", reason: "the session info response did not name the requested session" };
     }
     payload = parsed.data;
@@ -1857,7 +2136,7 @@ function parseSessionInfo(text, sessionId) {
   if (typeof payload.id !== "string" || payload.id !== sessionId) {
     return { kind: "failed", reason: "the session info response did not name the requested session" };
   }
-  if (!isRecord3(payload.time))
+  if (!isRecord4(payload.time))
     return { kind: "failed", reason: "the session info response had no time object" };
   const idle = payload.time.idle;
   if (idle !== undefined && idle !== null && (typeof idle !== "number" || !Number.isFinite(idle))) {
@@ -1872,7 +2151,7 @@ function sessionInfoOutcome(value) {
     return value;
   return;
 }
-function isRecord3(value) {
+function isRecord4(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
@@ -1971,7 +2250,7 @@ function confirmsArchive(text, sessionId) {
 }
 
 // service/poller.ts
-function isRecord4(value) {
+function isRecord5(value) {
   return typeof value === "object" && value !== null;
 }
 function createSupervisionPoller(input) {
@@ -2236,11 +2515,11 @@ ${sessionId}`;
       return { kind: "failed", reason: "the session status response body could not be read" };
     try {
       const parsed = JSON.parse(outcome.text);
-      if (!isRecord4(parsed) || !isRecord4(parsed.pending) || Array.isArray(parsed.pending)) {
+      if (!isRecord5(parsed) || !isRecord5(parsed.pending) || Array.isArray(parsed.pending)) {
         return { kind: "failed", reason: "the session status response had no pending map" };
       }
       for (const entry of Object.values(parsed.pending)) {
-        if (!isRecord4(entry) || Array.isArray(entry)) {
+        if (!isRecord5(entry) || Array.isArray(entry)) {
           return { kind: "failed", reason: "the session status response had a malformed pending entry" };
         }
         if (entry.permissions !== undefined && !Array.isArray(entry.permissions) || entry.forms !== undefined && !Array.isArray(entry.forms)) {
@@ -2367,7 +2646,7 @@ function describeEvent(event) {
   }
 }
 function pendingActivity(entry) {
-  if (!isRecord4(entry))
+  if (!isRecord5(entry))
     return;
   if (Array.isArray(entry.permissions) && entry.permissions.length > 0)
     return "waiting-permission";
@@ -3476,13 +3755,30 @@ var archiveReviewSweep = createArchiveReviewSweep({
   filesystem: nodeFileSystem,
   homeRoot,
   nowMs: clock.nowMs,
-  deliver: (registration, prompt) => withProjectLifecycle(homeRoot, async () => {
+  cleanup: (registration) => withProjectLifecycle(homeRoot, async () => {
     const current = (await loadRegistry(nodeFileSystem, homeRoot))[registration.slug];
-    if (current === undefined)
+    if (current === undefined || current.coordinatorSessionId !== registration.coordinatorSessionId || current.homeDirectory !== registration.homeDirectory || current.projectDirectory !== registration.projectDirectory)
       return false;
     const status = await sessionStatus(nodeExec, { sessionId: current.coordinatorSessionId, directory: current.homeDirectory });
-    if (status.activity === "unknown")
-      throw new Error("archive review is waiting for a verified idle coordinator");
+    if (status.activity !== "idle")
+      return false;
+    const unlinked = await cleanupCoordinatorPullRequests({
+      filesystem: nodeFileSystem,
+      homeRoot,
+      registration: current,
+      exec: nodeExec,
+      fetcher: nodeFetcher,
+      support: await discoverSupport({ filesystem: nodeFileSystem, settingsPath: openchamberSettingsPath })
+    });
+    if (unlinked.length > 0)
+      console.info(`FirstMate PR cleanup [${current.slug}]: unlinked ${unlinked.length} merged PR(s)`);
+    return true;
+  }),
+  deliver: (registration, prompt) => withProjectLifecycle(homeRoot, async () => {
+    const current = (await loadRegistry(nodeFileSystem, homeRoot))[registration.slug];
+    if (current === undefined || current.coordinatorSessionId !== registration.coordinatorSessionId || current.homeDirectory !== registration.homeDirectory || current.projectDirectory !== registration.projectDirectory)
+      return false;
+    const status = await sessionStatus(nodeExec, { sessionId: current.coordinatorSessionId, directory: current.homeDirectory });
     if (status.activity !== "idle")
       return false;
     try {
@@ -3601,7 +3897,7 @@ async function runWatchRound() {
 function isAuthorized(request) {
   return request.headers.authorization === `Bearer ${serviceToken}`;
 }
-function isRecord5(value) {
+function isRecord6(value) {
   return typeof value === "object" && value !== null;
 }
 function respondJson(response, statusCode, body) {
@@ -3626,7 +3922,7 @@ function readJsonBody(request) {
 async function readJsonRecord(request) {
   try {
     const payload = await readJsonBody(request);
-    return isRecord5(payload) ? payload : undefined;
+    return isRecord6(payload) ? payload : undefined;
   } catch {
     return;
   }
@@ -3645,7 +3941,7 @@ async function readProjectDirectory(request) {
   } catch {
     return;
   }
-  const projectDirectory = isRecord5(payload) ? payload.projectDirectory : undefined;
+  const projectDirectory = isRecord6(payload) ? payload.projectDirectory : undefined;
   if (typeof projectDirectory !== "string" || projectDirectory.trim() === "") {
     return;
   }

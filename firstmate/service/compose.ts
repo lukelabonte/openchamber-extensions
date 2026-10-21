@@ -1,6 +1,7 @@
 import type { FileSystemPort } from "./file-system"
 import { randomUUID } from "node:crypto"
 import { loadProjectSettings } from "./settings"
+import { fileURLToPath } from "node:url"
 
 interface ComposeInstructionsInput {
   filesystem: FileSystemPort
@@ -63,7 +64,21 @@ ${headerLines.join("\n")}
     "When the captain must decide, record a backlog entry with `id:`, a concrete `hold:`, and standalone `actions:`. State the actual question, why the captain's authority is needed, the options and consequences, and your recommendation in the first mate chat. Use `state: Blocked` only when the captain's answer is needed now. A separate `kind: captain` decision can also be Queued. Resolve prerequisite tasks before requesting that decision. A hold on ongoing work isn't a request for attention; keep that work Working until the decision is ready.",
     "The service alerts the captain for these ready decisions and opens your chat, not the worker. Unchanged decisions stay quiet across service restarts. After interpreting an answer, record its scope and clear only the resolved hold and actions. If a decision changes, update its hold, actions, PR URL, or reviewed head so the next alert describes the new gate.",
   ].join("\n\n")
-  const composed = `${header}\n\n${body}\n\n${sessionTitles}\n\n${workerSelection}\n\n${captainAttention}\n`
+  const cleanupCommand = `node ${JSON.stringify(fileURLToPath(new URL("../scripts/cleanup-pr-links.js", import.meta.url)))}`
+  const pullRequestCleanup = [
+    "## PR link cleanup",
+    `During cleanup audits, run \`${cleanupCommand}\` from this registered FirstMate home. This calls the extension's guarded merged-PR cleanup directly, including from your own active turn. It accepts no session or URL overrides.`,
+    "Read the JSON result and record only confirmed removals. An empty list doesn't mean every link or task is resolved. Keep unknown, unmerged, held, or untracked links and report concrete blockers. This command doesn't delete repository content or change worker sessions. The automatic service pass remains a fallback; custom charter wording doesn't hide this callable command.",
+  ].join("\n\n")
+  const cleanupRunbook = fileURLToPath(new URL("../templates/cleanup-worker.md", import.meta.url))
+  const cleanupRunner = fileURLToPath(new URL("../scripts/worktree-cleanup.js", import.meta.url))
+  const repositoryCleanup = [
+    "## Authorized repository cleanup",
+    `For already-authorized repository cleanup, dispatch or continue a worker and include the runbook at ${JSON.stringify(cleanupRunbook)} and safety runner module at ${JSON.stringify(cleanupRunner)} in its brief. Keep repository mutations delegated to that worker, never this first mate.`,
+    "Graceful per-location release of idle, task-owned tooling is included within verified landing or explicit cleanup authorization. It doesn't need a separate approval just because idle tools hold directory handles. A finished worker turn alone doesn't authorize deletion. Active or unknown sessions, requests, commands, terminals, ownership, Git state, runtime identity, or handle owners block cleanup. Never kill processes, restart shared services, interrupt active work, force-delete work, or broaden permission policies.",
+    "Require complete runtime/handle discovery, installed-contract checks, worker session and cwd outside every target, fresh clean tracked/untracked/ignored state and no unique unlanded content, protected source/unrelated/evidence snapshots, non-forced removal, bounded retries and independent outcome verification. Remote branch cleanup needs existing explicit scope. Keep retained paths and blockers visible until resolved. Higher-precedence captain exclusions and retention requests still apply.",
+  ].join("\n\n")
+  const composed = `${header}\n\n${body}\n\n${sessionTitles}\n\n${workerSelection}\n\n${captainAttention}\n\n${pullRequestCleanup}\n\n${repositoryCleanup}\n`
   const filePath = `${homeRoot}/projects/${slug}/AGENTS.md`
   const temporaryPath = `${filePath}.${randomUUID()}.tmp`
   await filesystem.writeFile(temporaryPath, composed)

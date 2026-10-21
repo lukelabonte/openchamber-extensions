@@ -1,16 +1,23 @@
 import { randomUUID } from "node:crypto"
-import { loadHostArchivedSessionIds } from "./archive"
-import { loadBacklog } from "./backlog"
 import type { FileSystemPort } from "./file-system"
 import { resolveProjectHomeDirectory } from "./launch"
 import { loadRegistry, type Registration } from "./registry"
 import { normalizeProjectDirectory } from "./slug"
+import { loadCleanupRevision } from "./cleanup-revision"
 
 const reviewIntervalMs = 24 * 60 * 60 * 1000
+const retryIntervalMs = 5 * 60 * 1000
 
 interface ReviewProgress {
+  coordinatorSessionId?: string
+  projectDirectory?: string
   lastDeliveredAt?: number
+  lastReviewAttemptAt?: number
   lastCleanupAttemptAt?: number
+  reviewFingerprint?: string
+  cleanupFingerprint?: string
+  reviewFailed?: boolean
+  cleanupFailed?: boolean
 }
 
 // Static instructions avoid treating backlog titles or worker output as orders.
@@ -36,7 +43,7 @@ export function createArchiveReviewSweep(input: {
   // False means deferred (busy or released), not successfully delivered.
   deliver(registration: Registration, prompt: string): Promise<boolean>
   // Runs independently of archival candidates, including historical workers.
-  // False defers a busy coordinator. Failures are reported and retried next day.
+  // False defers a busy coordinator without consuming its revision or slot.
   cleanup?(registration: Registration): Promise<boolean>
   failed(slug: string, reason: string): void
 }) {
@@ -55,8 +62,10 @@ export function createArchiveReviewSweep(input: {
   async function saveProgress(slug: string, filePath: string, pending: { progress: ReviewProgress; temporaryPath: string }): Promise<void> {
     // Reuse the temporary path after a failed save rather than accumulating a
     // new file per tick. Successful rename consumes it on the host filesystem.
-    const state = { version: 1 }
-    for (const [key, value] of Object.entries(pending.progress)) state[key] = new Date(value).toISOString()
+    const state: Record<string, unknown> = { version: 2, ...pending.progress }
+    for (const key of ["lastDeliveredAt", "lastReviewAttemptAt", "lastCleanupAttemptAt"] as const) {
+      if (pending.progress[key] !== undefined) state[key] = new Date(pending.progress[key]).toISOString()
+    }
     await input.filesystem.writeFile(pending.temporaryPath, `${JSON.stringify(state, null, 2)}\n`)
     await input.filesystem.rename(pending.temporaryPath, filePath)
     pendingSaves.delete(slug)
@@ -71,63 +80,74 @@ export function createArchiveReviewSweep(input: {
       const homeDirectory = resolveProjectHomeDirectory(input.homeRoot, slug)
       if (normalizeProjectDirectory(registration.homeDirectory) !== homeDirectory) throw new Error("archive review project home doesn't match its registration")
       const filePath = archiveReviewPath(homeDirectory)
-      const current = { ...progress.get(slug) }
-      const persisted: ReviewProgress = {}
+      let persisted: ReviewProgress = {}
       if (await input.filesystem.exists(filePath)) {
-        let parsed: unknown
         try {
-          parsed = JSON.parse(await input.filesystem.readFile(filePath))
+          persisted = parseProgress(JSON.parse(await input.filesystem.readFile(filePath)))
         } catch {
-          throw new Error(`archive review state is unreadable: ${filePath}`)
-        }
-        if (typeof parsed !== "object" || parsed === null || !("version" in parsed) || parsed.version !== 1 || (!("lastDeliveredAt" in parsed) && !("lastCleanupAttemptAt" in parsed))) {
-          throw new Error(`archive review state is invalid: ${filePath}`)
-        }
-        for (const key of ["lastDeliveredAt", "lastCleanupAttemptAt"] as const) {
-          if (!(key in parsed)) continue
-          if (typeof parsed[key] !== "string" || !Number.isFinite(Date.parse(parsed[key]))) throw new Error(`archive review state is invalid: ${filePath}`)
-          persisted[key] = Date.parse(parsed[key])
-          current[key] = Math.max(current[key] ?? -Infinity, persisted[key])
+          throw new Error(`archive review state is unreadable or invalid: ${filePath}`)
         }
       }
+      const current = mergeProgress(persisted, progress.get(slug), registration)
       const pendingSave = pendingSaves.get(slug)
       if (pendingSave !== undefined) {
-        if (Object.entries(pendingSave.progress).every(([key, value]) => persisted[key] !== undefined && persisted[key] >= value)) pendingSaves.delete(slug)
+        if (Object.entries(pendingSave.progress).every(([key, value]) => persisted[key] === value)) pendingSaves.delete(slug)
         else await saveProgress(slug, filePath, pendingSave)
       }
       progress.set(slug, current)
-      if (input.cleanup !== undefined && (current.lastCleanupAttemptAt === undefined || input.nowMs() - current.lastCleanupAttemptAt >= reviewIntervalMs)) {
+      // Capture once, before any callback. A newer revision arriving during a
+      // cleanup/send stays pending for the next tick, including after restart.
+      const revision = await loadCleanupRevision({ ...input, registration, coordinatorIds })
+      const cleanupInterval = revision.hasPullCandidates || current.cleanupFailed ? retryIntervalMs : reviewIntervalMs
+      const cleanupBackoff = current.cleanupFailed && current.lastCleanupAttemptAt !== undefined && input.nowMs() - current.lastCleanupAttemptAt < retryIntervalMs
+      const cleanupDue = current.cleanupFingerprint !== revision.cleanup || current.lastCleanupAttemptAt === undefined || input.nowMs() - current.lastCleanupAttemptAt >= cleanupInterval
+      if (input.cleanup !== undefined && cleanupDue && !cleanupBackoff) {
         let attempted = false
-        // Deduplicate within an attempt, not across separate daily attempts.
         failures.delete(`${slug}:cleanup`)
         try {
           attempted = await input.cleanup(registration)
+          if (attempted) current.cleanupFailed = false
         } catch (error) {
           attempted = true
+          current.cleanupFailed = true
           reportFailure(`${slug}:cleanup`, error)
         }
         if (attempted) {
           current.lastCleanupAttemptAt = input.nowMs()
-          const pending = { progress: { ...current }, temporaryPath: `${filePath}.${randomUUID()}.tmp` }
-          pendingSaves.set(slug, pending)
-          await saveProgress(slug, filePath, pending)
+          current.cleanupFingerprint = revision.cleanup
+          await remember()
         }
       }
-      if (current.lastDeliveredAt !== undefined && input.nowMs() - current.lastDeliveredAt < reviewIntervalMs) return
-      const backlog = await loadBacklog(input.filesystem, `${homeDirectory}/backlog.md`)
-      if (backlog.errors.length > 0) throw new Error("archive review is waiting for a readable backlog without malformed entries")
-      // Board-only End never archived the host session. Include those workers
-      // so the sweep can reconcile old, hidden cards as well as visible ones.
-      const archived = await loadHostArchivedSessionIds(input.filesystem, input.homeRoot, slug)
-      if (!backlog.tasks.some((task) => task.sessionId !== undefined && !coordinatorIds.has(task.sessionId) && !archived.has(task.sessionId))) return
-      if (!(await input.deliver(registration, reviewPrompt))) return
-      // CLI acceptance is not review completion. Remember it before saving so
+      if (!revision.hasReviewCandidates && current.reviewFingerprint !== revision.review) {
+        // Observing no eligible work is a no-op, not prompt delivery. Remember
+        // the empty baseline so a reopened task can become newly eligible again.
+        current.reviewFingerprint = revision.review
+        if (current.lastDeliveredAt !== undefined || current.lastCleanupAttemptAt !== undefined || current.lastReviewAttemptAt !== undefined) await remember()
+      }
+      const reviewBackoff = current.reviewFailed && current.lastReviewAttemptAt !== undefined && input.nowMs() - current.lastReviewAttemptAt < retryIntervalMs
+      const reviewDue = current.lastDeliveredAt === undefined || input.nowMs() - current.lastDeliveredAt >= reviewIntervalMs || revision.hasReviewCandidates && current.reviewFingerprint !== revision.review
+      if (!revision.hasWorkers || !reviewDue || reviewBackoff) return
+      failures.delete(`${slug}:review`)
+      try {
+        if (!(await input.deliver(registration, reviewPrompt))) return
+        current.lastDeliveredAt = input.nowMs()
+        current.reviewFingerprint = revision.review
+        current.reviewFailed = false
+      } catch (error) {
+        current.reviewFailed = true
+        reportFailure(`${slug}:review`, error)
+      }
+      current.lastReviewAttemptAt = input.nowMs()
+      // Host acceptance isn't review completion. Remember it before saving so
       // a storage failure doesn't resend the prompt every supervision tick.
-      const completedAt = input.nowMs()
-      current.lastDeliveredAt = completedAt
-      const pending = { progress: { ...current }, temporaryPath: `${filePath}.${randomUUID()}.tmp` }
-      pendingSaves.set(slug, pending)
-      await saveProgress(slug, filePath, pending)
+      await remember()
+
+      async function remember(): Promise<void> {
+        progress.set(slug, { ...current })
+        const pending = { progress: { ...current }, temporaryPath: pendingSaves.get(slug)?.temporaryPath ?? `${filePath}.${randomUUID()}.tmp` }
+        pendingSaves.set(slug, pending)
+        await saveProgress(slug, filePath, pending)
+      }
     } catch (error) {
       reportFailure(slug, error)
     } finally {
@@ -146,4 +166,46 @@ export function createArchiveReviewSweep(input: {
   }
 
   return { check }
+}
+
+function parseProgress(parsed: unknown): ReviewProgress {
+  if (typeof parsed !== "object" || parsed === null || !("version" in parsed) || ![1, 2].includes(parsed.version as number)) throw new Error("invalid review state")
+  const value = parsed as Record<string, unknown>
+  const result: ReviewProgress = {}
+  for (const key of ["lastDeliveredAt", "lastReviewAttemptAt", "lastCleanupAttemptAt"] as const) {
+    if (!(key in value)) continue
+    if (typeof value[key] !== "string" || !Number.isFinite(Date.parse(value[key]))) throw new Error("invalid review timestamp")
+    result[key] = Date.parse(value[key])
+  }
+  if (result.lastDeliveredAt === undefined && result.lastReviewAttemptAt === undefined && result.lastCleanupAttemptAt === undefined) throw new Error("missing review timestamp")
+  if (value.version === 1) return result
+  for (const key of ["coordinatorSessionId", "projectDirectory"] as const) {
+    if (typeof value[key] !== "string" || value[key] === "") throw new Error("missing review scope")
+    result[key] = value[key]
+  }
+  for (const key of ["reviewFingerprint", "cleanupFingerprint"] as const) {
+    if (!(key in value)) continue
+    if (typeof value[key] !== "string" || !/^[a-f0-9]{64}$/.test(value[key])) throw new Error("invalid review fingerprint")
+    result[key] = value[key]
+  }
+  for (const key of ["reviewFailed", "cleanupFailed"] as const) {
+    if (!(key in value)) continue
+    if (typeof value[key] !== "boolean") throw new Error("invalid review retry state")
+    result[key] = value[key]
+  }
+  return result
+}
+
+function mergeProgress(persisted: ReviewProgress, local: ReviewProgress | undefined, registration: Registration): ReviewProgress {
+  const matchesScope = (entry: ReviewProgress) => entry.coordinatorSessionId === undefined || entry.coordinatorSessionId === registration.coordinatorSessionId && entry.projectDirectory === registration.projectDirectory
+  const disk = matchesScope(persisted) ? persisted : {}
+  const memory = local !== undefined && matchesScope(local) ? local : {}
+  const review = (memory.lastReviewAttemptAt ?? memory.lastDeliveredAt ?? -Infinity) >= (disk.lastReviewAttemptAt ?? disk.lastDeliveredAt ?? -Infinity) ? memory : disk
+  const cleanup = (memory.lastCleanupAttemptAt ?? -Infinity) >= (disk.lastCleanupAttemptAt ?? -Infinity) ? memory : disk
+  return {
+    coordinatorSessionId: registration.coordinatorSessionId, projectDirectory: registration.projectDirectory,
+    lastDeliveredAt: review.lastDeliveredAt, lastReviewAttemptAt: review.lastReviewAttemptAt,
+    reviewFingerprint: review.reviewFingerprint, reviewFailed: review.reviewFailed,
+    lastCleanupAttemptAt: cleanup.lastCleanupAttemptAt, cleanupFingerprint: cleanup.cleanupFingerprint, cleanupFailed: cleanup.cleanupFailed,
+  }
 }

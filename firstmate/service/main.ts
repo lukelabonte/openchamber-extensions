@@ -189,9 +189,8 @@ const archiveReviewSweep = createArchiveReviewSweep({
   nowMs: clock.nowMs,
   cleanup: (registration) => withProjectLifecycle(homeRoot, async () => {
     const current = (await loadRegistry(nodeFileSystem, homeRoot))[registration.slug]
-    if (current === undefined) return false
+    if (current === undefined || current.coordinatorSessionId !== registration.coordinatorSessionId || current.homeDirectory !== registration.homeDirectory || current.projectDirectory !== registration.projectDirectory) return false
     const status = await sessionStatus(nodeExec, { sessionId: current.coordinatorSessionId, directory: current.homeDirectory })
-    if (status.activity === "unknown") throw new Error("PR cleanup is waiting for a verified idle first mate")
     if (status.activity !== "idle") return false
     const unlinked = await cleanupCoordinatorPullRequests({
       filesystem: nodeFileSystem, homeRoot, registration: current, exec: nodeExec, fetcher: nodeFetcher,
@@ -202,9 +201,8 @@ const archiveReviewSweep = createArchiveReviewSweep({
   }),
   deliver: (registration, prompt) => withProjectLifecycle(homeRoot, async () => {
     const current = (await loadRegistry(nodeFileSystem, homeRoot))[registration.slug]
-    if (current === undefined) return false
+    if (current === undefined || current.coordinatorSessionId !== registration.coordinatorSessionId || current.homeDirectory !== registration.homeDirectory || current.projectDirectory !== registration.projectDirectory) return false
     const status = await sessionStatus(nodeExec, { sessionId: current.coordinatorSessionId, directory: current.homeDirectory })
-    if (status.activity === "unknown") throw new Error("archive review is waiting for a verified idle coordinator")
     if (status.activity !== "idle") return false
     try {
       await sessionSend(nodeExec, { sessionId: current.coordinatorSessionId, directory: current.homeDirectory, prompt })

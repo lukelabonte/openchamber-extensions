@@ -99,13 +99,13 @@ function fixture(activity: string, pollMs: number, blockWorker = false) {
     return tracked.child
   }
   return { start, log, sends, projectHome,
-    setupCleanup(hostPort: number) {
+    setupCleanup(hostPort: number, hostArchived = true) {
       settingsPath = path.join(root, "desktop-settings.json")
       writeFileSync(settingsPath, JSON.stringify({ desktopLocalPort: hostPort, desktopLocalClientToken: "desktop-token" }))
       writeFileSync(path.join(projectHome, "backlog.md"), "- Ship search\n  state: Done\n  id: search\n  kind: ship\n  session: ses_old\n  pr: https://github.com/owner/app/pull/7")
       mkdirSync(path.join(projectHome, "reports"), { recursive: true })
       writeFileSync(path.join(projectHome, "reports", "search.md"), "Verified merged PR: https://github.com/owner/app/pull/7. Worker ses_old. Worktree and branch retained.")
-      writeFileSync(path.join(projectHome, "reports", "archive.jsonl"), JSON.stringify({ sessionId: "ses_old", title: "Ship search", archivedAt: "2026-10-21T10:00:00Z", hostArchived: true }) + "\n")
+      writeFileSync(path.join(projectHome, "reports", "archive.jsonl"), JSON.stringify({ sessionId: "ses_old", title: "Ship search", archivedAt: "2026-10-21T10:00:00Z", hostArchived }) + "\n")
       const ghPath = path.join(shimDirectory, "gh")
       writeFileSync(ghPath, '#!/bin/sh\nprintf "gh %s\\n" "$*" >> "$FIRSTMATE_TEST_CLI_LOG"\necho \'{"state":"MERGED","mergedAt":"2026-10-21T10:00:00Z","url":"https://github.com/owner/app/pull/7"}\'\n')
       chmodSync(ghPath, 0o755)
@@ -198,6 +198,40 @@ describe("service archive-review scheduling", () => {
       await new Promise((resolve) => setTimeout(resolve, 100))
       expect(requests.filter((request) => request.path.startsWith("/api/openchamber/sessions/"))).toHaveLength(2)
       expect(environment.sends()).toBe(0)
+    } finally {
+      host.stop(true)
+    }
+  })
+
+  test("reacts to newly confirmed host archival on the next supervision tick", async () => {
+    const pull = { id: "owner/app#7", title: "Ship search", kind: "pull", url: "https://github.com/owner/app/pull/7" }
+    let links = [pull]
+    let unlinks = 0
+    const host = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
+      const url = new URL(request.url)
+      if (url.pathname === "/api/sessions/status") return Response.json({})
+      if (url.pathname === "/api/session/ses_old") return Response.json({ id: "ses_old", time: { idle: 1 } })
+      if (url.pathname.endsWith("/links") && request.method === "POST") {
+        const body = await request.json()
+        expect(body.directory).toBe(environment.projectHome)
+        expect(body.linked).toBe(false)
+        links = []
+        unlinks += 1
+      } else if (!url.pathname.endsWith("/metadata")) return new Response("unexpected operation", { status: 400 })
+      return Response.json({ metadata: { openchamber: { linked_issues: links } } })
+    } })
+    const environment = fixture("idle", 30)
+    environment.setupCleanup(host.port, false)
+    try {
+      await environment.start()
+      await waitUntil(() => environment.state()?.lastDeliveredAt !== undefined, "initial review didn't finish")
+      expect(unlinks).toBe(0)
+      writeFileSync(path.join(environment.projectHome, "reports", "archive.jsonl"), JSON.stringify({ sessionId: "ses_old", title: "Ship search", archivedAt: "2026-10-21T10:01:00Z", hostArchived: true }) + "\n")
+      await waitUntil(() => unlinks === 1, "new host archival didn't trigger PR cleanup")
+      expect(links).toEqual([])
+      expect(environment.sends()).toBe(1)
+      await new Promise((resolve) => setTimeout(resolve, 100))
+      expect(unlinks).toBe(1)
     } finally {
       host.stop(true)
     }

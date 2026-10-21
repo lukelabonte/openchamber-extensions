@@ -293,273 +293,6 @@ function isArchiveEntry(value) {
 // service/archive-review.ts
 import { randomUUID as randomUUID3 } from "node:crypto";
 
-// service/backlog.ts
-var backlogStates = [
-  "Queued",
-  "Working",
-  "Blocked",
-  "Parked",
-  "Done",
-  "Failed",
-  "Idle"
-];
-var fieldKeys = {
-  id: "id",
-  kind: "kind",
-  "blocked-by": "blockedBy",
-  hold: "hold",
-  "review-head": "reviewHead",
-  actions: "actions",
-  session: "sessionId",
-  "archive-session": "archiveSessionId",
-  worktree: "worktreeDirectory",
-  branch: "branch",
-  "start-ref": "startRef",
-  pr: "prUrl",
-  created: "createdAt",
-  updated: "updatedAt"
-};
-var allFieldKeys = new Set(["state", ...Object.keys(fieldKeys)]);
-var timestampFields = ["createdAt", "updatedAt"];
-function parseBacklog(markdown) {
-  const tasks = [];
-  const errors = [];
-  const taskIds = new Set;
-  let entry;
-  let inCodeFence = false;
-  const closeEntry = () => {
-    if (entry === undefined)
-      return;
-    const draft = entry;
-    entry = undefined;
-    if (draft.problem !== undefined) {
-      errors.push(draft.problem);
-      return;
-    }
-    const { state, ...optionalFields } = draft.fields;
-    if (state === undefined) {
-      errors.push({ line: draft.titleLine, message: `the entry "${draft.title}" has no state line` });
-      return;
-    }
-    if (optionalFields.id !== undefined) {
-      if (taskIds.has(optionalFields.id)) {
-        errors.push({ line: draft.idLine ?? draft.titleLine, message: `the entry "${draft.title}" repeats the task id "${optionalFields.id}"` });
-        return;
-      }
-      taskIds.add(optionalFields.id);
-    }
-    tasks.push({ title: draft.title, ...optionalFields, state });
-  };
-  markdown.split(`
-`).forEach((line, index) => {
-    const lineNumber = index + 1;
-    const trimmed = line.trim();
-    if (trimmed.startsWith("```")) {
-      inCodeFence = !inCodeFence;
-      return;
-    }
-    if (inCodeFence || trimmed === "")
-      return;
-    const bullet = /^[-*]\s+(.+)$/.exec(trimmed);
-    if (bullet !== null) {
-      closeEntry();
-      entry = { titleLine: lineNumber, title: bullet[1].trim(), fields: {} };
-      return;
-    }
-    if (trimmed.startsWith("#")) {
-      closeEntry();
-      return;
-    }
-    const field = /^([A-Za-z][A-Za-z-]*):\s*(.*)$/.exec(trimmed);
-    const indented = line.startsWith(" ") || line.startsWith("\t");
-    if (!indented) {
-      closeEntry();
-      return;
-    }
-    if (entry === undefined) {
-      if (field !== null && allFieldKeys.has(field[1])) {
-        errors.push({ line: lineNumber, message: `the field "${field[1]}" has no entry above it` });
-      }
-      return;
-    }
-    applyField(entry, field, lineNumber);
-  });
-  closeEntry();
-  return { tasks, errors };
-}
-function applyField(entry, field, lineNumber) {
-  if (entry.problem !== undefined)
-    return;
-  if (field === null) {
-    entry.problem = {
-      line: lineNumber,
-      message: `the entry "${entry.title}" has a line that is not a \`key: value\` field`
-    };
-    return;
-  }
-  const key = field[1];
-  const value = field[2].trim();
-  if (key === "state") {
-    if (!isBacklogState(value)) {
-      entry.problem = { line: lineNumber, message: `the entry "${entry.title}" has an unknown state "${value}"` };
-    } else if (entry.fields.state !== undefined) {
-      entry.problem = { line: lineNumber, message: `the entry "${entry.title}" repeats the "state" field` };
-    } else {
-      entry.fields.state = value;
-    }
-    return;
-  }
-  const fieldName = fieldKeys[key];
-  if (fieldName === undefined) {
-    entry.problem = { line: lineNumber, message: `the entry "${entry.title}" has an unknown field "${key}"` };
-    return;
-  }
-  if (entry.fields[fieldName] !== undefined) {
-    entry.problem = { line: lineNumber, message: `the entry "${entry.title}" repeats the "${key}" field` };
-    return;
-  }
-  if (fieldName === "actions") {
-    const actions = parseTaskActions(value);
-    if (actions === undefined) {
-      entry.problem = { line: lineNumber, message: `the entry "${entry.title}" has an invalid "actions" field; use up to four unique nonempty labels and prompts separated by "=>" and "|", escaping pipes and backslashes` };
-    } else {
-      entry.fields.actions = actions;
-    }
-    return;
-  }
-  if (value === "") {
-    entry.problem = { line: lineNumber, message: `the entry "${entry.title}" has an empty "${key}" field` };
-    return;
-  }
-  if (timestampFields.includes(fieldName) && Number.isNaN(Date.parse(value))) {
-    entry.problem = { line: lineNumber, message: `the entry "${entry.title}" has a "${key}" that is not a timestamp` };
-    return;
-  }
-  if (fieldName === "kind") {
-    if (!isTaskKind(value)) {
-      entry.problem = { line: lineNumber, message: `the entry "${entry.title}" has an unknown "kind" value "${value}"` };
-    } else {
-      entry.fields.kind = value;
-    }
-    return;
-  }
-  if ((fieldName === "id" || fieldName === "blockedBy") && !isTaskId(value)) {
-    entry.problem = { line: lineNumber, message: `the entry "${entry.title}" has a "${key}" that is not a path-safe task id (1–64 lowercase letters, digits or hyphens, starting with a letter or digit)` };
-    return;
-  }
-  if (fieldName === "reviewHead" && !isReviewHead(value)) {
-    entry.problem = { line: lineNumber, message: `the entry "${entry.title}" has a "${key}" that is not a hex SHA (7–64 characters)` };
-    return;
-  }
-  if (fieldName === "archiveSessionId" && !/^[A-Za-z0-9_-]{1,128}$/.test(value)) {
-    entry.problem = { line: lineNumber, message: `the entry "${entry.title}" has an invalid "archive-session" session id` };
-    return;
-  }
-  entry.fields[fieldName] = value;
-  if (fieldName === "id")
-    entry.idLine = lineNumber;
-}
-function isBacklogState(value) {
-  return backlogStates.includes(value);
-}
-function isTaskId(value) {
-  return typeof value === "string" && value.trim() === value && /^[a-z0-9][a-z0-9-]{0,63}$/.test(value);
-}
-function isTaskKind(value) {
-  return value === "ship" || value === "scout" || value === "captain";
-}
-function isReviewHead(value) {
-  return typeof value === "string" && value.trim() === value && /^[0-9a-f]{7,64}$/i.test(value);
-}
-function isTaskActions(value) {
-  if (!Array.isArray(value) || value.length > 4)
-    return false;
-  const labels = new Set;
-  for (const action of value) {
-    if (typeof action !== "object" || action === null || Array.isArray(action))
-      return false;
-    if (typeof action.label !== "string" || typeof action.text !== "string")
-      return false;
-    const label = action.label.trim();
-    if (label === "" || action.text.trim() === "" || labels.has(label))
-      return false;
-    labels.add(label);
-  }
-  return true;
-}
-function parseTaskActions(value) {
-  if (value === "")
-    return [];
-  const segments = [];
-  let segment = "";
-  for (let index = 0;index < value.length; index += 1) {
-    const character = value[index];
-    if (character === "\\") {
-      const escaped = value[index + 1];
-      if (escaped !== "\\" && escaped !== "|")
-        return;
-      segment += escaped;
-      index += 1;
-    } else if (character === "|") {
-      segments.push(segment);
-      segment = "";
-    } else {
-      segment += character;
-    }
-  }
-  segments.push(segment);
-  if (segments.length > 4)
-    return;
-  const actions = [];
-  for (const entry of segments) {
-    const separator = entry.indexOf("=>");
-    if (separator === -1)
-      return;
-    actions.push({ label: entry.slice(0, separator).trim(), text: entry.slice(separator + 2).trim() });
-  }
-  return isTaskActions(actions) ? actions : undefined;
-}
-function escapeActionText(text) {
-  return text.replace(/\\/g, "\\\\").replace(/\|/g, "\\|");
-}
-function formatBacklogEntry(task) {
-  const lines = [`- ${task.title}`, `  state: ${task.state}`];
-  if (task.id !== undefined)
-    lines.push(`  id: ${task.id}`);
-  if (task.kind !== undefined)
-    lines.push(`  kind: ${task.kind}`);
-  if (task.blockedBy !== undefined)
-    lines.push(`  blocked-by: ${task.blockedBy}`);
-  if (task.hold !== undefined)
-    lines.push(`  hold: ${task.hold}`);
-  if (task.reviewHead !== undefined)
-    lines.push(`  review-head: ${task.reviewHead}`);
-  if (task.actions !== undefined) {
-    lines.push(`  actions: ${task.actions.map((action) => `${escapeActionText(action.label)} => ${escapeActionText(action.text)}`).join(" | ")}`);
-  }
-  if (task.sessionId !== undefined)
-    lines.push(`  session: ${task.sessionId}`);
-  if (task.archiveSessionId !== undefined)
-    lines.push(`  archive-session: ${task.archiveSessionId}`);
-  if (task.worktreeDirectory !== undefined)
-    lines.push(`  worktree: ${task.worktreeDirectory}`);
-  if (task.branch !== undefined)
-    lines.push(`  branch: ${task.branch}`);
-  if (task.startRef !== undefined)
-    lines.push(`  start-ref: ${task.startRef}`);
-  if (task.prUrl !== undefined)
-    lines.push(`  pr: ${task.prUrl}`);
-  if (task.createdAt !== undefined)
-    lines.push(`  created: ${task.createdAt}`);
-  if (task.updatedAt !== undefined)
-    lines.push(`  updated: ${task.updatedAt}`);
-  return lines.join(`
-`);
-}
-async function loadBacklog(filesystem, backlogPath) {
-  return parseBacklog(await filesystem.readFile(backlogPath));
-}
-
 // service/compose.ts
 import { randomUUID } from "node:crypto";
 
@@ -685,7 +418,7 @@ ${layer.contents}`).join(`
   const pullRequestCleanup = [
     "## PR link cleanup",
     `During cleanup audits, run \`${cleanupCommand}\` from this registered FirstMate home. This calls the extension's guarded merged-PR cleanup directly, including from your own active turn. It accepts no session or URL overrides.`,
-    "Read the JSON result and record only confirmed removals. An empty list doesn't mean every link or task is resolved. Keep unknown, unmerged, held, or untracked links and report concrete blockers. This command doesn't delete repository content or change worker sessions. The daily service pass remains a fallback; custom charter wording doesn't hide this callable command."
+    "Read the JSON result and record only confirmed removals. An empty list doesn't mean every link or task is resolved. Keep unknown, unmerged, held, or untracked links and report concrete blockers. This command doesn't delete repository content or change worker sessions. The automatic service pass remains a fallback; custom charter wording doesn't hide this callable command."
   ].join(`
 
 `);
@@ -902,7 +635,7 @@ async function acknowledgeTemplateUpgrade(input) {
 // service/provision.ts
 var sharedDirectories = ["watches"];
 var legacyTemplateHashes = {
-  charter: ["44c30fc03a72d0e3db47f520f77e9d2f256a8595da0c4a92a3613ba8d0bf4bd9", "f2a01f5f4d7e76a63bd026ebda14ecceee56c266aa2c8547af3e8b1430bf7c5b", "26ec3644f04dd682108b932ce183734b3dcaf9bba607c402da7adfde985d5d3b", "8a888fd9dd86efbd7f7bfb35a3780353c7ec690c83c8dbf7cec007c7b5447b4a"],
+  charter: ["44c30fc03a72d0e3db47f520f77e9d2f256a8595da0c4a92a3613ba8d0bf4bd9", "f2a01f5f4d7e76a63bd026ebda14ecceee56c266aa2c8547af3e8b1430bf7c5b", "26ec3644f04dd682108b932ce183734b3dcaf9bba607c402da7adfde985d5d3b", "8a888fd9dd86efbd7f7bfb35a3780353c7ec690c83c8dbf7cec007c7b5447b4a", "a5b7d8f8131c05da4372b3f627e2180e76c8ee78c3caff071e92f5472c4a1fcd"],
   "pr-watch": ["436ce74feaf4fcb7beaeca787e30b0434ed2a5feeb0e4222540852c6b103fbbe"]
 };
 var sharedFiles = [
@@ -1261,8 +994,326 @@ async function recordCoordinatorSessionId(filesystem, homeDirectory, coordinator
   await filesystem.rename(temporaryPath, settingsPath);
 }
 
+// service/cleanup-revision.ts
+import { createHash as createHash2 } from "node:crypto";
+
+// service/backlog.ts
+var backlogStates = [
+  "Queued",
+  "Working",
+  "Blocked",
+  "Parked",
+  "Done",
+  "Failed",
+  "Idle"
+];
+var fieldKeys = {
+  id: "id",
+  kind: "kind",
+  "blocked-by": "blockedBy",
+  hold: "hold",
+  "review-head": "reviewHead",
+  actions: "actions",
+  session: "sessionId",
+  "archive-session": "archiveSessionId",
+  worktree: "worktreeDirectory",
+  branch: "branch",
+  "start-ref": "startRef",
+  pr: "prUrl",
+  created: "createdAt",
+  updated: "updatedAt"
+};
+var allFieldKeys = new Set(["state", ...Object.keys(fieldKeys)]);
+var timestampFields = ["createdAt", "updatedAt"];
+function parseBacklog(markdown) {
+  const tasks = [];
+  const errors = [];
+  const taskIds = new Set;
+  let entry;
+  let inCodeFence = false;
+  const closeEntry = () => {
+    if (entry === undefined)
+      return;
+    const draft = entry;
+    entry = undefined;
+    if (draft.problem !== undefined) {
+      errors.push(draft.problem);
+      return;
+    }
+    const { state, ...optionalFields } = draft.fields;
+    if (state === undefined) {
+      errors.push({ line: draft.titleLine, message: `the entry "${draft.title}" has no state line` });
+      return;
+    }
+    if (optionalFields.id !== undefined) {
+      if (taskIds.has(optionalFields.id)) {
+        errors.push({ line: draft.idLine ?? draft.titleLine, message: `the entry "${draft.title}" repeats the task id "${optionalFields.id}"` });
+        return;
+      }
+      taskIds.add(optionalFields.id);
+    }
+    tasks.push({ title: draft.title, ...optionalFields, state });
+  };
+  markdown.split(`
+`).forEach((line, index) => {
+    const lineNumber = index + 1;
+    const trimmed = line.trim();
+    if (trimmed.startsWith("```")) {
+      inCodeFence = !inCodeFence;
+      return;
+    }
+    if (inCodeFence || trimmed === "")
+      return;
+    const bullet = /^[-*]\s+(.+)$/.exec(trimmed);
+    if (bullet !== null) {
+      closeEntry();
+      entry = { titleLine: lineNumber, title: bullet[1].trim(), fields: {} };
+      return;
+    }
+    if (trimmed.startsWith("#")) {
+      closeEntry();
+      return;
+    }
+    const field = /^([A-Za-z][A-Za-z-]*):\s*(.*)$/.exec(trimmed);
+    const indented = line.startsWith(" ") || line.startsWith("\t");
+    if (!indented) {
+      closeEntry();
+      return;
+    }
+    if (entry === undefined) {
+      if (field !== null && allFieldKeys.has(field[1])) {
+        errors.push({ line: lineNumber, message: `the field "${field[1]}" has no entry above it` });
+      }
+      return;
+    }
+    applyField(entry, field, lineNumber);
+  });
+  closeEntry();
+  return { tasks, errors };
+}
+function applyField(entry, field, lineNumber) {
+  if (entry.problem !== undefined)
+    return;
+  if (field === null) {
+    entry.problem = {
+      line: lineNumber,
+      message: `the entry "${entry.title}" has a line that is not a \`key: value\` field`
+    };
+    return;
+  }
+  const key = field[1];
+  const value = field[2].trim();
+  if (key === "state") {
+    if (!isBacklogState(value)) {
+      entry.problem = { line: lineNumber, message: `the entry "${entry.title}" has an unknown state "${value}"` };
+    } else if (entry.fields.state !== undefined) {
+      entry.problem = { line: lineNumber, message: `the entry "${entry.title}" repeats the "state" field` };
+    } else {
+      entry.fields.state = value;
+    }
+    return;
+  }
+  const fieldName = fieldKeys[key];
+  if (fieldName === undefined) {
+    entry.problem = { line: lineNumber, message: `the entry "${entry.title}" has an unknown field "${key}"` };
+    return;
+  }
+  if (entry.fields[fieldName] !== undefined) {
+    entry.problem = { line: lineNumber, message: `the entry "${entry.title}" repeats the "${key}" field` };
+    return;
+  }
+  if (fieldName === "actions") {
+    const actions = parseTaskActions(value);
+    if (actions === undefined) {
+      entry.problem = { line: lineNumber, message: `the entry "${entry.title}" has an invalid "actions" field; use up to four unique nonempty labels and prompts separated by "=>" and "|", escaping pipes and backslashes` };
+    } else {
+      entry.fields.actions = actions;
+    }
+    return;
+  }
+  if (value === "") {
+    entry.problem = { line: lineNumber, message: `the entry "${entry.title}" has an empty "${key}" field` };
+    return;
+  }
+  if (timestampFields.includes(fieldName) && Number.isNaN(Date.parse(value))) {
+    entry.problem = { line: lineNumber, message: `the entry "${entry.title}" has a "${key}" that is not a timestamp` };
+    return;
+  }
+  if (fieldName === "kind") {
+    if (!isTaskKind(value)) {
+      entry.problem = { line: lineNumber, message: `the entry "${entry.title}" has an unknown "kind" value "${value}"` };
+    } else {
+      entry.fields.kind = value;
+    }
+    return;
+  }
+  if ((fieldName === "id" || fieldName === "blockedBy") && !isTaskId(value)) {
+    entry.problem = { line: lineNumber, message: `the entry "${entry.title}" has a "${key}" that is not a path-safe task id (1–64 lowercase letters, digits or hyphens, starting with a letter or digit)` };
+    return;
+  }
+  if (fieldName === "reviewHead" && !isReviewHead(value)) {
+    entry.problem = { line: lineNumber, message: `the entry "${entry.title}" has a "${key}" that is not a hex SHA (7–64 characters)` };
+    return;
+  }
+  if (fieldName === "archiveSessionId" && !/^[A-Za-z0-9_-]{1,128}$/.test(value)) {
+    entry.problem = { line: lineNumber, message: `the entry "${entry.title}" has an invalid "archive-session" session id` };
+    return;
+  }
+  entry.fields[fieldName] = value;
+  if (fieldName === "id")
+    entry.idLine = lineNumber;
+}
+function isBacklogState(value) {
+  return backlogStates.includes(value);
+}
+function isTaskId(value) {
+  return typeof value === "string" && value.trim() === value && /^[a-z0-9][a-z0-9-]{0,63}$/.test(value);
+}
+function isTaskKind(value) {
+  return value === "ship" || value === "scout" || value === "captain";
+}
+function isReviewHead(value) {
+  return typeof value === "string" && value.trim() === value && /^[0-9a-f]{7,64}$/i.test(value);
+}
+function isTaskActions(value) {
+  if (!Array.isArray(value) || value.length > 4)
+    return false;
+  const labels = new Set;
+  for (const action of value) {
+    if (typeof action !== "object" || action === null || Array.isArray(action))
+      return false;
+    if (typeof action.label !== "string" || typeof action.text !== "string")
+      return false;
+    const label = action.label.trim();
+    if (label === "" || action.text.trim() === "" || labels.has(label))
+      return false;
+    labels.add(label);
+  }
+  return true;
+}
+function parseTaskActions(value) {
+  if (value === "")
+    return [];
+  const segments = [];
+  let segment = "";
+  for (let index = 0;index < value.length; index += 1) {
+    const character = value[index];
+    if (character === "\\") {
+      const escaped = value[index + 1];
+      if (escaped !== "\\" && escaped !== "|")
+        return;
+      segment += escaped;
+      index += 1;
+    } else if (character === "|") {
+      segments.push(segment);
+      segment = "";
+    } else {
+      segment += character;
+    }
+  }
+  segments.push(segment);
+  if (segments.length > 4)
+    return;
+  const actions = [];
+  for (const entry of segments) {
+    const separator = entry.indexOf("=>");
+    if (separator === -1)
+      return;
+    actions.push({ label: entry.slice(0, separator).trim(), text: entry.slice(separator + 2).trim() });
+  }
+  return isTaskActions(actions) ? actions : undefined;
+}
+function escapeActionText(text) {
+  return text.replace(/\\/g, "\\\\").replace(/\|/g, "\\|");
+}
+function formatBacklogEntry(task) {
+  const lines = [`- ${task.title}`, `  state: ${task.state}`];
+  if (task.id !== undefined)
+    lines.push(`  id: ${task.id}`);
+  if (task.kind !== undefined)
+    lines.push(`  kind: ${task.kind}`);
+  if (task.blockedBy !== undefined)
+    lines.push(`  blocked-by: ${task.blockedBy}`);
+  if (task.hold !== undefined)
+    lines.push(`  hold: ${task.hold}`);
+  if (task.reviewHead !== undefined)
+    lines.push(`  review-head: ${task.reviewHead}`);
+  if (task.actions !== undefined) {
+    lines.push(`  actions: ${task.actions.map((action) => `${escapeActionText(action.label)} => ${escapeActionText(action.text)}`).join(" | ")}`);
+  }
+  if (task.sessionId !== undefined)
+    lines.push(`  session: ${task.sessionId}`);
+  if (task.archiveSessionId !== undefined)
+    lines.push(`  archive-session: ${task.archiveSessionId}`);
+  if (task.worktreeDirectory !== undefined)
+    lines.push(`  worktree: ${task.worktreeDirectory}`);
+  if (task.branch !== undefined)
+    lines.push(`  branch: ${task.branch}`);
+  if (task.startRef !== undefined)
+    lines.push(`  start-ref: ${task.startRef}`);
+  if (task.prUrl !== undefined)
+    lines.push(`  pr: ${task.prUrl}`);
+  if (task.createdAt !== undefined)
+    lines.push(`  created: ${task.createdAt}`);
+  if (task.updatedAt !== undefined)
+    lines.push(`  updated: ${task.updatedAt}`);
+  return lines.join(`
+`);
+}
+async function loadBacklog(filesystem, backlogPath) {
+  return parseBacklog(await filesystem.readFile(backlogPath));
+}
+
+// service/cleanup-revision.ts
+async function loadCleanupRevision(input) {
+  const { filesystem, homeRoot, registration, coordinatorIds } = input;
+  const backlog = await loadBacklog(filesystem, `${registration.homeDirectory}/backlog.md`);
+  if (backlog.errors.length > 0)
+    throw new Error("archive review is waiting for a readable backlog without malformed entries");
+  const archived = await loadHostArchivedSessionIds(filesystem, homeRoot, registration.slug);
+  const rows = [];
+  const reviewRows = [];
+  let hasWorkers = false;
+  let hasPullCandidates = false;
+  for (const task of backlog.tasks) {
+    if (task.kind === "captain" || task.sessionId !== undefined && coordinatorIds.has(task.sessionId))
+      continue;
+    const hostArchived = task.sessionId !== undefined && archived.has(task.sessionId);
+    const tracked = task.sessionId !== undefined;
+    if (tracked && !hostArchived)
+      hasWorkers = true;
+    const reportPath = task.id === undefined ? undefined : `${registration.homeDirectory}/reports/${task.id}.md`;
+    const reportReady = reportPath !== undefined && ["Done", "Failed", "Idle"].includes(task.state) && await filesystem.exists(reportPath) && (await filesystem.readFile(reportPath)).trim() !== "";
+    const row = {
+      id: task.id,
+      title: task.title,
+      kind: task.kind,
+      state: task.state,
+      sessionId: task.sessionId,
+      worktreeDirectory: task.worktreeDirectory,
+      branch: task.branch,
+      startRef: task.startRef,
+      prUrl: task.prUrl,
+      hold: task.hold,
+      blockedBy: task.blockedBy,
+      actions: task.actions,
+      reviewHead: task.reviewHead,
+      reportReady,
+      hostArchived
+    };
+    rows.push(row);
+    if (tracked && !hostArchived && task.archiveSessionId !== task.sessionId && ["Done", "Failed", "Idle"].includes(task.state))
+      reviewRows.push(row);
+    if (task.prUrl !== undefined && task.state === "Done" && tracked && hostArchived && reportReady && task.hold === undefined && task.blockedBy === undefined && (task.actions?.length ?? 0) === 0)
+      hasPullCandidates = true;
+  }
+  const fingerprint = (records) => createHash2("sha256").update(JSON.stringify(records.map((record) => JSON.stringify(record)).sort())).digest("hex");
+  return { cleanup: fingerprint(rows), review: fingerprint(reviewRows), hasWorkers, hasReviewCandidates: reviewRows.length > 0, hasPullCandidates };
+}
+
 // service/archive-review.ts
 var reviewIntervalMs = 24 * 60 * 60 * 1000;
+var retryIntervalMs = 5 * 60 * 1000;
 var reviewPrompt = `Scheduled worker-session archival review for this project only.
 
 Read backlog.md and the saved briefs and reports. Follow the charter's cleanup process. Review tracked worker sessions, including legacy entries and board-only End entries. Check live status and evidence before deciding which sessions no longer need review, follow-up, or an open decision. Reconcile missing task IDs or reports before requesting retirement. Age, idle status, and a worker's own done claim aren't completion evidence.
@@ -1288,9 +1339,11 @@ function createArchiveReviewSweep(input) {
     input.failed(slug, reason);
   }
   async function saveProgress(slug, filePath, pending) {
-    const state = { version: 1 };
-    for (const [key, value] of Object.entries(pending.progress))
-      state[key] = new Date(value).toISOString();
+    const state = { version: 2, ...pending.progress };
+    for (const key of ["lastDeliveredAt", "lastReviewAttemptAt", "lastCleanupAttemptAt"]) {
+      if (pending.progress[key] !== undefined)
+        state[key] = new Date(pending.progress[key]).toISOString();
+    }
     await input.filesystem.writeFile(pending.temporaryPath, `${JSON.stringify(state, null, 2)}
 `);
     await input.filesystem.rename(pending.temporaryPath, filePath);
@@ -1307,66 +1360,73 @@ function createArchiveReviewSweep(input) {
       if (normalizeProjectDirectory(registration.homeDirectory) !== homeDirectory)
         throw new Error("archive review project home doesn't match its registration");
       const filePath = archiveReviewPath(homeDirectory);
-      const current = { ...progress.get(slug) };
-      const persisted = {};
+      let persisted = {};
       if (await input.filesystem.exists(filePath)) {
-        let parsed;
         try {
-          parsed = JSON.parse(await input.filesystem.readFile(filePath));
+          persisted = parseProgress(JSON.parse(await input.filesystem.readFile(filePath)));
         } catch {
-          throw new Error(`archive review state is unreadable: ${filePath}`);
-        }
-        if (typeof parsed !== "object" || parsed === null || !("version" in parsed) || parsed.version !== 1 || !("lastDeliveredAt" in parsed) && !("lastCleanupAttemptAt" in parsed)) {
-          throw new Error(`archive review state is invalid: ${filePath}`);
-        }
-        for (const key of ["lastDeliveredAt", "lastCleanupAttemptAt"]) {
-          if (!(key in parsed))
-            continue;
-          if (typeof parsed[key] !== "string" || !Number.isFinite(Date.parse(parsed[key])))
-            throw new Error(`archive review state is invalid: ${filePath}`);
-          persisted[key] = Date.parse(parsed[key]);
-          current[key] = Math.max(current[key] ?? -Infinity, persisted[key]);
+          throw new Error(`archive review state is unreadable or invalid: ${filePath}`);
         }
       }
+      const current = mergeProgress(persisted, progress.get(slug), registration);
       const pendingSave = pendingSaves.get(slug);
       if (pendingSave !== undefined) {
-        if (Object.entries(pendingSave.progress).every(([key, value]) => persisted[key] !== undefined && persisted[key] >= value))
+        if (Object.entries(pendingSave.progress).every(([key, value]) => persisted[key] === value))
           pendingSaves.delete(slug);
         else
           await saveProgress(slug, filePath, pendingSave);
       }
       progress.set(slug, current);
-      if (input.cleanup !== undefined && (current.lastCleanupAttemptAt === undefined || input.nowMs() - current.lastCleanupAttemptAt >= reviewIntervalMs)) {
+      const revision = await loadCleanupRevision({ ...input, registration, coordinatorIds });
+      const cleanupInterval = revision.hasPullCandidates || current.cleanupFailed ? retryIntervalMs : reviewIntervalMs;
+      const cleanupBackoff = current.cleanupFailed && current.lastCleanupAttemptAt !== undefined && input.nowMs() - current.lastCleanupAttemptAt < retryIntervalMs;
+      const cleanupDue = current.cleanupFingerprint !== revision.cleanup || current.lastCleanupAttemptAt === undefined || input.nowMs() - current.lastCleanupAttemptAt >= cleanupInterval;
+      if (input.cleanup !== undefined && cleanupDue && !cleanupBackoff) {
         let attempted = false;
         failures.delete(`${slug}:cleanup`);
         try {
           attempted = await input.cleanup(registration);
+          if (attempted)
+            current.cleanupFailed = false;
         } catch (error) {
           attempted = true;
+          current.cleanupFailed = true;
           reportFailure(`${slug}:cleanup`, error);
         }
         if (attempted) {
           current.lastCleanupAttemptAt = input.nowMs();
-          const pending = { progress: { ...current }, temporaryPath: `${filePath}.${randomUUID3()}.tmp` };
-          pendingSaves.set(slug, pending);
-          await saveProgress(slug, filePath, pending);
+          current.cleanupFingerprint = revision.cleanup;
+          await remember();
         }
       }
-      if (current.lastDeliveredAt !== undefined && input.nowMs() - current.lastDeliveredAt < reviewIntervalMs)
+      if (!revision.hasReviewCandidates && current.reviewFingerprint !== revision.review) {
+        current.reviewFingerprint = revision.review;
+        if (current.lastDeliveredAt !== undefined || current.lastCleanupAttemptAt !== undefined || current.lastReviewAttemptAt !== undefined)
+          await remember();
+      }
+      const reviewBackoff = current.reviewFailed && current.lastReviewAttemptAt !== undefined && input.nowMs() - current.lastReviewAttemptAt < retryIntervalMs;
+      const reviewDue = current.lastDeliveredAt === undefined || input.nowMs() - current.lastDeliveredAt >= reviewIntervalMs || revision.hasReviewCandidates && current.reviewFingerprint !== revision.review;
+      if (!revision.hasWorkers || !reviewDue || reviewBackoff)
         return;
-      const backlog = await loadBacklog(input.filesystem, `${homeDirectory}/backlog.md`);
-      if (backlog.errors.length > 0)
-        throw new Error("archive review is waiting for a readable backlog without malformed entries");
-      const archived = await loadHostArchivedSessionIds(input.filesystem, input.homeRoot, slug);
-      if (!backlog.tasks.some((task) => task.sessionId !== undefined && !coordinatorIds.has(task.sessionId) && !archived.has(task.sessionId)))
-        return;
-      if (!await input.deliver(registration, reviewPrompt))
-        return;
-      const completedAt = input.nowMs();
-      current.lastDeliveredAt = completedAt;
-      const pending = { progress: { ...current }, temporaryPath: `${filePath}.${randomUUID3()}.tmp` };
-      pendingSaves.set(slug, pending);
-      await saveProgress(slug, filePath, pending);
+      failures.delete(`${slug}:review`);
+      try {
+        if (!await input.deliver(registration, reviewPrompt))
+          return;
+        current.lastDeliveredAt = input.nowMs();
+        current.reviewFingerprint = revision.review;
+        current.reviewFailed = false;
+      } catch (error) {
+        current.reviewFailed = true;
+        reportFailure(`${slug}:review`, error);
+      }
+      current.lastReviewAttemptAt = input.nowMs();
+      await remember();
+      async function remember() {
+        progress.set(slug, { ...current });
+        const pending = { progress: { ...current }, temporaryPath: pendingSaves.get(slug)?.temporaryPath ?? `${filePath}.${randomUUID3()}.tmp` };
+        pendingSaves.set(slug, pending);
+        await saveProgress(slug, filePath, pending);
+      }
     } catch (error) {
       reportFailure(slug, error);
     } finally {
@@ -1383,6 +1443,61 @@ function createArchiveReviewSweep(input) {
     }
   }
   return { check };
+}
+function parseProgress(parsed) {
+  if (typeof parsed !== "object" || parsed === null || !("version" in parsed) || ![1, 2].includes(parsed.version))
+    throw new Error("invalid review state");
+  const value = parsed;
+  const result = {};
+  for (const key of ["lastDeliveredAt", "lastReviewAttemptAt", "lastCleanupAttemptAt"]) {
+    if (!(key in value))
+      continue;
+    if (typeof value[key] !== "string" || !Number.isFinite(Date.parse(value[key])))
+      throw new Error("invalid review timestamp");
+    result[key] = Date.parse(value[key]);
+  }
+  if (result.lastDeliveredAt === undefined && result.lastReviewAttemptAt === undefined && result.lastCleanupAttemptAt === undefined)
+    throw new Error("missing review timestamp");
+  if (value.version === 1)
+    return result;
+  for (const key of ["coordinatorSessionId", "projectDirectory"]) {
+    if (typeof value[key] !== "string" || value[key] === "")
+      throw new Error("missing review scope");
+    result[key] = value[key];
+  }
+  for (const key of ["reviewFingerprint", "cleanupFingerprint"]) {
+    if (!(key in value))
+      continue;
+    if (typeof value[key] !== "string" || !/^[a-f0-9]{64}$/.test(value[key]))
+      throw new Error("invalid review fingerprint");
+    result[key] = value[key];
+  }
+  for (const key of ["reviewFailed", "cleanupFailed"]) {
+    if (!(key in value))
+      continue;
+    if (typeof value[key] !== "boolean")
+      throw new Error("invalid review retry state");
+    result[key] = value[key];
+  }
+  return result;
+}
+function mergeProgress(persisted, local, registration) {
+  const matchesScope = (entry) => entry.coordinatorSessionId === undefined || entry.coordinatorSessionId === registration.coordinatorSessionId && entry.projectDirectory === registration.projectDirectory;
+  const disk = matchesScope(persisted) ? persisted : {};
+  const memory = local !== undefined && matchesScope(local) ? local : {};
+  const review = (memory.lastReviewAttemptAt ?? memory.lastDeliveredAt ?? -Infinity) >= (disk.lastReviewAttemptAt ?? disk.lastDeliveredAt ?? -Infinity) ? memory : disk;
+  const cleanup = (memory.lastCleanupAttemptAt ?? -Infinity) >= (disk.lastCleanupAttemptAt ?? -Infinity) ? memory : disk;
+  return {
+    coordinatorSessionId: registration.coordinatorSessionId,
+    projectDirectory: registration.projectDirectory,
+    lastDeliveredAt: review.lastDeliveredAt,
+    lastReviewAttemptAt: review.lastReviewAttemptAt,
+    reviewFingerprint: review.reviewFingerprint,
+    reviewFailed: review.reviewFailed,
+    lastCleanupAttemptAt: cleanup.lastCleanupAttemptAt,
+    cleanupFingerprint: cleanup.cleanupFingerprint,
+    cleanupFailed: cleanup.cleanupFailed
+  };
 }
 
 // service/pr-cleanup.ts
@@ -1879,7 +1994,7 @@ function truncateLastWord(text) {
 }
 
 // service/captain-alerts.ts
-import { createHash as createHash2 } from "node:crypto";
+import { createHash as createHash3 } from "node:crypto";
 
 // service/notifications.ts
 async function notifyCaptain(input) {
@@ -1950,7 +2065,7 @@ function createCaptainAlerts(input) {
     }
     try {
       for (const task of decisions) {
-        const signature = createHash2("sha256").update(JSON.stringify([
+        const signature = createHash3("sha256").update(JSON.stringify([
           task.title,
           task.hold,
           task.actions,
@@ -3646,11 +3761,9 @@ var archiveReviewSweep = createArchiveReviewSweep({
   nowMs: clock.nowMs,
   cleanup: (registration) => withProjectLifecycle(homeRoot, async () => {
     const current = (await loadRegistry(nodeFileSystem, homeRoot))[registration.slug];
-    if (current === undefined)
+    if (current === undefined || current.coordinatorSessionId !== registration.coordinatorSessionId || current.homeDirectory !== registration.homeDirectory || current.projectDirectory !== registration.projectDirectory)
       return false;
     const status = await sessionStatus(nodeExec, { sessionId: current.coordinatorSessionId, directory: current.homeDirectory });
-    if (status.activity === "unknown")
-      throw new Error("PR cleanup is waiting for a verified idle first mate");
     if (status.activity !== "idle")
       return false;
     const unlinked = await cleanupCoordinatorPullRequests({
@@ -3667,11 +3780,9 @@ var archiveReviewSweep = createArchiveReviewSweep({
   }),
   deliver: (registration, prompt) => withProjectLifecycle(homeRoot, async () => {
     const current = (await loadRegistry(nodeFileSystem, homeRoot))[registration.slug];
-    if (current === undefined)
+    if (current === undefined || current.coordinatorSessionId !== registration.coordinatorSessionId || current.homeDirectory !== registration.homeDirectory || current.projectDirectory !== registration.projectDirectory)
       return false;
     const status = await sessionStatus(nodeExec, { sessionId: current.coordinatorSessionId, directory: current.homeDirectory });
-    if (status.activity === "unknown")
-      throw new Error("archive review is waiting for a verified idle coordinator");
     if (status.activity !== "idle")
       return false;
     try {

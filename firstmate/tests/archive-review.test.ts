@@ -44,7 +44,7 @@ function fixture() {
   }
 }
 
-describe("daily coordinator archival review", () => {
+describe("coordinator archival review and daily fallback", () => {
   test("requests review of legacy tracked workers on first check, without changing their backlog or archival state", async () => {
     const { filesystem, registration, deliveries, create } = fixture()
     const backlogBefore = filesystem.fileContents(`${registration.homeDirectory}/backlog.md`)
@@ -58,7 +58,7 @@ describe("daily coordinator archival review", () => {
     expect(prompt).toContain("Don't start, steer, interrupt, or relaunch workers")
     expect(filesystem.fileContents(`${registration.homeDirectory}/backlog.md`)).toBe(backlogBefore)
     expect(await filesystem.port.exists(`${registration.homeDirectory}/reports/archive.jsonl`)).toBe(false)
-    expect(JSON.parse(filesystem.fileContents(archiveReviewPath(registration.homeDirectory)))).toEqual({ version: 1, lastDeliveredAt: new Date(start).toISOString() })
+    expect(JSON.parse(filesystem.fileContents(archiveReviewPath(registration.homeDirectory)))).toMatchObject({ version: 2, coordinatorSessionId: registration.coordinatorSessionId, lastDeliveredAt: new Date(start).toISOString() })
     expect(filesystem.renames.some((rename) => rename.toPath === archiveReviewPath(registration.homeDirectory))).toBe(true)
   })
 
@@ -111,17 +111,19 @@ describe("daily coordinator archival review", () => {
     expect(await filesystem.port.exists(archiveReviewPath(registration.homeDirectory))).toBe(true)
   })
 
-  test("a failed send stays due, and repeated identical failures are reported once", async () => {
-    const { filesystem, registration, deliveries, errors, create, setDeliver } = fixture()
+  test("a failed send persists bounded retry backoff without claiming delivery", async () => {
+    const { filesystem, registration, deliveries, errors, create, setDeliver, setNow } = fixture()
     const sweep = create()
     setDeliver(async () => { throw new Error("host offline") })
     await sweep.check()
     await sweep.check()
-    expect(errors).toEqual([{ slug: "app", reason: "host offline" }])
-    expect(await filesystem.port.exists(archiveReviewPath(registration.homeDirectory))).toBe(false)
+    expect(errors).toEqual([{ slug: "app:review", reason: "host offline" }])
+    expect(JSON.parse(filesystem.fileContents(archiveReviewPath(registration.homeDirectory))).lastDeliveredAt).toBeUndefined()
+    expect(deliveries).toHaveLength(1)
     setDeliver(async () => true)
+    setNow(start + 5 * 60 * 1000)
     await sweep.check()
-    expect(deliveries).toHaveLength(3)
+    expect(deliveries).toHaveLength(2)
   })
 
   test("a slow project's delivery doesn't stop another project's review", async () => {
@@ -235,7 +237,7 @@ describe("daily coordinator archival review", () => {
     await create().check()
     expect(cleaned).toEqual([registration.coordinatorSessionId])
     expect(deliveries).toHaveLength(0)
-    expect(JSON.parse(filesystem.fileContents(archiveReviewPath(registration.homeDirectory)))).toEqual({ version: 1, lastCleanupAttemptAt: new Date(start).toISOString() })
+    expect(JSON.parse(filesystem.fileContents(archiveReviewPath(registration.homeDirectory)))).toMatchObject({ version: 2, lastCleanupAttemptAt: new Date(start).toISOString() })
     const restarted = create()
     await restarted.check()
     setNow(start + day)
@@ -251,10 +253,10 @@ describe("daily coordinator archival review", () => {
     await create().check()
     expect(cleaned).toBe(true)
     expect(deliveries).toHaveLength(1)
-    expect(JSON.parse(filesystem.fileContents(archiveReviewPath(registration.homeDirectory)))).toEqual({ version: 1, lastDeliveredAt: new Date(start).toISOString(), lastCleanupAttemptAt: new Date(start).toISOString() })
+    expect(JSON.parse(filesystem.fileContents(archiveReviewPath(registration.homeDirectory)))).toMatchObject({ version: 2, lastDeliveredAt: new Date(start).toISOString(), lastCleanupAttemptAt: new Date(start).toISOString() })
   })
 
-  test("defers busy cleanup and bounds failed cleanup to one attempt a day without blocking archival review", async () => {
+  test("defers busy cleanup and backs off failed cleanup without blocking archival review", async () => {
     const { filesystem, registration, deliveries, errors, create, setCleanup, setDeliver, setNow } = fixture()
     let attempts = 0
     let activity = "busy"

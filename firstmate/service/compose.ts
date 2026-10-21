@@ -68,7 +68,7 @@ ${headerLines.join("\n")}
   const pullRequestCleanup = [
     "## PR link cleanup",
     `During cleanup audits, run \`${cleanupCommand}\` from this registered FirstMate home. This calls the extension's guarded merged-PR cleanup directly, including from your own active turn. It accepts no session or URL overrides.`,
-    "Read the JSON result and record only confirmed removals. An empty list doesn't mean every link or task is resolved. Keep unknown, unmerged, held, or untracked links and report concrete blockers. This command doesn't delete repository content or change worker sessions. The daily service pass remains a fallback; custom charter wording doesn't hide this callable command.",
+    "Read the JSON result and record only confirmed removals. An empty list doesn't mean every link or task is resolved. Keep unknown, unmerged, held, or untracked links and report concrete blockers. This command doesn't delete repository content or change worker sessions. The automatic service pass remains a fallback; custom charter wording doesn't hide this callable command.",
   ].join("\n\n")
   const cleanupRunbook = fileURLToPath(new URL("../templates/cleanup-worker.md", import.meta.url))
   const cleanupRunner = fileURLToPath(new URL("../scripts/worktree-cleanup.js", import.meta.url))

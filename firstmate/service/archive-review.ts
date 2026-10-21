@@ -19,6 +19,8 @@ const reviewPrompt = `Scheduled worker-session archival review for this project 
 
 Read backlog.md and the saved briefs and reports. Follow the charter's cleanup process. Review tracked worker sessions, including legacy entries and board-only End entries. Check live status and evidence before deciding which sessions no longer need review, follow-up, or an open decision. Reconcile missing task IDs or reports before requesting retirement. Age, idle status, and a worker's own done claim aren't completion evidence.
 
+Run the guarded command in the composed PR link cleanup instructions as part of this audit. Record its confirmed removals, keep unresolved links, and report failures. It changes only coordinator link metadata and never authorizes repository deletion.
+
 Respect the captain's orders and requests to keep sessions active. Save checked results, evidence and message links, session/worktree references, and the retirement reason in reports/<id>.md. Only for a genuinely Done task with no remaining dependency, hold, or answer action, add archive-session: <exact current session id> to its backlog entry. The service checks ownership, a saved report, idle status, and pending questions/permissions. Wait for its confirmation before claiming archival. Leave failed archive attempts paused until their failure has been reconciled.
 
 Keep running, waiting, failed, unknown, or unresolved workers available. Leave untracked sessions untouched. Don't start, steer, interrupt, or relaunch workers. This review doesn't authorize landing, scope expansion, deletion, discard, or repository cleanup. Preserve conversations, branches, worktrees, and existing evidence. Keep routine no-change results quiet; report real failures or decisions.`

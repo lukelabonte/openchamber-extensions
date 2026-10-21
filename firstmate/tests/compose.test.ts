@@ -127,4 +127,14 @@ describe("composeInstructions", () => {
     expect(composed).toContain("stop before dispatch or resume")
     expect(composed).toContain("Never retry by dropping `model` or `variant`")
   })
+
+  test("exposes the guarded PR cleanup command even when the shared charter was customized", async () => {
+    const filesystem = new InMemoryFileSystem()
+    filesystem.seedFile("/home/firstmate/shared/charter.md", "CUSTOM CHARTER")
+    const composed = await composeInstructions({ filesystem: filesystem.port, homeRoot: "/home/firstmate", slug: "sunrise" })
+    expect(composed).toContain("## PR link cleanup")
+    expect(composed).toContain("scripts/cleanup-pr-links.js")
+    expect(composed).toContain("from your own active turn")
+    expect(composed).toContain("An empty list doesn't mean every link or task is resolved")
+  })
 })

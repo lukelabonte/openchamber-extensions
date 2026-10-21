@@ -628,6 +628,7 @@ async function saveProjectSettings(filesystem, homeDirectory, value) {
 }
 
 // service/compose.ts
+import { fileURLToPath } from "node:url";
 async function composeInstructions(input) {
   const { filesystem, homeRoot, slug } = input;
   const relativePaths = [
@@ -680,6 +681,14 @@ ${layer.contents}`).join(`
   ].join(`
 
 `);
+  const cleanupCommand = `node ${JSON.stringify(fileURLToPath(new URL("../scripts/cleanup-pr-links.js", import.meta.url)))}`;
+  const pullRequestCleanup = [
+    "## PR link cleanup",
+    `During cleanup audits, run \`${cleanupCommand}\` from this registered FirstMate home. This calls the extension's guarded merged-PR cleanup directly, including from your own active turn. It accepts no session or URL overrides.`,
+    "Read the JSON result and record only confirmed removals. An empty list doesn't mean every link or task is resolved. Keep unknown, unmerged, held, or untracked links and report concrete blockers. This command doesn't delete repository content or change worker sessions. The daily service pass remains a fallback; custom charter wording doesn't hide this callable command."
+  ].join(`
+
+`);
   const composed = `${header}
 
 ${body}
@@ -689,6 +698,8 @@ ${sessionTitles}
 ${workerSelection}
 
 ${captainAttention}
+
+${pullRequestCleanup}
 `;
   const filePath = `${homeRoot}/projects/${slug}/AGENTS.md`;
   const temporaryPath = `${filePath}.${randomUUID()}.tmp`;
@@ -879,7 +890,7 @@ async function acknowledgeTemplateUpgrade(input) {
 // service/provision.ts
 var sharedDirectories = ["watches"];
 var legacyTemplateHashes = {
-  charter: ["44c30fc03a72d0e3db47f520f77e9d2f256a8595da0c4a92a3613ba8d0bf4bd9", "f2a01f5f4d7e76a63bd026ebda14ecceee56c266aa2c8547af3e8b1430bf7c5b"],
+  charter: ["44c30fc03a72d0e3db47f520f77e9d2f256a8595da0c4a92a3613ba8d0bf4bd9", "f2a01f5f4d7e76a63bd026ebda14ecceee56c266aa2c8547af3e8b1430bf7c5b", "26ec3644f04dd682108b932ce183734b3dcaf9bba607c402da7adfde985d5d3b"],
   "pr-watch": ["436ce74feaf4fcb7beaeca787e30b0434ed2a5feeb0e4222540852c6b103fbbe"]
 };
 var sharedFiles = [
@@ -1243,6 +1254,8 @@ var reviewIntervalMs = 24 * 60 * 60 * 1000;
 var reviewPrompt = `Scheduled worker-session archival review for this project only.
 
 Read backlog.md and the saved briefs and reports. Follow the charter's cleanup process. Review tracked worker sessions, including legacy entries and board-only End entries. Check live status and evidence before deciding which sessions no longer need review, follow-up, or an open decision. Reconcile missing task IDs or reports before requesting retirement. Age, idle status, and a worker's own done claim aren't completion evidence.
+
+Run the guarded command in the composed PR link cleanup instructions as part of this audit. Record its confirmed removals, keep unresolved links, and report failures. It changes only coordinator link metadata and never authorizes repository deletion.
 
 Respect the captain's orders and requests to keep sessions active. Save checked results, evidence and message links, session/worktree references, and the retirement reason in reports/<id>.md. Only for a genuinely Done task with no remaining dependency, hold, or answer action, add archive-session: <exact current session id> to its backlog entry. The service checks ownership, a saved report, idle status, and pending questions/permissions. Wait for its confirmation before claiming archival. Leave failed archive attempts paused until their failure has been reconciled.
 

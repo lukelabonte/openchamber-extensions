@@ -1,6 +1,7 @@
 import type { FileSystemPort } from "./file-system"
 import { randomUUID } from "node:crypto"
 import { loadProjectSettings } from "./settings"
+import { fileURLToPath } from "node:url"
 
 interface ComposeInstructionsInput {
   filesystem: FileSystemPort
@@ -63,7 +64,13 @@ ${headerLines.join("\n")}
     "When the captain must decide, record a backlog entry with `id:`, a concrete `hold:`, and standalone `actions:`. State the actual question, why the captain's authority is needed, the options and consequences, and your recommendation in the first mate chat. Use `state: Blocked` only when the captain's answer is needed now. A separate `kind: captain` decision can also be Queued. Resolve prerequisite tasks before requesting that decision. A hold on ongoing work isn't a request for attention; keep that work Working until the decision is ready.",
     "The service alerts the captain for these ready decisions and opens your chat, not the worker. Unchanged decisions stay quiet across service restarts. After interpreting an answer, record its scope and clear only the resolved hold and actions. If a decision changes, update its hold, actions, PR URL, or reviewed head so the next alert describes the new gate.",
   ].join("\n\n")
-  const composed = `${header}\n\n${body}\n\n${sessionTitles}\n\n${workerSelection}\n\n${captainAttention}\n`
+  const cleanupCommand = `node ${JSON.stringify(fileURLToPath(new URL("../scripts/cleanup-pr-links.js", import.meta.url)))}`
+  const pullRequestCleanup = [
+    "## PR link cleanup",
+    `During cleanup audits, run \`${cleanupCommand}\` from this registered FirstMate home. This calls the extension's guarded merged-PR cleanup directly, including from your own active turn. It accepts no session or URL overrides.`,
+    "Read the JSON result and record only confirmed removals. An empty list doesn't mean every link or task is resolved. Keep unknown, unmerged, held, or untracked links and report concrete blockers. This command doesn't delete repository content or change worker sessions. The daily service pass remains a fallback; custom charter wording doesn't hide this callable command.",
+  ].join("\n\n")
+  const composed = `${header}\n\n${body}\n\n${sessionTitles}\n\n${workerSelection}\n\n${captainAttention}\n\n${pullRequestCleanup}\n`
   const filePath = `${homeRoot}/projects/${slug}/AGENTS.md`
   const temporaryPath = `${filePath}.${randomUUID()}.tmp`
   await filesystem.writeFile(temporaryPath, composed)

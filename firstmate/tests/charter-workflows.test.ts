@@ -106,7 +106,7 @@ describe("FirstMate charter workflows", () => {
     expect(charter).toContain("every backlog task referencing that PR is Done")
     expect(charter).toContain("a confirmed host-archived worker")
     expect(charter).toContain("requests to retain a PR link as a task `hold:`")
-    expect(charter).toContain("It preserves worker links and all saved PR URLs")
+    expect(charter).toContain("preserve worker links and all saved PR URLs")
     expect(charter).toContain("Unlinking isn't repository cleanup")
     expect(charter).toContain("both implementation and landing workers")
     expect(charter).toContain("confirmed complete, intentionally retained, or blocked with an owner and next decision")

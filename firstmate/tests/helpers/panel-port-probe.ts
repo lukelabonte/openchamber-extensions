@@ -51,7 +51,10 @@ export async function runPortScenario(name: string): Promise<Record<string, unkn
     onSession: (callback: typeof sessionChanged) => { sessionChanged = callback; return () => {} },
     listProjects: async () => ({ projects: [{ id: "p-a", directory: "/repos/a" }, { id: "p-b", directory: "/repos/b" }] }),
     onSessions: async (_projectId: string, callback: typeof sessionsChanged) => { sessionsChanged = callback; return () => {} },
-    openSession: async (sessionId: string) => { opened.push(sessionId) },
+    openSession: async (sessionId: string) => {
+      if (name === "worker-list-error") throw new Error("navigation failed")
+      opened.push(sessionId)
+    },
     openUrl: async () => {},
     writeClipboard: async (contents: string) => { copied.push(contents) },
     onRunningShells: name.startsWith("shell-") ? async (scope: { kind: string; sessionId: string }, listener: (snapshot: unknown) => void) => {
@@ -179,11 +182,88 @@ export async function runPortScenario(name: string): Promise<Record<string, unkn
   if (name === "stale-settings") holds.add("/settings:proj-a")
   if (name === "stale-lookup") holds.add("/lookup:")
   if (name === "board-initial-superseded") holds.add("/board:proj-a")
+  if (name === "worker-list-refresh") holds.add("/board:proj-a")
+  if (name === "worker-list") workers.push(
+    { title: "Duplicate A", state: "Working", sessionId: "ses-worker-a", worktree: "/trees/a" },
+    { title: "Previously done", state: "Done", sessionId: "ses-Idle", worktree: "/trees/Idle" },
+    ...["Queued", "Idle", "Parked", "Done", "Failed"].map((state) => ({ title: `${state} worker`, state, sessionId: `ses-${state}`, worktree: `/trees/${state}` })),
+    { title: "Not dispatched", state: "Queued", sessionId: "", worktree: "" },
+  )
+  if (name === "worker-list") {
+    workers[1]!.title = "<script>Worker A</script>"
+    workers[2]!.state = "Blocked"
+  }
   ready({ directory: name === "worker" ? "/trees/a" : name === "home-release" ? "/home/a" : "/repos/a", session: name === "worker" ? { id: "ses-worker-a" } : null })
   await flush()
   let extra: Record<string, unknown> = {}
 
   switch (name) {
+    case "worker-list": {
+      const picker = () => findFirst(fake.root, (element) => element.className === "fm-worker-picker")!
+      const toggle = () => findFirst(picker(), (element) => element.tagName === "button")!
+      const rows = () => all((element) => element.tagName === "button" && element.className.split(" ").includes("fm-worker-link"))
+      const count = toggle().textContent
+      const initialExpanded = toggle().attributes.get("aria-expanded")
+      toggle().click()
+      const expanded = toggle().attributes.get("aria-expanded")
+      const rowCount = rows().length
+      const listText = collectText(picker())
+      rows().find((row) => collectText(row).includes("<script>Worker A</script>"))!.click()
+      await flush()
+      sessionChanged({ id: "ses-worker-a" })
+      const current = rows().find((row) => collectText(row).includes("<script>Worker A</script>"))!.attributes.get("aria-current")
+      const workerExpanded = toggle().attributes.get("aria-expanded")
+      rows().find((row) => collectText(row).includes("Worker B"))!.click()
+      await flush()
+      toggle().click()
+      extra = { count, initialExpanded, expanded, rowCount, listText, current, workerExpanded, collapsed: toggle().attributes.get("aria-expanded"), opened }
+      break
+    }
+    case "worker-list-refresh": {
+      const picker = () => findFirst(fake.root, (element) => element.className === "fm-worker-picker")!
+      const toggle = () => findFirst(picker(), (element) => element.tagName === "button")!
+      const rows = () => all((element) => element.tagName === "button" && element.className.split(" ").includes("fm-worker-link"))
+      const loading = toggle().textContent
+      const loadingDisabled = toggle().disabled
+      release("/board:proj-a", {}, 500)
+      await flush()
+      const unavailable = toggle().textContent
+      await refresh()
+      toggle().click()
+      failures.add("/board")
+      await refresh()
+      const stale = toggle().textContent
+      const staleRows = rows().length
+      failures.delete("/board")
+      workers.splice(1, 1)
+      sessionsChanged({ state: "ready", sessions: [] })
+      fake.advanceClock(1_000)
+      await flush()
+      const updated = toggle().textContent
+      const updatedRows = rows().length
+      const updatedExpanded = toggle().attributes.get("aria-expanded")
+      directoryChanged("/repos/b")
+      await flush()
+      const newProjectExpanded = toggle().attributes.get("aria-expanded")
+      workers.splice(0, workers.length)
+      await refresh()
+      toggle().click()
+      extra = { loading, loadingDisabled, unavailable, stale, staleRows, updated, updatedRows, updatedExpanded, newProjectExpanded, empty: toggle().textContent, emptyText: collectText(picker()) }
+      break
+    }
+    case "worker-list-error": {
+      const toggle = () => findFirst(fake.root, (element) => element.className === "fm-worker-picker")!.children[0]!
+      toggle().click()
+      all((element) => element.tagName === "button" && element.className.split(" ").includes("fm-worker-link"))[0]!.click()
+      await flush()
+      const failureText = collectText(fake.root)
+      await refresh()
+      const afterRefreshText = collectText(fake.root)
+      directoryChanged("/repos/b")
+      await flush()
+      extra = { failureText, afterRefreshText, newProjectText: collectText(fake.root) }
+      break
+    }
     case "shell-view":
     case "shell-removal": {
       const settingsInput = field("Coordinator model")
@@ -723,7 +803,10 @@ export async function runPortScenario(name: string): Promise<Record<string, unkn
       extra = { launch: posts().find((post) => post.path === "/launch")?.body }
       break
     case "worker": {
-      const workerText = collectText(fake.root)
+      // The fleet picker deliberately lists other workers. Task controls below
+      // it must still be limited to the current worker's card.
+      const taskText = () => fake.root.children.filter((element) => element.className !== "fm-worker-picker").map(collectText).join("")
+      const workerText = taskText()
       type("Note for first mate", "A note for the first mate")
       button("Send note to first mate").click()
       await flush()
@@ -731,7 +814,7 @@ export async function runPortScenario(name: string): Promise<Record<string, unkn
       await flush()
       sessionChanged({ id: "ses-worker-b" })
       await flush()
-      const afterSessionChange = collectText(fake.root)
+      const afterSessionChange = taskText()
       ready({ directory: "/trees/a", session: { id: "unrelated" } })
       await flush()
       extra = { workerText, opened, afterSessionChange, afterUnrelatedSession: collectText(fake.root) }

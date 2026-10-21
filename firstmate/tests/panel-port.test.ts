@@ -27,6 +27,44 @@ if (probeScenario !== undefined) {
   }
 
   describe("FirstMate panel parity port", () => {
+    test("the worker picker counts unique unfinished sessions and opens a row from coordinator or worker context", async () => {
+      const result = await runScenario("worker-list")
+      expect(result.count).toBe("4 active workers")
+      expect(result.initialExpanded).toBe("false")
+      expect(result.expanded).toBe("true")
+      expect(result.rowCount).toBe(7)
+      expect(result.listText).toContain("<script>Worker A</script>")
+      expect(result.listText).not.toContain("Previously done")
+      for (const state of ["Queued", "Working", "Blocked", "Idle", "Parked", "Done", "Failed"]) expect(result.listText).toContain(state)
+      expect(result.opened).toEqual(["ses-worker-a", "ses-worker-b"])
+      expect(result.current).toBe("true")
+      expect(result.workerExpanded).toBe("true")
+      expect(result.collapsed).toBe("false")
+      expect(result.innerHtmlWrites).toBe(0)
+    })
+
+    test("the worker picker distinguishes loading, unavailable, stale and empty data, and resets on project changes", async () => {
+      const result = await runScenario("worker-list-refresh")
+      expect(result.loading).toBe("Workers loading…")
+      expect(result.loadingDisabled).toBe(true)
+      expect(result.unavailable).toBe("Workers unavailable")
+      expect(result.stale).toBe("2 active workers (stale)")
+      expect(result.staleRows).toBe(2)
+      expect(result.updated).toBe("1 active worker")
+      expect(result.updatedRows).toBe(1)
+      expect(result.updatedExpanded).toBe("true")
+      expect(result.newProjectExpanded).toBe("false")
+      expect(result.empty).toBe("0 active workers")
+      expect(result.emptyText).toContain("No worker sessions yet.")
+    })
+
+    test("failed worker navigation is visible without an unhandled rejection and clears on project changes", async () => {
+      const result = await runScenario("worker-list-error")
+      expect(result.failureText).toContain("Could not open the worker session. Try again.")
+      expect(result.afterRefreshText).toContain("Could not open the worker session. Try again.")
+      expect(result.newProjectText).not.toContain("Could not open the worker session")
+    })
+
     test.each(["shell-view", "shell-removal"])("worker commands are scoped and released on project change or card removal: %s", async (scenario) => {
       const result = await runScenario(scenario)
       expect(result.shellScopes).toEqual([{ kind: "session", sessionId: "ses-worker-a" }])

@@ -4,6 +4,7 @@ import { parseBoardWorkers, parseSupervision, type BoardCard, type BoardColumn, 
 import { moveColumn, parseColumnOrder } from "./column-order"
 import { workerMessageLink } from "../service/message-links"
 import { createWorkerShells } from "./worker-shells"
+import { createWorkerList } from "./worker-list"
 import { parseShipping, shippingBadgeLabel, type LandingRow, type ShippingInfo } from "./shipping"
 import { parseSuggestions, type SuggestionRow } from "./suggestions"
 import { initialPanelState, reducePanelState, type Board, type PanelEvent, type PanelState, type RegistrationInfo } from "./state"
@@ -32,6 +33,7 @@ let boardRequestGeneration = 0
 let contextGeneration = 0
 let currentSessionId: string | null = null
 const workerShells = createWorkerShells(host)
+const workerList = createWorkerList((sessionId) => host.openSession(sessionId))
 
 interface ProjectSettings {
   coordinatorModel: string
@@ -209,6 +211,7 @@ function applySettings(settings: ProjectSettings, registration: RegistrationInfo
 
 function stopBoardFlow(): void {
   workerShells.reset()
+  workerList.reset()
   activeRegistration = null
   unsubscribeSessions?.()
   unsubscribeSessions = null
@@ -888,6 +891,7 @@ function render(state: PanelState): void {
       root.append(text("Launching the first mate…"))
       break
     case "registered":
+      root.append(workerList.render(state.board, currentSessionId))
       if (state.board.kind === "ready") {
         const cards = state.board.columns.flatMap((column) => column.cards)
         const currentWorker = cards.find((card) => card.sessionId !== undefined && card.sessionId === currentSessionId)

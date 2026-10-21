@@ -108,6 +108,44 @@
         margin: 10px 0;
       }
 
+      .fm-worker-links {
+        list-style: none;
+        margin: 8px 0 0;
+        padding: 0;
+        display: grid;
+        gap: 6px;
+        max-height: 320px;
+        overflow-y: auto;
+      }
+
+      button.fm-button.fm-worker-link {
+        width: 100%;
+        min-height: 44px;
+        padding: 8px 10px;
+        justify-content: space-between;
+        gap: 10px;
+        text-align: left;
+        white-space: normal;
+        line-height: 1.4;
+      }
+
+      button.fm-worker-link[aria-current="true"] {
+        border-color: var(--fm-accent);
+      }
+
+      .fm-worker-link-title {
+        overflow-wrap: anywhere;
+      }
+
+      .fm-worker-link-state {
+        flex-shrink: 0;
+        color: var(--fm-muted);
+      }
+
+      .fm-worker-list-warning {
+        color: var(--fm-warning);
+      }
+
       .fm-card {
         display: flex;
         flex-direction: column;

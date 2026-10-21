@@ -40,6 +40,20 @@ function launchInput(input: ReturnType<typeof fixture>["input"]) {
 }
 
 describe("FirstMate lifecycle", () => {
+  test("adoption and restart remain usable when the CLI lacks sidebar association support", async () => {
+    for (const operation of [(input: ReturnType<typeof fixture>["input"]) => adoptFirstMate({ ...input, sessionId: "ses_candidate" }), restartFirstMate]) {
+      const { input, filesystem, exec } = fixture()
+      input.exec = async (command, args) => {
+        if (args[1] === "associate-project") throw new Error("openchamber exited with code 1: Unknown option: --display-project-dir")
+        return exec(command, args)
+      }
+      const result = await operation(input)
+      expect(result.registration.homeDirectory).toBe(homeDirectory)
+      expect(JSON.parse(filesystem.fileContents(`${homeRoot}/registry.json`)).sunrise).toEqual(result.registration)
+      expect(JSON.parse(filesystem.fileContents(`${homeDirectory}/settings.json`)).coordinatorSessionId).toBe(result.registration.coordinatorSessionId)
+    }
+  })
+
   test("adopts a directory-listed idle session and preserves unrelated settings", async () => {
     const { filesystem, input, calls } = fixture()
     const result = await adoptFirstMate({ ...input, sessionId: "ses_candidate" })

@@ -1,4 +1,4 @@
-import { associateSessionProject, MissingCliError, type ExecRunner } from "./control-client"
+import { associateSessionProject, MissingCliError, UnsupportedSessionProjectError, type ExecRunner } from "./control-client"
 import type { FileSystemPort } from "./file-system"
 import { loadRegistry, type Registration } from "./registry"
 
@@ -10,6 +10,9 @@ export async function associateFirstMateSession(exec: ExecRunner, registration: 
       projectDirectory: registration.projectDirectory,
     })
   } catch (error) {
+    // Display ownership is optional. Older CLIs cannot group a home-rooted
+    // chat under its managed project, but the first mate remains usable.
+    if (error instanceof UnsupportedSessionProjectError) return
     if (error instanceof MissingCliError) throw error
     throw new Error(`first mate ${registration.coordinatorSessionId} is saved, but its sidebar project association failed: ${error instanceof Error ? error.message : String(error)}`)
   }

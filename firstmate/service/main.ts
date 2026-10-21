@@ -10,7 +10,7 @@ import { cleanupCoordinatorPullRequests } from "./pr-cleanup"
 import { loadBacklog, type BacklogTask } from "./backlog"
 import { composeInstructions } from "./compose"
 import { createNodeClock } from "./clock"
-import { MissingCliError, SessionBusyError, sessionSend, sessionStatus, type ExecRunner } from "./control-client"
+import { controlErrorMessage, MissingCliError, SessionBusyError, sessionSend, sessionStatus, type ExecRunner } from "./control-client"
 import { sendTaskDecision } from "./decisions"
 import { handoffToFirstMate, resolveProjectRegistration } from "./handoff"
 import type { FileSystemPort } from "./file-system"
@@ -113,7 +113,8 @@ const nodeExec: ExecRunner = (command, args) =>
         return
       }
       const stderr = Buffer.concat(stderrChunks).toString("utf8").trim()
-      reject(new Error(`${command} exited with code ${code}${stderr === "" ? "" : `: ${stderr}`}`))
+      const detail = (command === "openchamber" && args.includes("--json") ? controlErrorMessage(Buffer.concat(stdoutChunks).toString("utf8")) : undefined) ?? stderr
+      reject(new Error(`${command} exited with code ${code}${detail === undefined || detail === "" ? "" : `: ${detail}`}`))
     })
   })
 

@@ -16,6 +16,13 @@ export class SessionBusyError extends Error {
   }
 }
 
+export class UnsupportedSessionProjectError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = "UnsupportedSessionProjectError"
+  }
+}
+
 export type SessionActivity = "unknown" | "idle" | "running" | "retrying" | "waiting-permission" | "waiting-question"
 
 export type SessionOutcome = "completed" | "failed" | null
@@ -50,12 +57,20 @@ export async function createSession(exec: ExecRunner, input: { directory: string
 }
 
 export async function associateSessionProject(exec: ExecRunner, input: { sessionId: string; directory: string; projectDirectory: string }): Promise<void> {
-  const output = await runControlCommand(exec, [
-    "session", "associate-project", "--session", input.sessionId, "--dir", input.directory,
-    "--display-project-dir", input.projectDirectory, "--json",
-  ])
-  const parsed = parseJsonOutput(output)
-  if (extractSessionId(parsed) !== input.sessionId) throw new Error("openchamber session associate-project returned a different session id")
+  try {
+    const output = await runControlCommand(exec, [
+      "session", "associate-project", "--session", input.sessionId, "--dir", input.directory,
+      "--display-project-dir", input.projectDirectory, "--json",
+    ])
+    const parsed = parseJsonOutput(output)
+    if (extractSessionId(parsed) !== input.sessionId) throw new Error("openchamber session associate-project returned a different session id")
+  } catch (error) {
+    const message = error instanceof Error ? error.message.replace(/^openchamber exited with code \d+: /, "") : undefined
+    if (message === "Unknown option: --display-project-dir" || message === "Unknown session command 'associate-project'.") {
+      throw new UnsupportedSessionProjectError(message)
+    }
+    throw error
+  }
 }
 
 export async function sessionStatus(exec: ExecRunner, input: { sessionId: string; directory: string }): Promise<SessionStatus> {
@@ -163,9 +178,25 @@ function parseJsonOutput(output: string): unknown {
     throw new Error("openchamber command did not return valid JSON")
   }
   if (isRecord(parsed) && (parsed.status === "error" || parsed.ok === false || parsed.success === false || parsed.error != null)) {
-    throw new Error("openchamber command returned an error response")
+    throw new Error(extractControlErrorMessage(parsed) ?? "openchamber command returned an error response")
   }
   return parsed
+}
+
+// --json failures are written to stdout by the CLI. Keep only the diagnostic,
+// never the entire command output (which can contain session text or metadata).
+export function controlErrorMessage(output: string): string | undefined {
+  try {
+    return extractControlErrorMessage(JSON.parse(output))
+  } catch {
+    return undefined
+  }
+}
+
+function extractControlErrorMessage(parsed: unknown): string | undefined {
+  if (!isRecord(parsed) || (parsed.status !== "error" && parsed.ok !== false && parsed.success !== false && parsed.error == null)) return undefined
+  if (isRecord(parsed.error) && typeof parsed.error.message === "string" && parsed.error.message.trim() !== "") return parsed.error.message
+  return undefined
 }
 
 function extractArchived(parsed: unknown): boolean | undefined {

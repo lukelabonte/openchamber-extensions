@@ -5,13 +5,13 @@ const head = "a".repeat(40)
 const landedHead = "b".repeat(40)
 const plan: CleanupPlan = {
   taskId: "search", targetDirectory: "/repo/worktrees/search", sourceDirectory: "/repo/source", evidenceDirectory: "/evidence/search",
-  branch: "fm/search", head, landedHead, workerSessionId: "ses_cleanup", coordinatorSessionId: "ses_mate",
+  branch: "fm/search", head, sourceHead: landedHead, landedHead, workerSessionId: "ses_cleanup", coordinatorSessionId: "ses_mate",
   authorization: { kind: "verified-landing", reference: "reports/search.md: verified merged PR" },
 }
 
 function fixture() {
   let observation: GitCleanupObservation = {
-    directory: plan.targetDirectory, sourceDirectory: plan.sourceDirectory, sourceHead: landedHead,
+    directory: plan.targetDirectory, sourceDirectory: plan.sourceDirectory, sourceHead: landedHead, landedHead,
     task: { id: plan.taskId, directory: plan.targetDirectory, branch: plan.branch },
     exists: true, registered: true, branchHead: head, worktreeHead: head, worktreeBranch: plan.branch,
     tracked: [], untracked: [], ignored: [], content: "ancestor", landingVerified: true, protectedBranches: ["main"],
@@ -93,6 +93,7 @@ describe("worker-owned authorized worktree cleanup", () => {
     { content: "unique" }, { content: "unknown" }, { branchHead: "c".repeat(40) },
     { worktreeBranch: "other-task" },
     { protectedBranches: [plan.branch] }, { protectedBranches: undefined },
+    { sourceHead: "c".repeat(40) }, { landedHead: "c".repeat(40) },
     { landingVerified: false }, { task: { id: "other", directory: plan.targetDirectory, branch: plan.branch } },
   ] as Partial<GitCleanupObservation>[]) ("retains dirty, unlanded, moved-head or unowned work: %j", async (change) => {
     const { ports, calls, changeGit } = fixture()
@@ -236,6 +237,30 @@ describe("worker-owned authorized worktree cleanup", () => {
   test("an unsupported or undiscovered disposal contract blocks every owner before release", async () => {
     const { ports, calls, runtimes } = fixture()
     runtimes[1].disposalContract = undefined
+    expect((await cleanupTaskWorktree(plan, ports)).status).toBe("retained")
+    expect(calls.some((call) => call.startsWith("evict:") || call.startsWith("git:"))).toBe(false)
+  })
+
+  test("pins the unchanged source checkout independently of the verified landed-content commit", async () => {
+    const { ports, changeGit } = fixture()
+    const sourceHead = "d".repeat(40)
+    changeGit({ sourceHead })
+    expect((await cleanupTaskWorktree({ ...plan, sourceHead }, ports)).status).toBe("removed")
+  })
+
+  test.each([
+    { operationId: "location.reload" }, { method: "POST" },
+    { locationParameter: "directory" }, { successStatus: 200 },
+  ])("an incompatible installed disposal contract is rejected before any release: %j", async (change) => {
+    const { ports, calls, runtimes } = fixture()
+    runtimes[1].disposalContract = { ...runtimes[1].disposalContract, ...change }
+    expect((await cleanupTaskWorktree(plan, ports)).status).toBe("retained")
+    expect(calls.some((call) => call.startsWith("evict:") || call.startsWith("git:"))).toBe(false)
+  })
+
+  test("an unverified localhost endpoint isn't accepted as a loopback runtime identity", async () => {
+    const { ports, calls, runtimes } = fixture()
+    runtimes[0].identity.url = "http://localhost:12345"
     expect((await cleanupTaskWorktree(plan, ports)).status).toBe("retained")
     expect(calls.some((call) => call.startsWith("evict:") || call.startsWith("git:"))).toBe(false)
   })

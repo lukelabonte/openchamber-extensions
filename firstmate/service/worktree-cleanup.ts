@@ -7,6 +7,7 @@ export interface CleanupPlan {
   evidenceDirectory: string
   branch: string
   head: string
+  sourceHead: string
   landedHead: string
   workerSessionId: string
   coordinatorSessionId: string
@@ -17,6 +18,7 @@ export interface GitCleanupObservation {
   directory: string
   sourceDirectory: string
   sourceHead: string
+  landedHead: string
   task: { id: string; directory: string; branch: string }
   exists: boolean
   registered: boolean
@@ -84,7 +86,7 @@ export async function cleanupTaskWorktree(plan: CleanupPlan, ports: CleanupPorts
   try {
     if (!plan.authorization || !["verified-landing", "explicit-cleanup"].includes(plan.authorization.kind) || !plan.authorization.reference?.trim()) throw new Error("verified landing or explicit cleanup authorization with evidence is required")
     if (!plan.taskId || !plan.workerSessionId || plan.workerSessionId === plan.coordinatorSessionId || !plan.coordinatorSessionId) throw new Error("cleanup must belong to a worker, never the first mate")
-    if (!/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(plan.head) || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(plan.landedHead)) throw new Error("pin exact task and landed commit heads")
+    if (![plan.head, plan.sourceHead, plan.landedHead].every((head) => /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(head))) throw new Error("pin exact task, source checkout and landed commit heads")
     if (!/^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(plan.branch) || plan.branch.includes("..") || plan.branch.endsWith(".lock")) throw new Error("cleanup branch is invalid")
     for (const directory of [plan.sourceDirectory, plan.targetDirectory, plan.evidenceDirectory]) {
       if (!path.isAbsolute(directory) || path.normalize(directory) !== directory || directory.includes("\0") || await ports.canonicalize(directory) !== directory) throw new Error("cleanup paths must be absolute, canonical, and unchanged")
@@ -118,7 +120,7 @@ export async function cleanupTaskWorktree(plan: CleanupPlan, ports: CleanupPorts
         releases.push({ runtime, directory })
       }
     }
-    await ports.record({ phase: "preflight", target: plan.targetDirectory, details: { authorization: plan.authorization, taskId: plan.taskId, branch: plan.branch, head: plan.head, runtimes: runtimeKeys } })
+    await ports.record({ phase: "preflight", target: plan.targetDirectory, details: { authorization: plan.authorization, taskId: plan.taskId, branch: plan.branch, head: plan.head, sourceHead: plan.sourceHead, landedHead: plan.landedHead, runtimes: runtimeKeys } })
     await checkWorker()
     await checkGit()
     await checkProtected()
@@ -165,7 +167,7 @@ export async function cleanupTaskWorktree(plan: CleanupPlan, ports: CleanupPorts
     }
     async function checkGit(): Promise<GitCleanupObservation> {
       const observation = await ports.inspectGit()
-      if (observation.directory !== plan.targetDirectory || observation.sourceDirectory !== plan.sourceDirectory || observation.sourceHead !== plan.landedHead || observation.task?.id !== plan.taskId || observation.task.directory !== plan.targetDirectory || observation.task.branch !== plan.branch) throw new Error("task ownership, source checkout, or pinned landed head does not match")
+      if (observation.directory !== plan.targetDirectory || observation.sourceDirectory !== plan.sourceDirectory || observation.sourceHead !== plan.sourceHead || observation.landedHead !== plan.landedHead || observation.task?.id !== plan.taskId || observation.task.directory !== plan.targetDirectory || observation.task.branch !== plan.branch) throw new Error("task ownership, pinned source checkout, or pinned landed-content head does not match")
       if (typeof observation.exists !== "boolean" || typeof observation.registered !== "boolean" || observation.exists !== observation.registered) throw new Error("worktree path/registration state is uncertain")
       if (observation.branchHead !== undefined && observation.branchHead !== plan.head || observation.exists && (observation.worktreeHead !== plan.head || observation.branchHead !== plan.head)) throw new Error("the worktree or branch head changed")
       if (observation.exists && observation.worktreeBranch !== plan.branch) throw new Error("the worktree is no longer checked out on its recorded task branch")

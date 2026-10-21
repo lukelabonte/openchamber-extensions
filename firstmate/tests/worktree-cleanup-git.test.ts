@@ -27,7 +27,7 @@ function fixture() {
   git("commit", "-m", "Seed fixture")
   const head = git("rev-parse", "HEAD")
   git("worktree", "add", "-b", "fm/task", targetDirectory, head)
-  const plan: CleanupPlan = { taskId: "task", sourceDirectory, targetDirectory, evidenceDirectory, branch: "fm/task", head, landedHead: head, workerSessionId: "ses_worker", coordinatorSessionId: "ses_mate", authorization: { kind: "explicit-cleanup", reference: "fixture captain-approved cleanup brief" } }
+  const plan: CleanupPlan = { taskId: "task", sourceDirectory, targetDirectory, evidenceDirectory, branch: "fm/task", head, sourceHead: head, landedHead: head, workerSessionId: "ses_worker", coordinatorSessionId: "ses_mate", authorization: { kind: "explicit-cleanup", reference: "fixture captain-approved cleanup brief" } }
   let loaded = true
   let disposed = 0
   const identity = { pid: 100, version: "fixture", url: "http://127.0.0.1:12345" }
@@ -41,12 +41,12 @@ function fixture() {
       const exists = existsSync(targetDirectory)
       const status = exists ? execFileSync("git", ["--no-optional-locks", "-C", targetDirectory, "status", "--porcelain=v1", "--untracked-files=all", "--ignored"], { encoding: "utf8" }).split("\n").filter(Boolean) : []
       return {
-        directory: targetDirectory, sourceDirectory, sourceHead: git("rev-parse", "HEAD"), task: { id: "task", directory: targetDirectory, branch: "fm/task" },
+        directory: targetDirectory, sourceDirectory, sourceHead: git("rev-parse", "HEAD"), landedHead: git("rev-parse", "--verify", `${plan.landedHead}^{commit}`), task: { id: "task", directory: targetDirectory, branch: "fm/task" },
         exists, registered: git("worktree", "list", "--porcelain").split("\n").includes(`worktree ${targetDirectory}`), branchHead,
         worktreeHead: exists ? execFileSync("git", ["-C", targetDirectory, "rev-parse", "HEAD"], { encoding: "utf8" }).trim() : undefined,
         worktreeBranch: exists ? execFileSync("git", ["-C", targetDirectory, "symbolic-ref", "--short", "HEAD"], { encoding: "utf8" }).trim() : undefined,
         tracked: status.filter((line) => !line.startsWith("??") && !line.startsWith("!!")), untracked: status.filter((line) => line.startsWith("??")), ignored: status.filter((line) => line.startsWith("!!")),
-        content: git("merge-base", head, plan.landedHead) === head ? "ancestor" : "unique", landingVerified: false, protectedBranches: ["main"],
+        content: git("merge-base", plan.head, plan.landedHead) === plan.head ? "ancestor" : "unique", landingVerified: false, protectedBranches: ["main"],
       }
     },
     discover: async () => ({ complete: true, handles: loaded ? [{ pid: 101, runtimePid: 100, idleForTarget: true }] : [], runtimes: [{
@@ -87,5 +87,29 @@ describe("cleanup runner against disposable Git fixtures", () => {
     expect(existsSync(plan.targetDirectory)).toBe(true)
     expect(git("branch", "--list", plan.branch)).not.toBe("")
     expect(getDisposed()).toBe(0)
+  })
+
+  test("cleans against a newer verified remote landing without advancing the source checkout", async () => {
+    const { plan, ports, git, getDisposed } = fixture()
+    writeFileSync(path.join(plan.targetDirectory, "landed.txt"), "landed task content\n")
+    execFileSync("git", ["-C", plan.targetDirectory, "add", "landed.txt"])
+    execFileSync("git", ["-C", plan.targetDirectory, "commit", "-m", "Land fixture task"], { stdio: ["ignore", "pipe", "pipe"] })
+    const landedHead = git("rev-parse", `refs/heads/${plan.branch}`)
+    // Fixture-only remote tracking state. No remote request or push occurs.
+    git("remote", "add", "origin", path.join(plan.evidenceDirectory, "unused-remote"))
+    git("update-ref", "refs/remotes/origin/main", landedHead)
+    git("branch", "--set-upstream-to=origin/main", plan.branch)
+    plan.head = landedHead
+    plan.landedHead = landedHead
+    plan.authorization = { kind: "verified-landing", reference: "fixture verified merged head on origin/main" }
+    const inspectGit = ports.inspectGit
+    ports.inspectGit = async () => ({ ...await inspectGit(), landingVerified: true })
+    const before = await ports.protectedState()
+    expect(plan.sourceHead).not.toBe(plan.landedHead)
+    expect((await cleanupTaskWorktree(plan, ports)).status).toBe("removed")
+    expect(getDisposed()).toBe(1)
+    expect(git("rev-parse", "HEAD")).toBe(plan.sourceHead)
+    expect(git("rev-parse", "refs/remotes/origin/main")).toBe(landedHead)
+    expect(await ports.protectedState()).toBe(before)
   })
 })
